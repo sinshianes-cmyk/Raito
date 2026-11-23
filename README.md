@@ -8,9 +8,7 @@
 
 A free and open source reader for Android. Manga and light novels live side by side in a single library, wrapped in a calm, floating, low-chrome interface.
 
-[![Release](https://img.shields.io/github/v/release/sinshianes-cmyk/Raito?label=Release&labelColor=27303D&color=6d28d9)](https://github.com/sinshianes-cmyk/Raito/releases) [![Downloads](https://img.shields.io/github/downloads/sinshianes-cmyk/Raito/total?label=Downloads&labelColor=27303D&color=0D1117&logo=github&logoColor=FFFFFF)](https://github.com/sinshianes-cmyk/Raito/releases)
-[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-0877d2?labelColor=27303D)](./LICENSE)
-![Platform: Android](https://img.shields.io/badge/platform-Android%208.0%2B-3DDC84?labelColor=27303D)
+[![Release](https://img.shields.io/github/v/release/sinshianes-cmyk/Raito?label=Release&labelColor=27303D&color=6d28d9)](https://github.com/sinshianes-cmyk/Raito/releases) [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-0877d2?labelColor=27303D)](./LICENSE)![Platform: Android](https://img.shields.io/badge/platform-Android%208.0%2B-3DDC84?labelColor=27303D)
 
 <a href="https://github.com/sinshianes-cmyk/Raito/releases/download/Release/app-universal-release.apk"><img src="https://img.shields.io/badge/%E2%AC%87%20%20DOWNLOAD%20APK-6d28d9?style=for-the-badge&labelColor=4c1d95" alt="Download Raito APK" height="56" /></a>
 
