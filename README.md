@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="./.github/readme-images/app-icon.webp" alt="Raito app icon" height="160px" width="160px" />
+<img src="./.github/readme-images/raito-icon.png" alt="Raito app icon" height="160px" width="160px" />
 
 # Raito
 
@@ -35,7 +35,7 @@ Raito is a manga and light-novel reader for Android in the Tachiyomi / Mihon lin
 
 The look is deliberately **quiet, dense and deliberate**: tonal fills instead of outlines, one consistent side margin, a floating navigation bar that content scrolls beneath, and a search pill at the top of every tab. Reading sessions stay calm, and the library stays easy to scan.
 
-Raito is a fork of **Reikai**, the original app, which is itself built on Mihon. Its visual direction takes its inspiration from **Dropsauce**.
+Raito is a fork of **Reikai**, the original app, which is itself built on Mihon. Its visual direction takes its inspiration from [**DropSauce**](https://github.com/HuzaifaKhalid1311/DropSauce).
 
 ## What's new
 
@@ -90,7 +90,7 @@ Bug reports, ideas and pull requests are welcome. See [CONTRIBUTING.md](./CONTRI
 ## Credits
 
 - **[Reikai](https://github.com/unseensnick)**: the original app Raito is forked from.
-- **Dropsauce**: design and inspiration for Raito's interface.
+- **[DropSauce](https://github.com/HuzaifaKhalid1311/DropSauce)**: design and inspiration for Raito's interface.
 - **[Mihon](https://github.com/mihonapp/mihon)** and the wider **Tachiyomi** community: the base the whole lineage stands on.
 - **[Yōkai](https://github.com/null2264/yokai)** and **[TachiyomiJ2K](https://github.com/Jays2Kings/tachiyomiJ2K)**: ancestors of the single-list library and dynamic grouping.
 - **[Komikku](https://github.com/komikku-app/komikku)**: the related-titles carousel, adult sources, edit-info editor and auto webtoon mode.
