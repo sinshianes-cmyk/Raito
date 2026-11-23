@@ -1,0 +1,200 @@
+package eu.kanade.tachiyomi.ui.webview
+
+import android.app.assist.AssistContent
+import android.content.Context
+import android.content.Intent
+import android.os.Build
+import android.os.Bundle
+import android.widget.Toast
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.produceState
+import androidx.core.net.toUri
+import dev.zacsweers.metro.Inject
+import eu.kanade.presentation.webview.WebViewScreenContent
+import eu.kanade.tachiyomi.R
+import eu.kanade.tachiyomi.network.NetworkHelper
+import eu.kanade.tachiyomi.source.online.HttpSource
+import eu.kanade.tachiyomi.ui.base.activity.BaseActivity
+import eu.kanade.tachiyomi.util.system.WebViewUtil
+import eu.kanade.tachiyomi.util.system.openInBrowser
+import eu.kanade.tachiyomi.util.system.toShareIntent
+import eu.kanade.tachiyomi.util.system.toWebViewHeaders
+import eu.kanade.tachiyomi.util.system.toast
+import eu.kanade.tachiyomi.util.view.setComposeContent
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import logcat.LogPriority
+import mihon.app.di.appGraph
+import okhttp3.HttpUrl.Companion.toHttpUrl
+import raito.novel.network.NovelImageRequests
+import raito.presentation.webview.rememberNovelPageActions
+import raito.presentation.webview.rememberPluginStorageCapture
+import tachiyomi.core.common.util.lang.withIOContext
+import tachiyomi.core.common.util.system.logcat
+import tachiyomi.domain.source.service.SourceManager
+import tachiyomi.i18n.MR
+import tachiyomi.presentation.core.screens.LoadingScreen
+
+class WebViewActivity : BaseActivity() {
+
+    @Inject private lateinit var sourceManager: SourceManager
+
+    @Inject private lateinit var network: NetworkHelper
+
+    // RK -->
+    @Inject private lateinit var novelImageRequests: NovelImageRequests
+    // RK <--
+
+    private var assistUrl: String? = null
+
+    init {
+        registerSecureActivity(this)
+    }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        // RK: injected before super.onCreate, where upstream injects after, so every field is set
+        //     before anything the base class starts can read one.
+        appGraph.inject(this)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            overrideActivityTransition(
+                OVERRIDE_TRANSITION_OPEN,
+                R.anim.shared_axis_x_push_enter,
+                R.anim.shared_axis_x_push_exit,
+            )
+        } else {
+            @Suppress("DEPRECATION")
+            overridePendingTransition(R.anim.shared_axis_x_push_enter, R.anim.shared_axis_x_push_exit)
+        }
+        super.onCreate(savedInstanceState)
+        // RK: appGraph.inject moved above super.onCreate
+
+        if (!WebViewUtil.supportsWebView(this)) {
+            toast(MR.strings.information_webview_required, Toast.LENGTH_LONG)
+            finish()
+            return
+        }
+
+        val url = intent.extras?.getString(URL_KEY) ?: return
+        assistUrl = url
+
+        setComposeContent {
+            // Null until the source it belongs to has been resolved
+            val headers by produceState<Map<String, String>?>(initialValue = null) {
+                // RK --> a novel source is found by its text id, which the manga source manager cannot resolve
+                intent.getStringExtra(NOVEL_SOURCE_KEY)?.let {
+                    value = withIOContext { novelImageRequests.webViewHeaders(it) }
+                    return@produceState
+                }
+                // RK <--
+                val source = sourceManager.get(intent.extras!!.getLong(SOURCE_KEY)) as? HttpSource
+                value = withIOContext {
+                    try {
+                        source?.headers?.toWebViewHeaders().orEmpty()
+                    } catch (e: Exception) {
+                        logcat(LogPriority.ERROR, e) { "Failed to build headers" }
+                        emptyMap()
+                    }
+                }
+            }
+
+            if (headers == null) {
+                LoadingScreen()
+                return@setComposeContent
+            }
+
+            WebViewScreenContent(
+                onNavigateUp = { finish() },
+                initialTitle = intent.extras?.getString(TITLE_KEY),
+                url = url,
+                headers = headers.orEmpty(),
+                defaultUserAgentProvider = network::defaultUserAgentProvider,
+                onUrlChange = { assistUrl = it },
+                onShare = this::shareWebpage,
+                onOpenInBrowser = this::openInBrowser,
+                onClearCookies = this::clearCookies,
+                // RK: a novel chapter's page, whose text the reader reloads once it is saved
+                pageActions = rememberNovelPageActions(
+                    novelId = intent.getLongExtra(NOVEL_ID_KEY, -1L).takeIf { it > 0L },
+                    chapterId = intent.getLongExtra(CHAPTER_ID_KEY, -1L).takeIf { it > 0L },
+                ),
+                // RK: a light-novel plugin's chapter page keeps the site's storage, as WebViewScreen's does
+                onPageFinished = rememberPluginStorageCapture(null, intent.getStringExtra(NOVEL_SOURCE_KEY)),
+            )
+        }
+    }
+
+    override fun onProvideAssistContent(outContent: AssistContent) {
+        super.onProvideAssistContent(outContent)
+        assistUrl?.let { outContent.webUri = it.toUri() }
+    }
+
+    override fun finish() {
+        super.finish()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            overrideActivityTransition(
+                OVERRIDE_TRANSITION_CLOSE,
+                R.anim.shared_axis_x_pop_enter,
+                R.anim.shared_axis_x_pop_exit,
+            )
+        } else {
+            @Suppress("DEPRECATION")
+            overridePendingTransition(R.anim.shared_axis_x_pop_enter, R.anim.shared_axis_x_pop_exit)
+        }
+    }
+
+    private fun shareWebpage(url: String) {
+        try {
+            startActivity(url.toUri().toShareIntent(this, type = "text/plain"))
+        } catch (e: Exception) {
+            toast(e.message)
+        }
+    }
+
+    private fun openInBrowser(url: String) {
+        openInBrowser(url, forceDefaultBrowser = true)
+    }
+
+    private fun clearCookies(url: String) {
+        val cleared = network.cookieJar.remove(url.toHttpUrl())
+        logcat { "Cleared $cleared cookies for: $url" }
+    }
+
+    companion object {
+        private const val URL_KEY = "url_key"
+        private const val SOURCE_KEY = "source_key"
+        private const val TITLE_KEY = "title_key"
+
+        // RK -->
+        private const val NOVEL_ID_KEY = "novel_id_key"
+        private const val CHAPTER_ID_KEY = "chapter_id_key"
+        private const val NOVEL_SOURCE_KEY = "novel_source_key"
+
+        /**
+         * A novel chapter's page, sent with its source's headers and offering to save the chapter's text
+         * from it where its source can.
+         */
+        fun newNovelChapterIntent(
+            context: Context,
+            url: String,
+            title: String?,
+            novelId: Long,
+            chapterId: Long,
+            novelSourceId: String?,
+        ) =
+            newIntent(context, url, title = title).apply {
+                putExtra(NOVEL_SOURCE_KEY, novelSourceId)
+                putExtra(NOVEL_ID_KEY, novelId)
+                putExtra(CHAPTER_ID_KEY, chapterId)
+            }
+        // RK <--
+
+        fun newIntent(context: Context, url: String, sourceId: Long? = null, title: String? = null): Intent {
+            return Intent(context, WebViewActivity::class.java).apply {
+                addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP)
+                putExtra(URL_KEY, url)
+                putExtra(SOURCE_KEY, sourceId)
+                putExtra(TITLE_KEY, title)
+            }
+        }
+    }
+}

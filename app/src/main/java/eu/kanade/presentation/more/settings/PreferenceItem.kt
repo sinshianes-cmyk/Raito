@@ -1,0 +1,271 @@
+package eu.kanade.presentation.more.settings
+
+import tachiyomi.presentation.core.components.material.ScreenHorizontalPadding
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.expandVertically
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.shrinkVertically
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.padding
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.compositionLocalOf
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.structuralEqualityPolicy
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.unit.dp
+import eu.kanade.presentation.more.settings.screen.HighlightKey
+import eu.kanade.presentation.more.settings.widget.EditTextPreferenceWidget
+import eu.kanade.presentation.more.settings.widget.InfoWidget
+import eu.kanade.presentation.more.settings.widget.ListPreferenceWidget
+import eu.kanade.presentation.more.settings.widget.MultiSelectListPreferenceWidget
+import eu.kanade.presentation.more.settings.widget.PrefsHorizontalPadding
+import eu.kanade.presentation.more.settings.widget.PreviewChoicePreferenceWidget
+import eu.kanade.presentation.more.settings.widget.SegmentedPreferenceWidget
+import eu.kanade.presentation.more.settings.widget.PrefsVerticalPadding
+import eu.kanade.presentation.more.settings.widget.SwitchPreferenceWidget
+import eu.kanade.presentation.more.settings.widget.TextPreferenceWidget
+import eu.kanade.presentation.more.settings.widget.TrackingPreferenceWidget
+import eu.kanade.tachiyomi.data.track.RefreshResult
+import eu.kanade.tachiyomi.util.system.toast
+import kotlinx.coroutines.launch
+import raito.presentation.settings.LocalPreferenceCardPosition // RK
+import raito.presentation.settings.preferenceCard // RK
+import tachiyomi.core.common.i18n.stringResource
+import tachiyomi.i18n.MR
+import tachiyomi.presentation.core.components.BaseSliderItem
+import tachiyomi.presentation.core.util.collectAsState
+
+val LocalPreferenceHighlighted = compositionLocalOf(structuralEqualityPolicy()) { false }
+val LocalPreferenceMinHeight = compositionLocalOf(structuralEqualityPolicy()) { 56.dp }
+
+@Composable
+fun StatusWrapper(
+    item: Preference.PreferenceItem<*, *>,
+    highlightKey: HighlightKey?,
+    // RK: the group this item sits in, so a same-titled twin in another group isn't highlighted too.
+    groupTitle: String?,
+    content: @Composable () -> Unit,
+) {
+    val enabled = item.visible
+    // RK: match title within its group, so a same-titled item elsewhere stays unlit
+    val highlighted = highlightKey != null && HighlightKey(groupTitle, item.title).matches(highlightKey)
+    AnimatedVisibility(
+        visible = enabled,
+        enter = expandVertically() + fadeIn(),
+        exit = shrinkVertically() + fadeOut(),
+        content = {
+            // RK --> DropSauce grouped card: a row inside a preference list draws on its own tonal tile
+            val position = LocalPreferenceCardPosition.current
+            CompositionLocalProvider(
+                LocalPreferenceHighlighted provides highlighted,
+            ) {
+                if (position != null) {
+                    Box(Modifier.preferenceCard(position)) { content() }
+                } else {
+                    content()
+                }
+            }
+            // RK <--
+        },
+    )
+}
+
+@Composable
+internal fun PreferenceItem(
+    item: Preference.PreferenceItem<*, *>,
+    // RK: group-scoped highlight, as in StatusWrapper
+    highlightKey: HighlightKey?,
+    groupTitle: String?,
+) {
+    val scope = rememberCoroutineScope()
+    StatusWrapper(
+        item = item,
+        highlightKey = highlightKey,
+        groupTitle = groupTitle, // RK: group-scoped highlight
+    ) {
+        when (item) {
+            is Preference.PreferenceItem.SwitchPreference -> {
+                val value by item.preference.collectAsState()
+                SwitchPreferenceWidget(
+                    title = item.title,
+                    subtitle = item.subtitle,
+                    icon = item.icon,
+                    checked = value,
+                    onCheckedChanged = { newValue ->
+                        scope.launch {
+                            if (item.onValueChanged(newValue)) {
+                                item.preference.set(newValue)
+                            }
+                        }
+                    },
+                )
+            }
+            is Preference.PreferenceItem.SliderPreference -> {
+                val value by item.preference.collectAsState()
+                BaseSliderItem(
+                    value = value,
+                    valueRange = item.valueRange,
+                    steps = item.steps,
+                    title = item.title,
+                    subtitle = item.subtitle,
+                    valueString = item.valueText(value),
+                    onChange = { newValue ->
+                        scope.launch {
+                            if (item.onValueChanged(newValue)) {
+                                item.preference.set(newValue)
+                            }
+                        }
+                    },
+                    titleStyle = MaterialTheme.typography.titleMedium,
+                    // RK --> DropSauce's tonal value pill
+                    pillColor = MaterialTheme.colorScheme.secondaryContainer,
+                    pillContentColor = MaterialTheme.colorScheme.onSecondaryContainer,
+                    // RK <--
+                    modifier = Modifier.padding(
+                        horizontal = ScreenHorizontalPadding,
+                        vertical = PrefsVerticalPadding,
+                    ),
+                )
+            }
+            is Preference.PreferenceItem.ListPreference<*> -> if (item.preview != null) {
+                // RK --> DropSauce preview tiles
+                val value by item.preference.collectAsState()
+                PreviewChoicePreferenceWidget(
+                    title = item.title,
+                    entries = item.entries as Map<Any?, String>,
+                    value = value,
+                    drawing = { key -> item.internalPreview(key) },
+                    onValueChange = { newValue ->
+                        scope.launch {
+                            if (item.internalOnValueChanged(newValue!!)) {
+                                item.internalSet(newValue)
+                            }
+                        }
+                    },
+                )
+                // RK <--
+            } else if (item.segmented) {
+                // RK --> DropSauce segmented row
+                val value by item.preference.collectAsState()
+                SegmentedPreferenceWidget(
+                    title = item.title,
+                    entries = item.entries as Map<Any?, String>,
+                    value = value,
+                    onValueChange = { newValue ->
+                        scope.launch {
+                            if (item.internalOnValueChanged(newValue!!)) {
+                                item.internalSet(newValue)
+                            }
+                        }
+                    },
+                )
+                // RK <--
+            } else {
+                val value by item.preference.collectAsState()
+                ListPreferenceWidget(
+                    value = value,
+                    title = item.title,
+                    subtitle = item.internalSubtitleProvider(value, item.entries),
+                    icon = item.icon,
+                    entries = item.entries,
+                    onValueChange = { newValue ->
+                        scope.launch {
+                            if (item.internalOnValueChanged(newValue!!)) {
+                                item.internalSet(newValue)
+                            }
+                        }
+                    },
+                )
+            }
+            is Preference.PreferenceItem.BasicListPreference -> {
+                ListPreferenceWidget(
+                    value = item.value,
+                    title = item.title,
+                    subtitle = item.subtitleProvider(item.value, item.entries),
+                    icon = item.icon,
+                    entries = item.entries,
+                    onValueChange = { scope.launch { item.onValueChanged(it) } },
+                )
+            }
+            is Preference.PreferenceItem.MultiSelectListPreference<*> -> {
+                val values by item.preference.collectAsState()
+                MultiSelectListPreferenceWidget(
+                    values = values,
+                    title = item.title,
+                    subtitle = item.internalSubtitleProvider(values, item.entries),
+                    icon = item.icon,
+                    entries = item.entries,
+                    onValuesChange = { newValues ->
+                        scope.launch {
+                            if (item.internalOnValueChanged(newValues)) {
+                                item.internalSet(newValues)
+                            }
+                        }
+                    },
+                )
+            }
+            is Preference.PreferenceItem.TextPreference -> {
+                TextPreferenceWidget(
+                    title = item.title,
+                    subtitle = item.subtitle,
+                    icon = item.icon,
+                    widget = item.widget,
+                    onPreferenceClick = item.onClick,
+                )
+            }
+            is Preference.PreferenceItem.EditTextPreference -> {
+                val values by item.preference.collectAsState()
+                EditTextPreferenceWidget(
+                    title = item.title,
+                    subtitle = item.subtitle,
+                    icon = item.icon,
+                    value = values,
+                    onConfirm = {
+                        val accepted = item.onValueChanged(it)
+                        if (accepted) item.preference.set(it)
+                        accepted
+                    },
+                )
+            }
+            is Preference.PreferenceItem.TrackerPreference -> {
+                val context = LocalContext.current
+                LaunchedEffect(item.tracker) {
+                    item.tracker.refreshResultFlow.collect {
+                        when (it) {
+                            RefreshResult.Success -> context.toast(
+                                context.stringResource(MR.strings.refresh_tracker_success, item.tracker.name),
+                            )
+
+                            is RefreshResult.Error -> context.toast(
+                                context.stringResource(MR.strings.refresh_tracker_error, item.tracker.name, it.msg),
+                            )
+                        }
+                    }
+                }
+                val isLoggedIn by item.tracker.let { tracker ->
+                    tracker.isLoggedInFlow.collectAsState(tracker.isLoggedIn)
+                }
+                val isRefreshing by item.tracker.isRefreshingFlow.collectAsState()
+                TrackingPreferenceWidget(
+                    tracker = item.tracker,
+                    isLoggedIn = isLoggedIn,
+                    isRefreshing = isRefreshing,
+                    onClick = { if (isLoggedIn) item.logout() else item.login() },
+                )
+            }
+            is Preference.PreferenceItem.InfoPreference -> {
+                InfoWidget(text = item.title)
+            }
+            is Preference.PreferenceItem.CustomPreference -> {
+                item.content()
+            }
+        }
+    }
+}

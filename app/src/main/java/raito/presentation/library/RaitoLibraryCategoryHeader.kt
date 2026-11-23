@@ -1,0 +1,133 @@
+package raito.presentation.library
+
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import dev.icerock.moko.resources.StringResource
+import mihon.icons.materialsymbols.MaterialSymbols
+import mihon.icons.materialsymbols.rounded.ArrowDownward
+import mihon.icons.materialsymbols.rounded.ArrowUpward
+import mihon.icons.materialsymbols.rounded.KeyboardArrowDown
+import mihon.icons.materialsymbols.rounded.KeyboardArrowRight
+import mihon.icons.materialsymbols.rounded.RadioButtonUnchecked
+import mihon.icons.materialsymbols.rounded.Refresh
+import mihon.icons.materialsymbols.roundedfilled.CheckCircle
+import tachiyomi.i18n.MR
+import tachiyomi.presentation.core.i18n.stringResource
+
+/**
+ * Collapsible category header for Raito's single-list library. A chevron shows the collapse state
+ * (tap the row to toggle). Real (non-dynamic) categories also get a per-category sort indicator and
+ * a refresh button; in selection mode the chevron becomes a select-all circle for the category.
+ */
+@Composable
+fun RaitoLibraryCategoryHeader(
+    name: String,
+    itemCount: Int,
+    showItemCount: Boolean,
+    isCollapsed: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+    // Selection mode: the leading chevron becomes a select-all circle for this category.
+    selectionMode: Boolean = false,
+    allSelected: Boolean = false,
+    onToggleSelectAll: () -> Unit = {},
+    // Per-category affordances; null = hidden (e.g. dynamic groups, which have no real category).
+    // The caller passes the EFFECTIVE sort (a category's override, or the global sort it follows): the
+    // label via [sortLabel] and the arrow via [sortAscending], decoded by the caller so the header never
+    // touches the raw flag bits.
+    sortLabel: StringResource? = null,
+    sortAscending: Boolean? = null,
+    onClickSort: (() -> Unit)? = null,
+    onClickRefresh: (() -> Unit)? = null,
+) {
+    Row(
+        modifier = modifier
+            .fillMaxWidth()
+            .padding(horizontal = 8.dp, vertical = 4.dp) // RK: modern pill header inset
+            .clip(RoundedCornerShape(20.dp))
+            // Row tap toggles collapse, but not while selecting (the circle handles taps then).
+            .then(if (selectionMode) Modifier else Modifier.clickable(onClick = onClick))
+            .padding(horizontal = 8.dp, vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        if (selectionMode) {
+            IconButton(onClick = onToggleSelectAll) {
+                Icon(
+                    imageVector = if (allSelected) {
+                        MaterialSymbols.RoundedFilled.CheckCircle
+                    } else {
+                        MaterialSymbols.Rounded.RadioButtonUnchecked
+                    },
+                    contentDescription = stringResource(MR.strings.action_select_all),
+                )
+            }
+        } else {
+            Icon(
+                imageVector = if (isCollapsed) {
+                    MaterialSymbols.Rounded.KeyboardArrowRight
+                } else {
+                    MaterialSymbols.Rounded.KeyboardArrowDown
+                },
+                contentDescription = null,
+                modifier = Modifier.padding(vertical = 8.dp),
+            )
+        }
+        Spacer(Modifier.width(8.dp))
+        Text(
+            text = if (showItemCount) "$name ($itemCount)" else name,
+            style = MaterialTheme.typography.titleMedium,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.weight(1f),
+        )
+        if (sortLabel != null && sortAscending != null && onClickSort != null) {
+            Row(
+                modifier = Modifier
+                    .clip(RoundedCornerShape(50))
+                    .clickable(onClick = onClickSort)
+                    .padding(horizontal = 10.dp, vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    text = stringResource(sortLabel),
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Icon(
+                    imageVector = if (sortAscending) {
+                        MaterialSymbols.Rounded.ArrowUpward
+                    } else {
+                        MaterialSymbols.Rounded.ArrowDownward
+                    },
+                    contentDescription = stringResource(MR.strings.action_sort),
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.size(16.dp),
+                )
+            }
+        }
+        if (onClickRefresh != null) {
+            IconButton(onClick = onClickRefresh) {
+                Icon(
+                    imageVector = MaterialSymbols.Rounded.Refresh,
+                    contentDescription = stringResource(MR.strings.action_update_category),
+                )
+            }
+        }
+    }
+}

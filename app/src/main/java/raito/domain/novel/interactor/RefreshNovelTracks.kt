@@ -1,0 +1,47 @@
+package raito.domain.novel.interactor
+
+import dev.zacsweers.metro.Inject
+import eu.kanade.tachiyomi.data.track.Tracker
+import eu.kanade.tachiyomi.data.track.TrackerManager
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.supervisorScope
+import raito.domain.novel.track.toDbTrack
+import raito.domain.novel.track.toNovelTrack
+
+/**
+ * Novel twin of [eu.kanade.domain.track.interactor.RefreshTracks], pinned by RefreshTracksConformanceTest:
+ * pulls the latest remote state for every bound novel track and persists it. No EnhancedTracker
+ * chapter-sync: no novel-capable tracker is an EnhancedTracker. Merge-group-aware: refreshes tracks
+ * bound on any member of the group.
+ *
+ * @return the failed updates.
+ */
+@Inject
+class RefreshNovelTracks(
+    private val getNovelTracks: GetNovelTracks,
+    private val trackerManager: TrackerManager,
+    private val upsertNovelTrack: UpsertNovelTrack,
+) {
+
+    suspend fun await(novelId: Long): List<Pair<Tracker?, Throwable>> {
+        return supervisorScope {
+            getNovelTracks.awaitGroup(novelId)
+                .map { it to trackerManager.get(it.trackerId) }
+                .filter { (_, service) -> service?.isLoggedIn == true }
+                .map { (track, service) ->
+                    async {
+                        return@async try {
+                            val updatedTrack = service!!.refresh(track.toDbTrack()).toNovelTrack()!!
+                            upsertNovelTrack.await(updatedTrack)
+                            null
+                        } catch (e: Throwable) {
+                            service to e
+                        }
+                    }
+                }
+                .awaitAll()
+                .filterNotNull()
+        }
+    }
+}

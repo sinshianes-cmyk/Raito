@@ -1,0 +1,187 @@
+package raito.presentation.browse.feed
+
+import eu.kanade.domain.source.interactor.GetEnabledSources
+import eu.kanade.tachiyomi.source.Source
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.map
+import raito.domain.library.ContentType
+import raito.domain.novel.FavoritedNovels
+import raito.domain.source.GetEnabledNovelSources
+import raito.domain.source.SourceKey
+import raito.domain.source.filter.MangaSavedSearchFilters
+import raito.domain.source.filter.NovelSavedSearchFilters
+import raito.domain.source.model.SavedSearch
+import raito.novel.host.NovelItem
+import raito.novel.source.NovelListing
+import raito.novel.source.NovelSource
+import raito.novel.source.NovelSourceManager
+import raito.novel.source.listedNovels
+import raito.presentation.browse.catalogue.EntryBrowseListing
+import raito.presentation.browse.catalogue.EntryBrowseRow
+import raito.presentation.browse.globalsearch.BrowseSearchRow
+import raito.presentation.browse.globalsearch.EntrySearchState
+import raito.presentation.browse.novelBrowseRow
+import raito.presentation.browse.storedMangaRows
+import raito.presentation.novel.browse.NovelSavedSearchRun
+import tachiyomi.domain.manga.interactor.GetManga
+import tachiyomi.domain.manga.interactor.NetworkToLocalManga
+import tachiyomi.domain.source.service.SourceManager
+
+/**
+ * One content type's half of the feed: which of its sources a row can be built on, how to resolve one
+ * back, and how to fetch the page a row shows. The engine owns everything describing the whole feed.
+ */
+interface FeedProvider {
+
+    val contentType: ContentType
+
+    /**
+     * The installed sources' keys, emitted again when one arrives or leaves: the feed table does not
+     * emit for that, so a row built while its source was missing would read unavailable for good.
+     * Keys rather than sources, so a registry pass that changes no source (an extension update check)
+     * does not refetch every row.
+     */
+    val sourceChanges: Flow<Set<SourceKey>>
+
+    /** Sources a feed row can be added for, the ones a reader has left enabled. */
+    suspend fun sources(): List<BrowseSearchRow>
+
+    /** The source behind [key], or null when it is no longer installed. */
+    suspend fun source(key: SourceKey): BrowseSearchRow?
+
+    /** The name [key]'s source was stored with, for a row whose source is no longer installed. */
+    suspend fun missingName(key: SourceKey): String
+
+    /** Whether the source behind [row] can serve a Latest listing. */
+    fun supportsLatest(row: BrowseSearchRow): Boolean
+
+    /**
+     * The listing a row with no saved search shows, and so where its picker label and its tap point:
+     * Latest, falling back to Popular where the source has no latest listing.
+     */
+    fun listing(row: BrowseSearchRow): EntryBrowseListing =
+        if (supportsLatest(row)) EntryBrowseListing.Latest else EntryBrowseListing.Popular
+
+    /**
+     * Page one of what the row shows: [savedSearch] when it carries one, else the source's Latest,
+     * falling back to Popular where it has no latest listing.
+     */
+    suspend fun load(row: BrowseSearchRow, savedSearch: SavedSearch?): List<EntryBrowseRow>
+}
+
+/** The manga half, over Mihon's source manager. */
+class MangaFeedProvider(
+    private val sourceManager: SourceManager,
+    private val getEnabledSources: GetEnabledSources,
+    private val networkToLocalManga: NetworkToLocalManga,
+    private val getManga: GetManga,
+) : FeedProvider {
+
+    private val filters = MangaSavedSearchFilters()
+
+    override val contentType = ContentType.MANGA
+
+    override val sourceChanges get() = sourceManager.sources.keys { SourceKey.Manga(it.id) }
+
+    // The Sources tab's list, without the duplicate row it adds for the last-used source. Typed as the
+    // base Source, which carries every listing: the local source is no CatalogueSource.
+    override suspend fun sources(): List<BrowseSearchRow> =
+        getEnabledSources.subscribe().first()
+            .filterNot { it.isUsedLast }
+            .mapNotNull { sourceManager.get(it.id) }
+            .map(::toRow)
+
+    override suspend fun source(key: SourceKey): BrowseSearchRow? =
+        (key as? SourceKey.Manga)?.let { sourceManager.get(it.id) }?.let(::toRow)
+
+    override suspend fun missingName(key: SourceKey) = sourceManager.getOrStub((key as SourceKey.Manga).id).name
+
+    override fun supportsLatest(row: BrowseSearchRow) = (row.source as Source).supportsLatest
+
+    override suspend fun load(row: BrowseSearchRow, savedSearch: SavedSearch?): List<EntryBrowseRow> {
+        val source = row.source as Source
+        val page = when {
+            savedSearch != null -> source.getSearchManga(
+                1,
+                savedSearch.query.orEmpty(),
+                filters.restore(savedSearch.filtersJson, source::getFilterList),
+            )
+            listing(row) == EntryBrowseListing.Latest -> source.getLatestUpdates(1)
+            else -> source.getPopularManga(1)
+        }
+        return storedMangaRows(page, source.id, networkToLocalManga, getManga)
+    }
+
+    private fun toRow(source: Source) = BrowseSearchRow(
+        key = SourceKey.Manga(source.id),
+        name = source.name,
+        lang = source.lang,
+        isPinned = false,
+        state = EntrySearchState.Loading,
+        source = source,
+    )
+}
+
+/** The light-novel half, over the plugin manager. */
+class NovelFeedProvider(
+    private val sourceManager: NovelSourceManager,
+    private val getEnabledSources: GetEnabledNovelSources,
+    /** The library's keys, which each result row reads its in-library badge off. */
+    private val favorited: StateFlow<FavoritedNovels>,
+) : FeedProvider {
+
+    private val filters = NovelSavedSearchFilters()
+
+    override val contentType = ContentType.NOVELS
+
+    // After a first load: the registry starts empty, and the plugins only load when something asks.
+    override val sourceChanges get() = sourceManager.loadedSources().keys { SourceKey.Novel(it.id) }
+
+    override suspend fun sources(): List<BrowseSearchRow> = getEnabledSources.get().map(::toRow)
+
+    override suspend fun source(key: SourceKey): BrowseSearchRow? =
+        (key as? SourceKey.Novel)?.let { sourceManager.get(it.id) }?.let(::toRow)
+
+    override suspend fun missingName(key: SourceKey) = sourceManager.nameOf((key as SourceKey.Novel).id)
+
+    override fun supportsLatest(row: BrowseSearchRow) = (row.source as NovelSource).supportsLatest
+
+    override suspend fun load(row: BrowseSearchRow, savedSearch: SavedSearch?): List<EntryBrowseRow> {
+        val source = row.source as NovelSource
+        return page(source, listing(row), savedSearch).map { novelBrowseRow(it, source.id, favorited) }
+    }
+
+    private suspend fun page(
+        source: NovelSource,
+        listing: EntryBrowseListing,
+        savedSearch: SavedSearch?,
+    ): List<NovelItem> {
+        val defaults = source.filters?.defaultState()
+        if (savedSearch == null) {
+            val novelListing = if (listing == EntryBrowseListing.Latest) NovelListing.Latest else NovelListing.Popular
+            return source.browse(novelListing, page = 1, defaults).listedNovels()
+        }
+        val stored = source.filters?.let { filters.restore(savedSearch.filtersJson, it::defaultState) }
+        return when (val run = NovelSavedSearchRun.of(source.filters?.applyToSearch == true, savedSearch.query)) {
+            is NovelSavedSearchRun.SearchWithFilters -> source.search(run.query, page = 1, stored).listedNovels()
+            is NovelSavedSearchRun.PlainSearch -> source.search(run.query, page = 1, defaults).listedNovels()
+            NovelSavedSearchRun.FilteredPopular -> source.browse(NovelListing.Popular, page = 1, stored).listedNovels()
+        }
+    }
+
+    private fun toRow(source: NovelSource) = BrowseSearchRow(
+        key = SourceKey.Novel(source.id),
+        name = source.name,
+        lang = source.lang,
+        isPinned = false,
+        state = EntrySearchState.Loading,
+        source = source,
+        format = source.format,
+    )
+}
+
+private fun <S> Flow<List<S>>.keys(key: (S) -> SourceKey): Flow<Set<SourceKey>> =
+    map { sources -> sources.mapTo(HashSet(), key) }.distinctUntilChanged()

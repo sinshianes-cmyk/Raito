@@ -1,0 +1,148 @@
+package mihon.domain.source.interactor
+
+import dev.zacsweers.metro.Inject
+import eu.kanade.domain.chapter.interactor.SyncChaptersWithSource
+import eu.kanade.domain.chapter.model.toSChapter
+import eu.kanade.domain.manga.model.hasCustomCover
+import eu.kanade.domain.manga.model.toSManga
+import eu.kanade.tachiyomi.data.cache.CoverCache
+import eu.kanade.tachiyomi.data.download.DownloadManager
+import eu.kanade.tachiyomi.source.Source
+import eu.kanade.tachiyomi.source.model.SManga
+import logcat.LogPriority
+import mihon.domain.source.models.RemoteMangaUpdate
+import raito.domain.source.keptCover
+import raito.domain.source.keptDetail
+import raito.domain.source.keptGenres
+import raito.domain.source.keptStatus
+import raito.domain.source.refreshedCover
+import raito.domain.source.refreshedTitle
+import tachiyomi.core.common.util.lang.withIOContext
+import tachiyomi.core.common.util.system.logcat
+import tachiyomi.domain.chapter.model.Chapter
+import tachiyomi.domain.chapter.repository.ChapterRepository
+import tachiyomi.domain.library.service.LibraryPreferences
+import tachiyomi.domain.manga.model.Manga
+import tachiyomi.domain.manga.model.MangaRemoteUpdate
+import tachiyomi.domain.manga.repository.MangaRepository
+import tachiyomi.domain.source.service.SourceManager
+import tachiyomi.source.local.isLocal
+import kotlin.time.Clock
+import kotlin.time.Instant
+
+@Inject
+class UpdateMangaFromRemote(
+    private val sourceManager: SourceManager,
+    private val chapterRepository: ChapterRepository,
+    private val mangaRepository: MangaRepository,
+    private val syncChaptersWithSource: SyncChaptersWithSource,
+    private val coverCache: CoverCache,
+    private val libraryPreferences: LibraryPreferences,
+    private val downloadManager: DownloadManager,
+) {
+    suspend operator fun invoke(
+        manga: Manga,
+        fetchDetails: Boolean = false,
+        fetchChapters: Boolean = false,
+        manualFetch: Boolean = false,
+        fetchWindow: ClosedRange<Instant>? = null,
+    ): Result<RemoteMangaUpdate> {
+        val source = sourceManager.getOrStub(manga.source)
+        return invoke(
+            source = source,
+            manga = manga,
+            fetchDetails = fetchDetails,
+            fetchChapters = fetchChapters,
+            manualFetch = manualFetch,
+        )
+    }
+
+    suspend operator fun invoke(
+        source: Source,
+        manga: Manga,
+        fetchDetails: Boolean = false,
+        fetchChapters: Boolean = false,
+        manualFetch: Boolean = false,
+        fetchWindow: ClosedRange<Instant>? = null,
+    ): Result<RemoteMangaUpdate> = withIOContext {
+        try {
+            val chapters = chapterRepository.getChapterByMangaId(manga.id)
+                .sortedBy { it.sourceOrder }
+            val update = source.getMangaUpdate(
+                manga = manga.toSManga(),
+                chapters = chapters.map(Chapter::toSChapter),
+                fetchDetails = fetchDetails,
+                fetchChapters = fetchChapters,
+            )
+            awaitUpdateFromSource(manga, update.manga, manualFetch)
+            val newChapters = syncChaptersWithSource.await(
+                rawSourceChapters = update.chapters,
+                manga = manga,
+                source = source,
+                manualFetch = manualFetch,
+                fetchWindow = fetchWindow,
+            )
+            val updatedManga = mangaRepository.getMangaById(manga.id)
+
+            Result.success(RemoteMangaUpdate(manga = updatedManga, newChapters = newChapters))
+        } catch (e: Exception) {
+            logcat(LogPriority.ERROR, e)
+            Result.failure(e)
+        } catch (e: LinkageError) { // RK
+            // RK: an extension built against a class or method the app no longer ships throws a
+            //     LinkageError, which the catch above misses. Wrapped as an Exception because every
+            //     caller handles failures that way, so a broken extension fails its series, not the app.
+            logcat(LogPriority.ERROR, e)
+            Result.failure(Exception(e.toString(), e))
+        }
+    }
+
+    private suspend fun awaitUpdateFromSource(
+        localManga: Manga,
+        remoteManga: SManga,
+        manualFetch: Boolean,
+    ): Boolean {
+        val remoteTitle = try {
+            remoteManga.title
+        } catch (_: UninitializedPropertyAccessException) {
+            ""
+        }
+
+        // if the manga isn't a favorite (or 'update titles' preference is enabled), set its title from source and update in db
+        // RK: the rule is shared with the novel refresh
+        val title = refreshedTitle(remoteTitle, localManga.favorite, libraryPreferences.updateMangaTitles.get())
+
+        val thumbnailUrl = keptCover(null, remoteManga.thumbnail_url) // RK: nor a placeholder
+
+        // RK --> the rule is shared with the novel refresh
+        val cover = refreshedCover(localManga.thumbnailUrl, thumbnailUrl, manualFetch, localManga.isLocal()) {
+            localManga.hasCustomCover(coverCache)
+        }
+        if (cover.deletesCachedFile) coverCache.deleteFromCache(localManga, false)
+        val coverLastModified = Clock.System.now().takeIf { cover.stamps }
+        // RK <--
+
+        val success = mangaRepository.updateRemote(
+            MangaRemoteUpdate(
+                id = localManga.id,
+                title = title,
+                coverLastModified = coverLastModified,
+                // RK --> a blank detail or an unknown status keeps the stored one, the rule novels follow
+                author = keptDetail(null, remoteManga.author),
+                artist = keptDetail(null, remoteManga.artist),
+                description = keptDetail(null, remoteManga.description),
+                genre = keptGenres(null, remoteManga.getGenres()),
+                thumbnailUrl = thumbnailUrl,
+                status = keptStatus(localManga.status, remoteManga.status.toLong()),
+                // RK <--
+                updateStrategy = remoteManga.update_strategy,
+                initialized = true,
+                memo = remoteManga.memo,
+            ),
+        )
+        if (success && title != null) {
+            downloadManager.renameManga(localManga, title)
+        }
+        return success
+    }
+}

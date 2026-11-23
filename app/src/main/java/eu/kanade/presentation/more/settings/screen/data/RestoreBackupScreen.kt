@@ -1,0 +1,352 @@
+package eu.kanade.presentation.more.settings.screen.data
+
+import tachiyomi.presentation.core.components.material.ScreenHorizontalPadding
+import android.content.Context
+import android.net.Uri
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.lazy.LazyListScope
+import androidx.compose.foundation.text.selection.SelectionContainer
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.Immutable
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.withStyle
+import androidx.core.net.toUri
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import cafe.adriel.voyager.navigator.LocalNavigator
+import cafe.adriel.voyager.navigator.currentOrThrow
+import dev.zacsweers.metro.AppScope
+import dev.zacsweers.metro.Assisted
+import dev.zacsweers.metro.AssistedFactory
+import dev.zacsweers.metro.AssistedInject
+import dev.zacsweers.metro.ContributesIntoMap
+import dev.zacsweers.metrox.viewmodel.ManualViewModelAssistedFactory
+import dev.zacsweers.metrox.viewmodel.ManualViewModelAssistedFactoryKey
+import dev.zacsweers.metrox.viewmodel.assistedMetroViewModel
+import eu.kanade.presentation.components.AppBar
+import eu.kanade.presentation.components.WarningBanner
+import eu.kanade.presentation.util.Screen
+import eu.kanade.tachiyomi.data.backup.BackupFileValidator
+import eu.kanade.tachiyomi.data.backup.restore.BackupRestoreWorker
+import eu.kanade.tachiyomi.data.backup.restore.RestoreOptions
+import eu.kanade.tachiyomi.util.system.DeviceUtil
+import eu.kanade.tachiyomi.util.system.workManager
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
+import raito.data.backup.ApprovedRepos
+import raito.data.backup.BackupRepo
+import raito.data.backup.RestoreInstallPlan
+import raito.presentation.backup.restoreInstallItems
+import tachiyomi.core.common.util.lang.launchIO
+import tachiyomi.i18n.MR
+import tachiyomi.presentation.core.components.LabeledCheckbox
+import tachiyomi.presentation.core.components.LazyColumnWithAction
+import tachiyomi.presentation.core.components.SectionCard
+import tachiyomi.presentation.core.components.material.Scaffold
+import tachiyomi.presentation.core.components.material.padding
+import tachiyomi.presentation.core.i18n.stringResource
+
+class RestoreBackupScreen(
+    private val uri: String,
+) : Screen() {
+
+    @Composable
+    override fun Content() {
+        val navigator = LocalNavigator.currentOrThrow
+        val viewModel =
+            assistedMetroViewModel<RestoreBackupViewModel, RestoreBackupViewModel.Factory> { create(uri = uri) }
+        val state by viewModel.state.collectAsState()
+
+        Scaffold(
+            topBar = {
+                AppBar(
+                    title = stringResource(MR.strings.pref_restore_backup),
+                    navigateUp = navigator::pop,
+                    scrollBehavior = it,
+                )
+            },
+        ) { contentPadding ->
+            LazyColumnWithAction(
+                contentPadding = contentPadding,
+                actionLabel = stringResource(MR.strings.action_restore),
+                actionEnabled = state.canRestore && state.options.canRestore(),
+                onClickAction = {
+                    viewModel.startRestore()
+                    navigator.pop()
+                },
+            ) {
+                if (DeviceUtil.isMiui && DeviceUtil.isMiuiOptimizationDisabled()) {
+                    item {
+                        WarningBanner(MR.strings.restore_miui_warning)
+                    }
+                }
+
+                if (state.canRestore) {
+                    item {
+                        SectionCard {
+                            RestoreOptions.options.forEach { option ->
+                                LabeledCheckbox(
+                                    label = stringResource(option.label),
+                                    checked = option.getter(state.options),
+                                    onCheckedChange = {
+                                        viewModel.toggle(option.setter, it)
+                                    },
+                                )
+                            }
+                        }
+                    }
+                }
+
+                // RK --> what the restore installs, and the backup's repos this device lacks, each to trust
+                if (state.canRestore) {
+                    restoreInstallItems(state.installs, state.options.extensions, state.trusted, viewModel::trust)
+                }
+                // RK <--
+
+                if (state.error != null) {
+                    errorMessageItem(state.error)
+                }
+            }
+        }
+    }
+
+    private fun LazyListScope.errorMessageItem(
+        error: Any?,
+    ) {
+        item {
+            SectionCard {
+                Column(
+                    modifier = Modifier.padding(horizontal = ScreenHorizontalPadding),
+                    verticalArrangement = Arrangement.spacedBy(MaterialTheme.padding.small),
+                ) {
+                    val msg = restoreErrorMessage(error)
+
+                    SelectionContainer {
+                        Text(text = msg)
+                    }
+                }
+            }
+        }
+    }
+}
+
+/** The text of a restore's error card, shared by the Restore screen and the onboarding restore step. */
+@Composable
+internal fun restoreErrorMessage(error: Any?): androidx.compose.ui.text.AnnotatedString {
+    return buildAnnotatedString {
+        when (error) {
+            is MissingRestoreComponents -> {
+                appendLine(stringResource(MR.strings.backup_restore_content_full))
+                // RK --> the backup's apps and plugins in no repo to install from, and its repos
+                // that could not be read
+                if (error.extensions.isNotEmpty()) {
+                    appendLine()
+                    withStyle(SpanStyle(fontWeight = FontWeight.Bold)) {
+                        appendLine(stringResource(MR.strings.backup_restore_missing_extensions))
+                    }
+                    error.extensions.joinTo(
+                        this,
+                        separator = "\n- ",
+                        prefix = "- ",
+                    )
+                }
+                if (error.unreadRepos.isNotEmpty()) {
+                    appendLine()
+                    withStyle(SpanStyle(fontWeight = FontWeight.Bold)) {
+                        appendLine(stringResource(MR.strings.restore_repos_unread))
+                    }
+                    error.unreadRepos.joinTo(
+                        this,
+                        separator = "\n- ",
+                        prefix = "- ",
+                    )
+                }
+                // RK <--
+                if (error.sources.isNotEmpty()) {
+                    appendLine()
+                    withStyle(SpanStyle(fontWeight = FontWeight.Bold)) {
+                        appendLine(stringResource(MR.strings.backup_restore_missing_sources))
+                    }
+                    error.sources.joinTo(
+                        this,
+                        separator = "\n- ",
+                        prefix = "- ",
+                    )
+                }
+                if (error.trackers.isNotEmpty()) {
+                    appendLine()
+                    withStyle(SpanStyle(fontWeight = FontWeight.Bold)) {
+                        appendLine(stringResource(MR.strings.backup_restore_missing_trackers))
+                    }
+                    error.trackers.joinTo(
+                        this,
+                        separator = "\n- ",
+                        prefix = "- ",
+                    )
+                }
+            }
+
+            is InvalidRestore -> {
+                withStyle(SpanStyle(fontWeight = FontWeight.Bold)) {
+                    appendLine(stringResource(MR.strings.invalid_backup_file))
+                }
+                appendLine(error.uri.toString())
+
+                appendLine()
+
+                withStyle(SpanStyle(fontWeight = FontWeight.Bold)) {
+                    appendLine(stringResource(MR.strings.invalid_backup_file_error))
+                }
+                appendLine(error.message)
+            }
+
+            else -> {
+                appendLine(error.toString())
+            }
+        }
+    }
+}
+
+@AssistedInject
+class RestoreBackupViewModel(
+    @Assisted uri: String,
+    private val backupFileValidator: BackupFileValidator,
+    private val context: Context,
+) : ViewModel() {
+
+    // RK: mutable so the onboarding restore step can point a kept model at the file just chosen
+    private var uri: String = uri
+
+    val state: StateFlow<RestoreBackupViewModel.State>
+        field = MutableStateFlow<RestoreBackupViewModel.State>(State())
+
+    @AssistedFactory
+    @ManualViewModelAssistedFactoryKey
+    @ContributesIntoMap(AppScope::class)
+    interface Factory : ManualViewModelAssistedFactory {
+        fun create(uri: String): RestoreBackupViewModel
+    }
+
+    init {
+        // RK: validate now streams the file (suspend), so run it off the main thread.
+        viewModelScope.launchIO {
+            validate(uri.toUri())
+        }
+    }
+
+    /** Starts over on [newUri]; a no-op when that file is already loaded and has been touched. */
+    fun reload(newUri: String) {
+        if (newUri == uri && state.value != State()) return
+        uri = newUri
+        state.value = State()
+        viewModelScope.launchIO { validate(newUri.toUri()) }
+    }
+
+    fun toggle(setter: (RestoreOptions, Boolean) -> RestoreOptions, enabled: Boolean) {
+        state.update {
+            it.copy(
+                options = setter(it.options, enabled),
+            )
+        }
+    }
+
+    // RK
+    fun trust(repo: BackupRepo, trusted: Boolean) {
+        state.update { it.copy(trusted = if (trusted) it.trusted + repo.url else it.trusted - repo.url) }
+    }
+
+    fun startRestore(): java.util.UUID {
+        // RK: an app repo is added only under the key shown here, so the restore refuses one that changed since
+        val trusted = state.value.installs.repos.filter { it.url in state.value.trusted }
+        return BackupRestoreWorker.start(
+            workManager = context.workManager,
+            uri = uri.toUri(),
+            options = state.value.options,
+            trusted = ApprovedRepos( // RK
+                apps = trusted.filterNot { it.isPluginRepo }.associate { it.url to it.signingKey.orEmpty() },
+                plugins = trusted.filter { it.isPluginRepo }.mapTo(HashSet()) { it.url },
+            ),
+        )
+    }
+
+    private suspend fun validate(uri: Uri) {
+        val results = try {
+            backupFileValidator.validate(uri)
+        } catch (e: Exception) {
+            setError(
+                error = InvalidRestore(uri, e.message.toString()),
+                canRestore = false,
+            )
+            return
+        }
+
+        state.update { it.copy(installs = results.installs) } // RK
+        if (
+            results.missingSources.isNotEmpty() ||
+            results.missingTrackers.isNotEmpty() ||
+            results.installs.unavailable.isNotEmpty() || // RK
+            results.installs.unreadRepos.isNotEmpty() // RK
+        ) {
+            setError(
+                error = MissingRestoreComponents(
+                    uri,
+                    results.missingSources,
+                    results.missingTrackers,
+                    results.installs.unavailable, // RK
+                    results.installs.unreadRepos, // RK
+                ),
+                canRestore = true,
+            )
+            return
+        }
+
+        setError(error = null, canRestore = true)
+    }
+
+    private fun setError(error: Any?, canRestore: Boolean) {
+        state.update {
+            it.copy(
+                error = error,
+                canRestore = canRestore,
+            )
+        }
+    }
+
+    @Immutable
+    data class State(
+        val error: Any? = null,
+        val canRestore: Boolean = false,
+        val options: RestoreOptions = RestoreOptions(),
+        // RK --> the restore's installs, and the backup repos the user trusted by address
+        val installs: RestoreInstallPlan = RestoreInstallPlan(),
+        val trusted: Set<String> = emptySet(),
+        // RK <--
+    )
+}
+
+private data class MissingRestoreComponents(
+    val uri: Uri,
+    val sources: List<String>,
+    val trackers: List<String>,
+    // RK --> in no repo to install from, and the backup's repos that could not be read
+    val extensions: List<String>,
+    val unreadRepos: List<String>,
+    // RK <--
+)
+
+private data class InvalidRestore(
+    val uri: Uri? = null,
+    val message: String,
+)

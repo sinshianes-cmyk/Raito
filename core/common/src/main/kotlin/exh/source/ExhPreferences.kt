@@ -1,0 +1,77 @@
+package exh.source
+
+import dev.zacsweers.metro.AppScope
+import dev.zacsweers.metro.Inject
+import dev.zacsweers.metro.SingleIn
+import tachiyomi.core.common.preference.Preference
+import tachiyomi.core.common.preference.PreferenceStore
+
+@Inject
+@SingleIn(AppScope::class)
+class ExhPreferences(
+    private val preferenceStore: PreferenceStore,
+) {
+    fun isHentaiEnabled() = preferenceStore.getBoolean("eh_is_hentai_enabled", false)
+
+    fun ehIncognitoMode() = preferenceStore.getBoolean("eh_incognito_mode", false)
+
+    fun enableExhentai() = preferenceStore.getBoolean(Preference.privateKey("enable_exhentai"), false)
+
+    fun imageQuality() = preferenceStore.getString("ehentai_quality", "auto")
+
+    fun useHentaiAtHome() = preferenceStore.getInt("eh_enable_hah", 0)
+
+    fun useJapaneseTitle() = preferenceStore.getBoolean("use_jp_title", false)
+
+    fun exhUseOriginalImages() = preferenceStore.getBoolean("eh_useOrigImages", false)
+
+    fun ehTagFilterValue() = preferenceStore.getInt("eh_tag_filtering_value", 0)
+
+    fun ehTagWatchingValue() = preferenceStore.getInt("eh_tag_watching_value", 0)
+
+    // EH Cookies
+    fun memberIdVal() = preferenceStore.getString(Preference.privateKey("eh_ipb_member_id"), "")
+
+    fun passHashVal() = preferenceStore.getString(Preference.privateKey("eh_ipb_pass_hash"), "")
+    fun igneousVal() = preferenceStore.getString(Preference.privateKey("eh_igneous"), "")
+    fun ehSettingsProfile() = preferenceStore.getInt(Preference.privateKey("eh_ehSettingsProfile"), -1)
+    fun exhSettingsProfile() = preferenceStore.getInt(Preference.privateKey("eh_exhSettingsProfile"), -1)
+    fun exhSettingsKey() = preferenceStore.getString(Preference.privateKey("eh_settingsKey"), "")
+    fun exhSessionCookie() = preferenceStore.getString(Preference.privateKey("eh_sessionCookie"), "")
+    fun exhHathPerksCookies() = preferenceStore.getString(Preference.privateKey("eh_hathPerksCookie"), "")
+
+    fun exhShowSettingsUploadWarning() = preferenceStore.getBoolean("eh_showSettingsUploadWarning2", true)
+
+    // default Daily. The worker only re-checks each gallery once per day anyway, so a tighter
+    // schedule just wakes up to skip; 24 also keeps the value within the settings frequency options.
+    fun exhAutoUpdateFrequency() = preferenceStore.getInt("eh_auto_update_frequency", 24)
+
+    fun exhAutoUpdateRequirements() = preferenceStore.getStringSet("eh_auto_update_restrictions", emptySet())
+
+    fun exhAutoUpdateStats() = preferenceStore.getString(Preference.appStateKey("eh_auto_update_stats"), "")
+
+    // one-way favorites backup to the E-Hentai account (push add, opt-in remote remove).
+    fun exhBackupFavoritesToAccount() = preferenceStore.getBoolean("eh_backup_favorites_to_account", false)
+
+    fun exhFavoritesBackupSlot() = preferenceStore.getInt("eh_favorites_backup_slot", 0)
+
+    /** The one gate for pushing library adds to the account: signed in, with the backup switched on. */
+    fun isFavoritesBackupOn() = enableExhentai().get() && exhBackupFavoritesToAccount().get()
+
+    fun exhWatchedListDefaultState() = preferenceStore.getBoolean("eh_watched_list_default_state", false)
+
+    fun exhSettingsLanguages() = preferenceStore.getString(
+        "eh_settings_languages",
+        "false*false*false\nfalse*false*false\nfalse*false*false\nfalse*false*false\nfalse*false*false\n" +
+            "false*false*false\nfalse*false*false\nfalse*false*false\nfalse*false*false\nfalse*false*false\n" +
+            "false*false*false\nfalse*false*false\nfalse*false*false\nfalse*false*false\nfalse*false*false\n" +
+            "false*false*false\nfalse*false*false",
+    )
+
+    fun exhEnabledCategories() = preferenceStore.getString(
+        "eh_enabled_categories",
+        "false,false,false,false,false,false,false,false,false,false",
+    )
+
+    fun enhancedEHentaiView() = preferenceStore.getBoolean("enhanced_e_hentai_view", true)
+}

@@ -1,0 +1,48 @@
+package eu.kanade.tachiyomi.data.backup.models
+
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.protobuf.ProtoNumber
+
+@Serializable
+data class Backup(
+    @ProtoNumber(1) val backupManga: List<BackupManga>,
+    @ProtoNumber(2) var backupCategories: List<BackupCategory> = emptyList(),
+    // @ProtoNumber(100) var backupBrokenSources, legacy source model with non-compliant proto number,
+    @ProtoNumber(101) var backupSources: List<BackupSource> = emptyList(),
+    @ProtoNumber(104) var backupPreferences: List<BackupPreference> = emptyList(),
+    @ProtoNumber(105) var backupSourcePreferences: List<BackupSourcePreferences> = emptyList(),
+    @ProtoNumber(106) var backupExtensionStores: List<BackupExtensionStore> = emptyList(),
+    // RK: light-novel library. Proto numbers in the 700 range stay clear of Mihon's
+    // (1-106) and Komikku's fork additions (600/610). Merge groups carry stable {url,source} refs
+    // (see BackupNovelMerge), since novel ids change on restore. 703 is no longer written, and is read only
+    // from a backup without field 718.
+    @ProtoNumber(700) var backupNovels: List<BackupNovel> = emptyList(),
+    @ProtoNumber(701) var backupNovelCategories: List<BackupNovelCategory> = emptyList(),
+    @ProtoNumber(702) var backupNovelMerges: List<BackupNovelMergeGroup> = emptyList(),
+    @ProtoNumber(703) var backupNovelUnmerges: List<BackupNovelMergeGroup> = emptyList(),
+    // RK: installed manga and novel extension apps (Mihon backs up only their repos). LN plugins need no
+    // field here: their install state already rides the preference backup (ln_installed_plugin_urls).
+    @ProtoNumber(710) var backupExtensions: List<BackupExtension> = emptyList(),
+    // RK: manga merge groups as stable {url,source} refs (see BackupMangaMerge), since manga ids change on
+    // restore, as backupNovelMerges at 702 does for novels. 712 is no longer written, and is read only from a
+    // backup without field 718.
+    @ProtoNumber(711) var backupMangaMerges: List<BackupMangaMergeGroup> = emptyList(),
+    @ProtoNumber(712) var backupMangaUnmerges: List<BackupMangaMergeGroup> = emptyList(),
+    // RK: custom info as Raito 0.3.x wrote it, read only. Custom info now rides on each entry
+    // (BackupCustomInfoFields), and restore folds these lists onto it through LegacyCustomInfo.
+    @ProtoNumber(713) var backupCustomMangaInfo: List<BackupCustomMangaInfo> = emptyList(),
+    @ProtoNumber(714) var backupCustomNovelInfo: List<BackupCustomNovelInfo> = emptyList(),
+    // RK: saved browse searches and the feed rows built on them, keyed by serialized SourceKey rather
+    // than by row id, which is what lets a restore match them against what is already here.
+    @ProtoNumber(715) var backupSavedSearches: List<BackupSavedSearch> = emptyList(),
+    @ProtoNumber(716) var backupFeedRows: List<BackupFeedRow> = emptyList(),
+    // RK: the name of each novel source the backup's novels use, the twin of backupSources at 101, type only.
+    @ProtoNumber(717) var backupNovelSources: List<BackupNovelSource> = emptyList(),
+    // RK: present when 711 and 702 hold every merge group; without it the backup is 0.3.x's, whose
+    // same-title groups restore rebuilds from its favourites, 712 / 703 and its auto-merge settings.
+    @ProtoNumber(718) var backupMergeGroupsStored: BackupMergeGroupsStored? = null,
+    // RK: present when the category flags carry the sort-override bit; Mihon and Raito before 0.3.0 wrote none.
+    @ProtoNumber(719) var backupSortOverridesStored: BackupSortOverridesStored? = null,
+    // RK: present when Kitsu scores are on Kitsu's native 2-20 scale; without it a restore may double them.
+    @ProtoNumber(720) var backupKitsuNativeScale: BackupKitsuNativeScale? = null,
+)

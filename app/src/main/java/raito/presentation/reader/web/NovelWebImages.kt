@@ -1,0 +1,72 @@
+package raito.presentation.reader.web
+
+import okhttp3.HttpUrl
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
+import org.jsoup.Jsoup
+import raito.data.coil.NovelImage
+import raito.novel.content.NovelChapterAddress
+import raito.novel.content.NovelImageSources
+import java.util.concurrent.ConcurrentHashMap
+
+/**
+ * Routes a chapter's online pictures through the app, so WebView mode fetches them with the source's own
+ * client and headers, as the text renderer does. Each address is rewritten to one on the host Android
+ * reserves for an app to answer itself, which the reader's `shouldInterceptRequest` serves; nothing
+ * else the page loads is touched. The source rides in the address because a merged novel's chapters
+ * can come from different sources. One per viewport: only an address it produced is served, since a
+ * chapter could otherwise name one (in a style or a script) that sends a source's headers anywhere.
+ */
+class NovelWebImages {
+
+    private val routed = ConcurrentHashMap.newKeySet<NovelImage>()
+
+    /** [html] with each online picture address rewritten; relative ones are resolved against [baseUrl]. */
+    fun rewrite(html: String, baseUrl: String?, sourceId: String?): String {
+        if (!html.contains("<img", ignoreCase = true) && !html.contains("<source", ignoreCase = true)) return html
+        val document = Jsoup.parseBodyFragment(html)
+        // Pretty-printing reflows preformatted text, the trap the download inliner avoids the same way.
+        document.outputSettings().prettyPrint(false)
+        document.select("img[src]").forEach { img ->
+            routed(NovelChapterAddress.absolute(baseUrl, img.attr("src")), sourceId)?.let { img.attr("src", it) }
+        }
+        document.select("img[srcset], source[srcset]").forEach { element ->
+            val candidates = NovelImageSources.parseSrcset(element.attr("srcset")).map { (url, descriptor) ->
+                val address = routed(NovelChapterAddress.absolute(baseUrl, url), sourceId) ?: url
+                if (descriptor.isEmpty()) address else "$address $descriptor"
+            }
+            element.attr("srcset", candidates.joinToString(", "))
+        }
+        return document.body().html()
+    }
+
+    /** The picture an address from [rewrite] stands for, or null for any other address. */
+    fun imageFor(url: String): NovelImage? {
+        val parsed = appAddressAt(url, PATH) ?: return null
+        val image = parsed.queryParameter("u") ?: return null
+        return NovelImage(image, parsed.queryParameter("s")).takeIf { it in routed }
+    }
+
+    private fun routed(url: String, sourceId: String?): String? {
+        if (!NovelChapterAddress.isWebAddress(url)) return null
+        routed += NovelImage(url, sourceId)
+        return appAddress(PATH)
+            .addQueryParameter("u", url)
+            .apply { sourceId?.let { addQueryParameter("s", it) } }
+            .build()
+            .toString()
+    }
+
+    companion object {
+        /** The host Android reserves for an app to answer itself, which the reader's fonts use too. */
+        const val HOST = "appassets.androidplatform.net"
+        private const val PATH = "rk-image"
+
+        /** An address on [HOST] at [path], which the reader's `shouldInterceptRequest` answers. */
+        internal fun appAddress(path: String): HttpUrl.Builder =
+            HttpUrl.Builder().scheme("https").host(HOST).addPathSegment(path)
+
+        /** [url] when it is an [appAddress] at [path], else null. */
+        internal fun appAddressAt(url: String, path: String): HttpUrl? =
+            url.toHttpUrlOrNull()?.takeIf { it.host == HOST && it.pathSegments == listOf(path) }
+    }
+}

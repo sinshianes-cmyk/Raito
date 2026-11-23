@@ -1,0 +1,26 @@
+package raito.domain.novel.interactor
+
+import dev.zacsweers.metro.Inject
+import eu.kanade.tachiyomi.ui.reader.setting.ReaderOrientation
+import raito.domain.novel.NovelRepository
+import raito.domain.novel.model.NovelUpdate
+import raito.domain.novel.model.setNovelFlag
+
+/**
+ * Per-novel reader viewer-flag writes, the novel twin of
+ * [eu.kanade.domain.manga.interactor.SetMangaViewerFlags], pinned by ViewerOrientationConformanceTest.
+ * Novels carry only the orientation bits (the reader is text-based, so there is no reading-mode).
+ * Reads the current flags and writes only the [viewer_flags] column via a [NovelUpdate].
+ */
+@Inject
+class SetNovelViewerFlags(
+    private val novelRepository: NovelRepository,
+) {
+
+    suspend fun awaitSetOrientation(id: Long, flag: Long) {
+        val novel = novelRepository.getById(id) ?: return
+        novelRepository.update(
+            NovelUpdate(id) { viewerFlags = setNovelFlag(novel.viewerFlags, flag, ReaderOrientation.MASK.toLong()) },
+        )
+    }
+}

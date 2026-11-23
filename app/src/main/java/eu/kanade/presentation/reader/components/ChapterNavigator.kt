@@ -1,0 +1,312 @@
+package eu.kanade.presentation.reader.components
+
+import androidx.compose.foundation.background
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsDraggedAsState
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.IconButtonColors
+import androidx.compose.material3.IconButtonDefaults
+import androidx.compose.material3.Slider
+import androidx.compose.material3.SliderState
+import androidx.compose.material3.Text
+import androidx.compose.material3.rememberSliderState
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.platform.LocalLayoutDirection
+import androidx.compose.ui.tooling.preview.Preview
+import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.LayoutDirection
+import androidx.compose.ui.unit.dp
+import eu.kanade.presentation.theme.TachiyomiPreviewTheme
+import eu.kanade.presentation.util.isTabletUi
+import mihon.icons.materialsymbols.MaterialSymbols
+import mihon.icons.materialsymbols.rounded.SkipNext
+import mihon.icons.materialsymbols.rounded.SkipPrevious
+import raito.domain.reader.ChapterProgress
+import raito.domain.reader.fraction
+import raito.domain.reader.isSeekable
+import raito.domain.reader.leadingLabel
+import raito.domain.reader.seekTo
+import raito.domain.reader.stepCount
+import raito.domain.reader.trailingLabel
+import raito.presentation.reader.VerticalReaderRail
+import raito.presentation.reader.readerChromeColor
+import tachiyomi.i18n.MR
+import tachiyomi.presentation.core.i18n.stringResource
+
+enum class ChapterNavigatorType {
+    HORIZONTAL_LTR,
+    HORIZONTAL_RTL,
+    VERTICAL_LEFT,
+    VERTICAL_RIGHT,
+
+    // RK: no navigator at all; the chapter buttons are drawn in the bottom bar instead
+    NONE,
+    ;
+
+    fun isHorizontal() = this in setOf(HORIZONTAL_LTR, HORIZONTAL_RTL)
+
+    // RK
+    fun isVertical() = this in setOf(VERTICAL_LEFT, VERTICAL_RIGHT)
+}
+
+@Composable
+fun ChapterNavigator(
+    type: ChapterNavigatorType,
+    onNextChapter: () -> Unit,
+    enabledNext: Boolean,
+    onPreviousChapter: () -> Unit,
+    enabledPrevious: Boolean,
+    // RK --> a typed position replaces upstream's page index and page count
+    progress: ChapterProgress?,
+    onSeek: (ChapterProgress) -> Unit,
+    onSeekFinished: () -> Unit,
+    // RK <--
+    modifier: Modifier = Modifier,
+) {
+    val haptic = LocalHapticFeedback.current
+
+    // RK --> the thumb runs 0..1 over a step count the position kernel clamps, so the page arithmetic
+    // that used to hand Material a negative step count for a one-page chapter cannot arise here.
+    // Keep the range constant: a page-derived one inverts to an empty range at a page count of 0,
+    // and Material coerces into it on every value write.
+    val fraction = progress?.fraction ?: 0f
+    val steps = progress?.stepCount ?: 0
+    val state = key(steps) {
+        rememberSliderState(value = fraction, steps = steps, trackRange = 0f..1f)
+    }
+    state.value = fraction
+    val onSeekFraction: (Float) -> Unit = { value -> progress?.let { onSeek(it.seekTo(value)) } }
+    // RK <--
+
+    val interactionSource = remember { MutableInteractionSource() }
+    val sliderDragged by interactionSource.collectIsDraggedAsState()
+    // RK
+    LaunchedEffect(fraction) {
+        if (sliderDragged) {
+            haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+        }
+    }
+
+    val isTabletUi = isTabletUi()
+    val mainAxisPadding = if (isTabletUi) 24.dp else 8.dp
+
+    // Match with toolbar background color set in ReaderActivity
+    val backgroundColor = readerChromeColor() // RK: the scrim the bars and the rail share (see ReaderChrome)
+    val buttonColor = IconButtonDefaults.filledIconButtonColors(
+        containerColor = backgroundColor,
+        disabledContainerColor = backgroundColor,
+    )
+
+    // RK: onPageChange became onSeekFraction, above
+    if (type.isHorizontal()) {
+        HorizontalChapterNavigator(
+            isRtl = type == ChapterNavigatorType.HORIZONTAL_RTL,
+            state = state,
+            // RK
+            onSeekFraction = onSeekFraction,
+            // RK
+            onSeekFinished = onSeekFinished,
+            onNextChapter = onNextChapter,
+            enabledNext = enabledNext,
+            onPreviousChapter = onPreviousChapter,
+            enabledPrevious = enabledPrevious,
+            // RK
+            progress = progress,
+            interactionSource = interactionSource,
+            mainAxisPadding = mainAxisPadding,
+            backgroundColor = backgroundColor,
+            buttonColor = buttonColor,
+            modifier = modifier,
+        )
+    } else {
+        // RK --> the shared rail takes its own padding and colours, see VerticalChapterNavigator
+        VerticalChapterNavigator(
+            state = state,
+            onSeekFraction = onSeekFraction,
+            onSeekFinished = onSeekFinished,
+            onNextChapter = onNextChapter,
+            enabledNext = enabledNext,
+            onPreviousChapter = onPreviousChapter,
+            enabledPrevious = enabledPrevious,
+            progress = progress,
+            interactionSource = interactionSource,
+            modifier = modifier,
+        )
+        // RK <--
+    }
+}
+
+@Composable
+fun HorizontalChapterNavigator(
+    isRtl: Boolean,
+    // RK --> always a state, since the range no longer depends on the page count
+    state: SliderState,
+    onSeekFraction: (Float) -> Unit,
+    onSeekFinished: () -> Unit,
+    // RK <--
+    onNextChapter: () -> Unit,
+    enabledNext: Boolean,
+    onPreviousChapter: () -> Unit,
+    enabledPrevious: Boolean,
+    // RK
+    progress: ChapterProgress?,
+    interactionSource: MutableInteractionSource,
+    mainAxisPadding: Dp,
+    backgroundColor: Color,
+    buttonColor: IconButtonColors,
+    modifier: Modifier = Modifier,
+) {
+    val layoutDirection = if (isRtl) LayoutDirection.Rtl else LayoutDirection.Ltr
+
+    // We explicitly handle direction based on the reader viewer rather than the system direction
+    CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Ltr) {
+        Row(
+            // RK --> DropSauce's floating reader toolbar: prev, slider and next share one rounded tonal
+            // pill with the same 16dp side margins as the action row below it.
+            modifier = modifier
+                .fillMaxWidth()
+                .padding(horizontal = if (mainAxisPadding > 8.dp) mainAxisPadding else 16.dp)
+                .clip(RoundedCornerShape(32.dp))
+                .background(backgroundColor)
+                .padding(horizontal = 4.dp, vertical = 2.dp),
+            // RK <--
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            IconButton(
+                enabled = if (isRtl) enabledNext else enabledPrevious,
+                onClick = if (isRtl) onNextChapter else onPreviousChapter,
+            ) {
+                Icon(
+                    imageVector = MaterialSymbols.Rounded.SkipPrevious,
+                    contentDescription = stringResource(
+                        if (isRtl) MR.strings.action_next_chapter else MR.strings.action_previous_chapter,
+                    ),
+                )
+            }
+
+            // RK
+            if (progress != null && progress.isSeekable) {
+                CompositionLocalProvider(LocalLayoutDirection provides layoutDirection) {
+                    Row(
+                        modifier = Modifier
+                            .weight(1f)
+                            .padding(horizontal = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Box(contentAlignment = Alignment.CenterEnd) {
+                            // RK --> labels from the position kernel, in the unit the medium counts in
+                            Text(text = progress.leadingLabel)
+                            // Taking up full length so the slider doesn't shift when the label length changes
+                            Text(text = progress.trailingLabel, color = Color.Transparent)
+                            // RK <--
+                        }
+
+                        Slider(
+                            state = state,
+                            modifier = Modifier
+                                .weight(1f)
+                                .padding(horizontal = 8.dp),
+                            // RK --> seeks by fraction
+                            onValueChange = onSeekFraction,
+                            onValueChangeFinished = onSeekFinished,
+                            // RK <--
+                            interactionSource = interactionSource,
+                        )
+
+                        // RK
+                        Text(text = progress.trailingLabel)
+                    }
+                }
+            } else {
+                Spacer(Modifier.weight(1f))
+            }
+
+            IconButton(
+                enabled = if (isRtl) enabledPrevious else enabledNext,
+                onClick = if (isRtl) onPreviousChapter else onNextChapter,
+            ) {
+                Icon(
+                    imageVector = MaterialSymbols.Rounded.SkipNext,
+                    contentDescription = stringResource(
+                        if (isRtl) MR.strings.action_previous_chapter else MR.strings.action_next_chapter,
+                    ),
+                )
+            }
+        }
+    }
+}
+
+// RK --> delegates to the shared VerticalReaderRail; the labels come from the position kernel, in
+// whatever unit the medium counts in.
+@Composable
+fun VerticalChapterNavigator(
+    state: SliderState,
+    onSeekFraction: (Float) -> Unit,
+    onSeekFinished: () -> Unit,
+    onNextChapter: () -> Unit,
+    enabledNext: Boolean,
+    onPreviousChapter: () -> Unit,
+    enabledPrevious: Boolean,
+    progress: ChapterProgress?,
+    interactionSource: MutableInteractionSource,
+    modifier: Modifier = Modifier,
+) {
+    VerticalReaderRail(
+        sliderState = state.takeIf { progress?.isSeekable == true },
+        onSeek = onSeekFraction,
+        onSeekFinished = onSeekFinished,
+        topLabel = progress?.leadingLabel.orEmpty(),
+        bottomLabel = progress?.trailingLabel.orEmpty(),
+        onPreviousChapter = onPreviousChapter,
+        enabledPrevious = enabledPrevious,
+        onNextChapter = onNextChapter,
+        enabledNext = enabledNext,
+        interactionSource = interactionSource,
+        modifier = modifier,
+    )
+}
+// RK <--
+
+@Preview
+@Composable
+private fun ChapterNavigatorPreview() {
+    // RK
+    var progress by remember {
+        mutableStateOf<ChapterProgress>(ChapterProgress.Pages(lastPageRead = 0, pageCount = 10))
+    }
+    TachiyomiPreviewTheme {
+        ChapterNavigator(
+            type = ChapterNavigatorType.VERTICAL_RIGHT,
+            onNextChapter = {},
+            enabledNext = true,
+            onPreviousChapter = {},
+            enabledPrevious = true,
+            // RK -->
+            progress = progress,
+            onSeek = { progress = it },
+            onSeekFinished = {},
+            // RK <--
+        )
+    }
+}

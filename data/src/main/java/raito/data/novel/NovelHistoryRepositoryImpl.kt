@@ -1,0 +1,121 @@
+package raito.data.novel
+
+import app.cash.sqldelight.async.coroutines.awaitAsList
+import app.cash.sqldelight.async.coroutines.awaitAsOne
+import app.cash.sqldelight.async.coroutines.awaitAsOneOrNull
+import dev.zacsweers.metro.AppScope
+import dev.zacsweers.metro.ContributesBinding
+import dev.zacsweers.metro.Inject
+import dev.zacsweers.metro.SingleIn
+import kotlinx.coroutines.flow.Flow
+import logcat.LogPriority
+import raito.domain.backup.RestoredChapterHistory
+import raito.domain.novel.NovelHistoryRepository
+import raito.domain.novel.model.NovelHistory
+import raito.domain.novel.model.NovelHistoryUpdate
+import raito.domain.novel.model.NovelHistoryWithRelations
+import tachiyomi.core.common.util.system.logcat
+import tachiyomi.data.Database
+import tachiyomi.data.subscribeToList
+import kotlin.time.Instant
+
+@Inject
+@SingleIn(AppScope::class)
+@ContributesBinding(AppScope::class)
+class NovelHistoryRepositoryImpl(
+    private val database: Database,
+) : NovelHistoryRepository {
+
+    override fun getNovelHistory(
+        query: String,
+        includedCategories: List<Long>,
+        excludedCategories: List<Long>,
+    ): Flow<List<NovelHistoryWithRelations>> =
+        database.novelHistoryViewQueries.novelHistory(
+            query = query,
+            includedEmpty = includedCategories.isEmpty(),
+            includedCategories = includedCategories,
+            excludedEmpty = excludedCategories.isEmpty(),
+            excludedCategories = excludedCategories,
+            mapper = ::mapNovelHistoryWithRelations,
+        ).subscribeToList()
+
+    override suspend fun getLastNovelHistory(): NovelHistoryWithRelations? =
+        database.novelHistoryViewQueries.getLatestNovelHistory(::mapNovelHistoryWithRelations).awaitAsOneOrNull()
+
+    override suspend fun resetNovelHistory(historyId: Long) {
+        try {
+            database.novel_historyQueries.resetById(historyId)
+        } catch (e: Exception) {
+            logcat(LogPriority.ERROR, e) { "Failed to reset novel history id=$historyId" }
+        }
+    }
+
+    override suspend fun resetNovelHistoryByNovelId(novelId: Long) {
+        try {
+            database.novel_historyQueries.resetByNovelId(novelId)
+        } catch (e: Exception) {
+            logcat(LogPriority.ERROR, e) { "Failed to reset novel history for novelId=$novelId" }
+        }
+    }
+
+    override suspend fun deleteAllNovelHistory(): Boolean =
+        try {
+            database.novel_historyQueries.removeAll()
+            // The reading log goes with the time it adds up to, as for manga.
+            database.reading_sessionQueries.removeAllNovel()
+            true
+        } catch (e: Exception) {
+            logcat(LogPriority.ERROR, e) { "Failed to clear novel history" }
+            false
+        }
+
+    override suspend fun deleteNovelHistorySince(since: kotlin.time.Instant): Boolean =
+        try {
+            database.reading_sessionQueries.removeNovelSince(since.toEpochMilliseconds())
+            database.novel_historyQueries.removeSince(since)
+            true
+        } catch (e: Exception) {
+            logcat(LogPriority.ERROR, e) { "Failed to clear novel history since $since" }
+            false
+        }
+
+    override suspend fun deleteNovelHistoryOutsideLibrary(): Boolean =
+        try {
+            database.reading_sessionQueries.removeNovelOutsideLibrary()
+            database.novel_historyQueries.removeOutsideLibrary()
+            true
+        } catch (e: Exception) {
+            logcat(LogPriority.ERROR, e) { "Failed to clear novel history outside the library" }
+            false
+        }
+
+    override suspend fun upsertNovelHistory(update: NovelHistoryUpdate) {
+        try {
+            database.novel_historyQueries.upsert(update.chapterId, update.readAt, update.sessionReadDuration)
+        } catch (e: Exception) {
+            logcat(LogPriority.ERROR, e) { "Failed to upsert novel history chapterId=${update.chapterId}" }
+        }
+    }
+
+    override suspend fun getHistoryByNovelId(novelId: Long): List<NovelHistory> =
+        database.novel_historyQueries.getHistoryByNovelId(novelId) { chapterId, readAt, readDuration ->
+            NovelHistory(chapterId, readAt, readDuration)
+        }.awaitAsList()
+
+    override suspend fun getUrlKeyedHistoryByNovelIds(novelIds: List<Long>): Map<Long, List<RestoredChapterHistory>> =
+        database.novel_historyQueries.getUrlKeyedHistoryByNovelIds(novelIds) { novelId, url, readAt, readDuration ->
+            novelId to RestoredChapterHistory(url, readAt, readDuration)
+        }.awaitAsList().groupBy({ it.first }, { it.second })
+
+    override suspend fun restoreHistory(chapterId: Long, readAt: Instant?, readDuration: Long) {
+        database.novel_historyQueries.restoreUpsert(chapterId, readAt, readDuration)
+    }
+
+    override suspend fun seedLastRead(novelId: Long, readAt: Instant) {
+        database.novel_historyQueries.seedLastRead(readAt = readAt, novelId = novelId)
+    }
+
+    override suspend fun getTotalReadDuration(): Long =
+        database.novel_historyQueries.getTotalReadDuration().awaitAsOne()
+}

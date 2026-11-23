@@ -1,0 +1,699 @@
+package eu.kanade.tachiyomi.extension
+
+import android.content.Context
+import dev.zacsweers.metro.AppScope
+import dev.zacsweers.metro.Inject
+import dev.zacsweers.metro.SingleIn
+import eu.kanade.domain.extension.interactor.TrustExtension
+import eu.kanade.domain.source.service.SourcePreferences
+import eu.kanade.tachiyomi.extension.api.ExtensionUpdateNotifier
+import eu.kanade.tachiyomi.extension.model.Extension
+import eu.kanade.tachiyomi.extension.model.InstallStep
+import eu.kanade.tachiyomi.extension.util.ExtensionInstallReceiver
+import eu.kanade.tachiyomi.extension.util.ExtensionInstaller
+import eu.kanade.tachiyomi.extension.util.ExtensionLoader
+import eu.kanade.tachiyomi.util.system.toast
+import exh.source.BlacklistedSources
+import exh.source.ExhPreferences
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.onStart
+import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import logcat.LogPriority
+import mihon.core.metro.AppCoroutineScope
+import mihon.domain.extension.interactor.UpdateExtensionStores
+import mihon.domain.extension.model.ExtensionStore
+import mihon.domain.extension.repository.ExtensionStoreRepository
+import raito.domain.extension.KindListing
+import raito.domain.extension.RepoStatus
+import raito.domain.extension.SharedRefresh
+import raito.domain.extension.hasSigningKey
+import raito.domain.extension.hasUpdate
+import raito.domain.extension.installUpdate
+import raito.domain.extension.kindListing
+import raito.domain.extension.pendingUpdate
+import raito.domain.extension.signingKeys
+import raito.domain.extension.toRepoStatus
+import raito.domain.novel.NovelPreferences
+import raito.domain.source.ContentWarningScan
+import raito.domain.source.contentWarningScan
+import raito.domain.source.contentWarningScanChanges
+import raito.domain.source.reloadWhenScanStale
+import raito.novel.source.novelSourceId
+import tachiyomi.core.common.i18n.stringResource
+import tachiyomi.core.common.util.lang.launchIO
+import tachiyomi.core.common.util.lang.withIOContext
+import tachiyomi.core.common.util.lang.withUIContext
+import tachiyomi.core.common.util.system.logcat
+import tachiyomi.domain.source.model.StubSource
+import tachiyomi.i18n.MR
+import java.util.Locale
+
+/**
+ * The manager of extensions installed as another apk which extend the available sources. It handles
+ * the retrieval of remotely available extensions as well as installing, updating and removing them.
+ * To avoid malicious distribution, every extension must be signed and it will only be loaded if its
+ * signature is trusted, otherwise the user will be prompted with a warning to trust it before being
+ * loaded.
+ */
+@Inject
+@SingleIn(AppScope::class)
+class ExtensionManager(
+    @AppCoroutineScope private val scope: CoroutineScope,
+    private val context: Context,
+    private val preferences: SourcePreferences,
+    private val trustExtension: TrustExtension,
+    // RK: gates hiding the stock E-Hentai extension while built-in EH is active.
+    private val exhPreferences: ExhPreferences,
+    private val extensionStoreRepository: ExtensionStoreRepository,
+    private val updateExtensionStores: UpdateExtensionStores,
+    private val installer: ExtensionInstaller,
+    private val extensionUpdateNotifier: ExtensionUpdateNotifier,
+    // RK: keeps the listing's icons for a novel app whose own icon shows nothing
+    private val novelPreferences: NovelPreferences,
+) {
+
+    private val initialized = CompletableDeferred<Unit>()
+
+    // A full load replaces both maps, so install events wait for it and apply on top instead of being overwritten
+    private val loadMutex = Mutex()
+
+    @Volatile
+    private var stores = emptyList<ExtensionStore>()
+
+    private val loadedExtensionMapFlow = MutableStateFlow(emptyMap<String, Extension.Loaded>())
+    val loadedExtensionsFlow = loadedExtensionMapFlow.mapExtensionsWhenInitialized()
+
+    // Every store's listing, since more than one store can list the same extension
+    private val availableExtensionListFlow = MutableStateFlow(emptyList<Extension.Available>())
+
+    // Stores sharing a signing key serve the same apks, so only the newest of their listings is shown. Stores
+    // with different keys offer different apks, each installable, so each keeps its own.
+    val availableExtensionsFlow = availableExtensionListFlow.mapListings(scope) // RK: through the EH gate
+
+    private val notLoadedExtensionMapFlow = MutableStateFlow(emptyMap<String, Extension.NotLoaded>())
+    val notLoadedExtensionsFlow = notLoadedExtensionMapFlow.mapExtensionsWhenInitialized()
+
+    // RK --> novel apks are split off where they arrive, so the maps above, and every manga reader
+    // of them (source registration, stub rows, lists, update counts, backups), stay manga only.
+    private val availableNovelExtensionListFlow = MutableStateFlow(emptyList<Extension.Available>())
+    val availableNovelExtensionsFlow = availableNovelExtensionListFlow.mapListings(scope)
+
+    private val loadedNovelExtensionMapFlow = MutableStateFlow(emptyMap<String, Extension.Loaded>())
+    val loadedNovelExtensionsFlow = loadedNovelExtensionMapFlow.mapExtensionsWhenInitialized()
+
+    private val notLoadedNovelExtensionMapFlow = MutableStateFlow(emptyMap<String, Extension.NotLoaded>())
+    val notLoadedNovelExtensionsFlow = notLoadedNovelExtensionMapFlow.mapExtensionsWhenInitialized()
+
+    /** Installed novel apks with an update pending, loaded or not, derived where manga's is a stored count. */
+    val novelUpdatesCount: StateFlow<Int> = combine(loadedNovelExtensionMapFlow, notLoadedNovelExtensionMapFlow) {
+            loaded,
+            notLoaded,
+        ->
+        (loaded.values + notLoaded.values).count { it.hasUpdate }
+    }
+        .stateIn(scope, SharingStarted.Eagerly, 0)
+
+    /** Each store's outcome from the last [findAvailableExtensions], keyed by index URL; null before one. */
+    val storeStatuses: StateFlow<Map<String, RepoStatus>?>
+        field = MutableStateFlow<Map<String, RepoStatus>?>(null)
+    // RK <--
+
+    // RK --> loadMutex also keeps scans one at a time. A scan runs from three places on this scope, and
+    // each pass assigns both maps wholesale from a store list it read when it started, so a slow startup
+    // scan landing after a re-trust would put every extension back to Untrusted until the next launch.
+    // LnPluginInstaller.loadMutex holds the LN plugin loads the same way; the pair stands in for a
+    // conformance test (docs/dev/subsystems/browse-and-sources.md).
+
+    /** The content-warning settings the latest scan judged against, see [reloadWhenScanStale]. */
+    @Volatile
+    private var scannedContentWarnings: ContentWarningScan? = null
+
+    /**
+     * The keys of the added stores that have one, read at each scan and listing fetch. The first scan
+     * finishes before the install receiver is registered, so every status sees stored keys.
+     */
+    @Volatile
+    private var storeKeys: Set<String> = emptySet()
+    // RK <--
+
+    init {
+        // RK: coroutine helper in place of upstream's raw dispatcher
+        scope.launchIO {
+            loadExtensions()
+            ExtensionInstallReceiver(InstallationListener(), scope).register(context)
+
+            // Everything the load decision rests on can change while running, so decide again
+            // RK --> content warnings compare against what the scan used rather than drop(1), which
+            // lost a write landing during the first scan (the upgrade carry, a backup restore).
+            launch {
+                preferences.contentWarningScanChanges()
+                    .reloadWhenScanStale({ scannedContentWarnings }) { loadExtensions() }
+            }
+            trustExtension.changes()
+                // RK <--
+                .collectLatest { loadExtensions() }
+        }
+
+        // Extensions are only reloaded when the set of signing keys changes, which misses a store being
+        // removed while another with the same key stays, or a store being renamed
+        // RK: coroutine helper in place of upstream's raw dispatcher
+        scope.launchIO {
+            initialized.await()
+            extensionStoreRepository.getAllAsFlow().collect(::assignStores)
+        }
+    }
+
+    private var subLanguagesEnabledOnFirstRun = preferences.enabledLanguages.isSet()
+
+    suspend fun getLoadedExtensions(): List<Extension.Loaded> {
+        initialized.await()
+        return loadedExtensionMapFlow.value.values.toList()
+    }
+
+    suspend fun getNotLoadedExtensions(): List<Extension.NotLoaded> {
+        initialized.await()
+        return notLoadedExtensionMapFlow.value.values.toList()
+    }
+
+    // RK -->
+
+    suspend fun getLoadedNovelExtensions(): List<Extension.Loaded> {
+        initialized.await()
+        return loadedNovelExtensionMapFlow.value.values.toList()
+    }
+
+    suspend fun getNotLoadedNovelExtensions(): List<Extension.NotLoaded> {
+        initialized.await()
+        return notLoadedNovelExtensionMapFlow.value.values.toList()
+    }
+
+    /**
+     * The novel apk providing the source [novelSourceId], matched by its whole text id, since the two
+     * apk formats share numbers.
+     */
+    fun getNovelExtensionPackageAsFlow(novelSourceId: String): Flow<String?> =
+        loadedNovelExtensionsFlow.map { extensions ->
+            extensions.find { extension ->
+                extension.sources.any { extension.kind.novelSourceId(it.id) == novelSourceId }
+            }?.pkgName
+        }
+    // RK <--
+
+    suspend fun getExtensionPackage(sourceId: Long): String? {
+        return getLoadedExtensions().find { extension ->
+            extension.sources.any { it.id == sourceId }
+        }
+            ?.pkgName
+    }
+
+    fun getExtensionPackageAsFlow(sourceId: Long): Flow<String?> {
+        return loadedExtensionsFlow.map { extensions ->
+            extensions.find { extension ->
+                extension.sources.any { it.id == sourceId }
+            }
+                ?.pkgName
+        }
+    }
+
+    private var availableExtensionsSourcesData: Map<Long, StubSource> = emptyMap()
+
+    private fun setupAvailableExtensionsSourcesDataMap(extensions: List<Extension.Available>) {
+        if (extensions.isEmpty()) return
+        availableExtensionsSourcesData = extensions
+            .flatMap { ext -> ext.sources.map { it.toStubSource() } }
+            .associateBy { it.id }
+    }
+
+    fun getSourceData(id: Long) = availableExtensionsSourcesData[id]
+
+    /**
+     * Loads and registers the installed extensions. Safe to call again: every extension is judged
+     * again, so one can move between loaded and not loaded in either direction, while extensions
+     * that still pass keep the instances they already had.
+     */
+    private suspend fun loadExtensions() = loadMutex.withLock {
+        // RK: serialized, see loadMutex
+        try {
+            // RK --> read before the loader reads them, so a write in between costs only a spare scan
+            val contentWarnings = preferences.contentWarningScan()
+            readStores()
+            // RK <--
+            // RK --> novel extensions go back in too, so a reload keeps their source instances
+            val (extensions, novelExtensions) = ExtensionLoader.loadExtensions(
+                context,
+                loadedExtensionMapFlow.value + loadedNovelExtensionMapFlow.value,
+            ).partition { it.kind == Extension.Kind.MANGA }
+
+            loadedNovelExtensionMapFlow.value = novelExtensions
+                .filterIsInstance<Extension.Loaded>()
+                .associateBy { it.pkgName }
+
+            notLoadedNovelExtensionMapFlow.value = novelExtensions
+                .filterIsInstance<Extension.NotLoaded>()
+                .associateBy { it.pkgName }
+            // RK <--
+
+            loadedExtensionMapFlow.value = extensions
+                .filterIsInstance<Extension.Loaded>()
+                .associateBy { it.pkgName }
+
+            notLoadedExtensionMapFlow.value = extensions
+                .filterIsInstance<Extension.NotLoaded>()
+                .associateBy { it.pkgName }
+            // RK: recorded once the scan lands, since a cancelled one judged nothing
+            scannedContentWarnings = contentWarnings
+
+            // Newly loaded extensions have no status derived from the store index yet
+            refreshStatuses()
+        } catch (e: Throwable) {
+            logcat(LogPriority.ERROR, e) { "Failed to load extensions" }
+        } finally {
+            // Release anything waiting on the extensions whether or not the load worked
+            initialized.complete(Unit)
+        }
+    }
+
+    // RK -->
+
+    /**
+     * Re-runs the installed scan and trust evaluation against the current repos.
+     *
+     * A store change re-scans on its own (see [init]), so this is the manual lever for the cases
+     * that flow cannot see: a scan that failed on a transient error, or an extension whose package
+     * changed without the receiver firing. Queues behind an in-flight scan rather than racing it.
+     */
+    fun reloadInstalledExtensions() {
+        scope.launchIO { loadExtensions() }
+    }
+    // RK <--
+
+    /**
+     * Finds the available extensions in the stores and updates [availableExtensionListFlow].
+     */
+    suspend fun findAvailableExtensions() {
+        val extensions: List<Extension.Available> = try {
+            fetchExtensions()
+        } catch (e: Exception) {
+            logcat(LogPriority.ERROR, e)
+            withUIContext { context.toast(MR.strings.extension_api_error) }
+            return
+        }
+
+        setAvailableExtensions(extensions)
+    }
+
+    /**
+     * Refreshes the stores and their listings like [findAvailableExtensions], then notifies about the
+     * installed extensions that have an update. Stays silent when the stores can't be reached.
+     */
+    suspend fun checkForUpdates() {
+        val extensions = try {
+            updateExtensionStores()
+            fetchExtensions()
+        } catch (e: Exception) {
+            logcat(LogPriority.ERROR, e)
+            return
+        }
+
+        initialized.await()
+        setAvailableExtensions(extensions)
+
+        val names = (loadedExtensionMapFlow.value.values + notLoadedExtensionMapFlow.value.values)
+            // RK: novel apks share the notice, since one store index lists both
+            .plus(loadedNovelExtensionMapFlow.value.values + notLoadedNovelExtensionMapFlow.value.values)
+            // RK: a badge a store outage kept has nothing to install, so it is left out of the notice
+            .filter { it.pendingUpdate(extensions, storeKeys) != null }
+            .map { it.name }
+        if (names.isNotEmpty()) {
+            extensionUpdateNotifier.promptUpdates(names)
+        }
+    }
+
+    // RK: fetched per store, so each store's outcome is kept for the Repos screen
+    private suspend fun fetchExtensions(): List<Extension.Available> {
+        val byStore = withIOContext { extensionStoreRepository.fetchExtensionsByStore() }
+        storeStatuses.value = byStore.mapValues { (_, result) -> result.toRepoStatus() }
+        return byStore.values.flatMap { it.getOrDefault(emptyList()) }
+    }
+
+    private suspend fun setAvailableExtensions(fetched: List<Extension.Available>) {
+        // RK --> novel entries leave here, so languages and stub data below see manga only
+        val (extensions, novelExtensions) = fetched.partition { it.kind == Extension.Kind.MANGA }
+        availableNovelExtensionListFlow.value = novelExtensions
+        readStores()
+        novelPreferences.addIconHints(
+            packages = novelExtensions.associate { it.pkgName to it.iconUrl },
+            siteIcons = novelExtensions.flatMap { extension ->
+                extension.sources.map { it.baseUrl to extension.iconUrl }
+            },
+        )
+        // RK <--
+
+        enableAdditionalSubLanguages(extensions)
+
+        availableExtensionListFlow.value = extensions
+        refreshStatuses()
+        setupAvailableExtensionsSourcesDataMap(extensions)
+    }
+
+    /**
+     * Enables the additional sub-languages in the app first run. This addresses
+     * the issue where users still need to enable some specific languages even when
+     * the device language is inside that major group. As an example, if a user
+     * has a zh device language, the app will also enable zh-Hans and zh-Hant.
+     *
+     * If the user have already changed the enabledLanguages preference value once,
+     * the new languages will not be added to respect the user enabled choices.
+     */
+    private fun enableAdditionalSubLanguages(extensions: List<Extension.Available>) {
+        if (subLanguagesEnabledOnFirstRun || extensions.isEmpty()) {
+            return
+        }
+
+        // Use the source lang as some aren't present on the extension level.
+        val availableLanguages = extensions
+            .flatMap(Extension.Available::sources)
+            .distinctBy(Extension.Available.Source::lang)
+            .map(Extension.Available.Source::lang)
+
+        val deviceLanguage = Locale.getDefault().language
+        val defaultLanguages = preferences.enabledLanguages.defaultValue()
+        val languagesToEnable = availableLanguages.filter {
+            it != deviceLanguage && it.startsWith(deviceLanguage)
+        }
+
+        preferences.enabledLanguages.set(defaultLanguages + languagesToEnable)
+        subLanguagesEnabledOnFirstRun = true
+    }
+
+    /**
+     * Returns a flow of the installation process for the given extension. It will complete
+     * once the extension is installed or throws an error. The process will be canceled if
+     * unsubscribed before its completion.
+     *
+     * @param extension The extension to be installed.
+     */
+    fun installExtension(extension: Extension.Available): Flow<InstallStep> {
+        return installer.downloadAndInstall(extension)
+    }
+
+    /**
+     * Returns a flow of the installation process for the given extension. It will complete
+     * once the extension is updated or throws an error. The process will be canceled if
+     * unsubscribed before its completion.
+     *
+     * @param extension The extension to be updated.
+     */
+    fun updateExtension(extension: Extension.Installed): Flow<InstallStep> {
+        // RK --> either kind's listings, fetched again once when they have none, see installUpdate
+        return installUpdate(
+            findUpdate = {
+                extension.findUpdate(
+                    availableExtensionListFlow.value + availableNovelExtensionListFlow.value,
+                    storeKeys,
+                )
+            },
+            refetch = listingRefetch::invoke,
+            unreachable = { InstallStep.Error(context.stringResource(MR.strings.ext_update_store_unreachable)) },
+        ) { update ->
+            // RK <--
+            val isUpdateForPrivatelyInstalled = !extension.isShared
+            installer.downloadAndInstall(update, isUpdateForPrivatelyInstalled)
+        }
+    }
+
+    // RK: shared, so Update all over the rows a store outage left without a listing fetches once
+    private val listingRefetch = SharedRefresh { setAvailableExtensions(fetchExtensions()) }
+
+    fun cancelInstallUpdateExtension(extension: Extension) {
+        installer.cancelInstall(extension.pkgName)
+    }
+
+    /**
+     * Sets to "installing" status of an extension installation.
+     *
+     * @param downloadId The id of the download.
+     */
+    fun setInstalling(downloadId: Long) {
+        installer.updateInstallStep(downloadId, InstallStep.Installing)
+    }
+
+    fun updateInstallStep(downloadId: Long, step: InstallStep) {
+        installer.updateInstallStep(downloadId, step)
+    }
+
+    /**
+     * Uninstalls the extension that matches the given package name.
+     *
+     * @param extension The extension to uninstall.
+     */
+    fun uninstallExtension(extension: Extension.Installed) {
+        installer.uninstallApk(extension.pkgName)
+    }
+
+    /**
+     * Adds the given extension to the list of trusted extensions. It also loads in background the
+     * now trusted extensions.
+     *
+     * @param extension the extension to trust
+     */
+    fun trust(extension: Extension.NotLoaded) {
+        val reason = extension.reason as? Extension.NotLoaded.Reason.Untrusted ?: return
+        notLoadedExtensionMapFlow.value[extension.pkgName]
+            ?: notLoadedNovelExtensionMapFlow.value[extension.pkgName] // RK
+            ?: return
+
+        // Loading it again is left to the reload triggered by the trust change
+        trustExtension.trust(extension.pkgName, extension.versionCode, reason.signatureHash)
+    }
+
+    /**
+     * Registers the given extension in this and the source managers.
+     *
+     * @param extension The extension to be registered.
+     */
+    private fun registerExtension(extension: Extension.Loaded) {
+        loadedExtensionMapFlow.update { it + extension }
+    }
+
+    /**
+     * Unregisters the extension in this and the source managers given its package name. Note this
+     * method is called for every uninstalled application in the system.
+     *
+     * @param pkgName The package name of the uninstalled application.
+     */
+    private fun unregisterExtension(pkgName: String) {
+        loadedExtensionMapFlow.update { it - pkgName }
+        notLoadedExtensionMapFlow.update { it - pkgName }
+        // RK -->
+        loadedNovelExtensionMapFlow.update { it - pkgName }
+        notLoadedNovelExtensionMapFlow.update { it - pkgName }
+        // RK <--
+    }
+
+    /**
+     * Listener which receives events of the extensions being installed, updated or removed.
+     */
+    private inner class InstallationListener : ExtensionInstallReceiver.Listener {
+
+        override suspend fun onExtensionLoaded(extension: Extension.Loaded) = loadMutex.withLock {
+            // RK -->
+            if (extension.kind != Extension.Kind.MANGA) {
+                loadedNovelExtensionMapFlow.update { it + extension }
+                notLoadedNovelExtensionMapFlow.update { it - extension.pkgName }
+                refreshStatuses()
+                return@withLock
+            }
+            // RK <--
+            registerExtension(extension)
+            notLoadedExtensionMapFlow.update { it - extension.pkgName }
+            refreshStatuses()
+        }
+
+        override suspend fun onExtensionNotLoaded(extension: Extension.NotLoaded) = loadMutex.withLock {
+            // RK -->
+            if (extension.kind != Extension.Kind.MANGA) {
+                loadedNovelExtensionMapFlow.update { it - extension.pkgName }
+                notLoadedNovelExtensionMapFlow.update { it + extension }
+                refreshStatuses()
+                return@withLock
+            }
+            // RK <--
+            loadedExtensionMapFlow.update { it - extension.pkgName }
+            notLoadedExtensionMapFlow.update { it + extension }
+            refreshStatuses()
+        }
+
+        override suspend fun onPackageUninstalled(pkgName: String) = loadMutex.withLock {
+            ExtensionLoader.uninstallPrivateExtension(context, pkgName)
+            unregisterExtension(pkgName)
+            updatePendingUpdatesCount()
+        }
+    }
+
+    /**
+     * Derives what the store listings say about every installed extension, loaded or not. Without any
+     * listing there's nothing to derive from, so they're left as they are rather than marked obsolete.
+     */
+    private fun refreshStatuses() {
+        // RK --> each apk kind against its own listings, over the same derivation
+        deriveStatuses(availableExtensionListFlow.value, loadedExtensionMapFlow, notLoadedExtensionMapFlow)
+        deriveStatuses(
+            availableNovelExtensionListFlow.value,
+            loadedNovelExtensionMapFlow,
+            notLoadedNovelExtensionMapFlow,
+        )
+        // RK <--
+        updatePendingUpdatesCount()
+    }
+
+    // RK --> upstream's refreshStatuses body, over one kind's maps and per apk; the store fill is the
+    // keyless one. Where upstream derives from whatever answered, an apk whose own store failed keeps
+    // its statuses, and one no store lists once its stores answered clears its update flag
+    // (KindListing), for manga as for novels.
+    private fun deriveStatuses(
+        available: List<Extension.Available>,
+        loaded: MutableStateFlow<Map<String, Extension.Loaded>>,
+        notLoaded: MutableStateFlow<Map<String, Extension.NotLoaded>>,
+    ) {
+        val statuses = storeStatuses.value
+        loaded.update { current ->
+            current.mapValues { (_, extension) ->
+                val kindListing = extension.kindListing(available, statuses, stores, storeKeys)
+                val hasUpdate = kindListing.hasUpdate(extension, available, storeKeys)
+                if (kindListing != KindListing.Listed) {
+                    extension.copy(hasUpdate = hasUpdate)
+                } else {
+                    val listing = extension.findListing(available, storeKeys)
+                    extension.copy(
+                        hasUpdate = hasUpdate,
+                        isObsolete = listing == null,
+                        store = if (stores.isEmpty()) extension.store else extension.pickStore(available),
+                    )
+                }
+            }
+        }
+        notLoaded.update { current ->
+            current.mapValues { (_, extension) ->
+                val kindListing = extension.kindListing(available, statuses, stores, storeKeys)
+                val hasUpdate = kindListing.hasUpdate(extension, available, storeKeys)
+                if (kindListing != KindListing.Listed) {
+                    extension.copy(hasUpdate = hasUpdate)
+                } else {
+                    extension.copy(
+                        hasUpdate = hasUpdate,
+                        store = if (stores.isEmpty()) extension.store else extension.pickStore(available),
+                    )
+                }
+            }
+        }
+    }
+    // RK <--
+
+    // RK: read at each scan and listing fetch as well as on a change, since a status derived before
+    // the first change lands must still know which stores each apk can come from. A keyless store's key
+    // is no key at all, so it never counts as one an apk could be signed with.
+    private suspend fun readStores() {
+        stores = extensionStoreRepository.getAll()
+        storeKeys = stores.signingKeys
+    }
+
+    /**
+     * Several stores can share a signing key, so one that lists the extension names where it comes from better
+     * than whichever of them was added first.
+     */
+    private fun Extension.Installed.pickStore(
+        available: List<Extension.Available> = availableExtensionListFlow.value, // RK: this apk kind's listings
+    ): ExtensionStore? {
+        val signingStores = stores.filter { it.signingKey in signatures }
+        val listedBy = available
+            .filter { it.pkgName == pkgName }
+            .mapTo(HashSet()) { it.store.indexUrl }
+        return signingStores.firstOrNull { it.indexUrl in listedBy } ?: signingStores.firstOrNull()
+            // RK: a keyless store names no key, so an apk it lists takes it from the listing, and keeps it
+            // while that store is still added
+            ?: findListing(available, storeKeys)?.store?.takeUnless { it.hasSigningKey }
+            ?: store?.takeUnless {
+                it.hasSigningKey
+            }?.let { current -> stores.find { it.indexUrl == current.indexUrl } }
+    }
+
+    private fun assignStores(stores: List<ExtensionStore>) {
+        this.stores = stores
+        loadedExtensionMapFlow.update { extensions ->
+            extensions.mapValues { (_, extension) -> extension.copy(store = extension.pickStore()) }
+        }
+        notLoadedExtensionMapFlow.update { extensions ->
+            extensions.mapValues { (_, extension) -> extension.copy(store = extension.pickStore()) }
+        }
+        // RK -->
+        loadedNovelExtensionMapFlow.update { extensions ->
+            extensions.mapValues { (_, extension) ->
+                extension.copy(store = extension.pickStore(availableNovelExtensionListFlow.value))
+            }
+        }
+        notLoadedNovelExtensionMapFlow.update { extensions ->
+            extensions.mapValues { (_, extension) ->
+                extension.copy(store = extension.pickStore(availableNovelExtensionListFlow.value))
+            }
+        }
+        // RK <--
+    }
+
+    private fun updatePendingUpdatesCount() {
+        val pendingUpdateCount = (loadedExtensionMapFlow.value.values + notLoadedExtensionMapFlow.value.values)
+            .count { it.hasUpdate }
+        preferences.extensionUpdatesCount.set(pendingUpdateCount)
+        // RK: the notice lists novel apks too, so it stays while either has one pending
+        val novelPending = (loadedNovelExtensionMapFlow.value.values + notLoadedNovelExtensionMapFlow.value.values)
+            .count { it.hasUpdate }
+        if (pendingUpdateCount == 0 && novelPending == 0) {
+            extensionUpdateNotifier.dismiss()
+        }
+    }
+
+    private operator fun <T : Extension> Map<String, T>.plus(extension: T) = plus(extension.pkgName to extension)
+
+    // RK: upstream's per-key listings, through the EH gate: the stock E-Hentai extension shares source
+    //     ids with built-in EH and would shadow it while that is active.
+    private fun StateFlow<List<Extension.Available>>.mapListings(
+        scope: CoroutineScope,
+    ): StateFlow<List<Extension.Available>> {
+        return combine(exhPreferences.isHentaiEnabled().changes()) { extensions, hentaiEnabled ->
+            extensions
+                .groupBy { it.pkgName to it.store.signingKey }
+                .values
+                .map { listings ->
+                    listings.maxWith(compareBy<Extension.Available> { it.versionCode }.thenBy { it.libVersion })
+                }
+                .filterNot { hentaiEnabled && it.pkgName in BlacklistedSources.BLACKLISTED_EXTENSIONS }
+        }.stateIn(scope, SharingStarted.Lazily, emptyList())
+    }
+
+    // RK --> rewritten from upstream's plain map to carry the EH gate, as mapExtensions does
+
+    /**
+     * [mapListings] without the [stateIn], whose seed would replay the empty map the flow was
+     * constructed with, so a reader before the scan finished got a wrong answer rather than a slow
+     * one. Emits nothing until the scan completes; the EH gate is applied the same way.
+     */
+    private fun <T : Extension> StateFlow<Map<String, T>>.mapExtensionsWhenInitialized(): Flow<List<T>> {
+        return onStart { initialized.await() }
+            .combine(exhPreferences.isHentaiEnabled().changes()) { map, hentaiEnabled ->
+                map.values.filterNot { hentaiEnabled && it.pkgName in BlacklistedSources.BLACKLISTED_EXTENSIONS }
+            }
+    }
+    // RK <--
+}

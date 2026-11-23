@@ -1,0 +1,256 @@
+package raito.domain.library
+
+import dev.zacsweers.metro.AppScope
+import dev.zacsweers.metro.Inject
+import dev.zacsweers.metro.SingleIn
+import raito.domain.source.NovelAwareContentTypePreference
+import raito.util.getStringList
+import tachiyomi.core.common.preference.Preference
+import tachiyomi.core.common.preference.PreferenceStore
+import tachiyomi.core.common.preference.TriState
+import tachiyomi.core.common.preference.getEnum
+import tachiyomi.core.common.preference.getLongArray
+
+/**
+ * Raito's net-new library preferences, the ones Mihon's [tachiyomi.domain.library.service.LibraryPreferences]
+ * does not have. Kept in a separate holder so Mihon's class stays untouched and upstream-mergeable.
+ *
+ * Key strings are stored on every install and restored verbatim from backups, so renaming one needs
+ * a migration that moves the value.
+ */
+@Inject
+@SingleIn(AppScope::class)
+class RaitoLibraryPreferences(
+    private val preferenceStore: PreferenceStore,
+) {
+
+    /** Off skips the "already in your library" prompt when adding; both content types read it. */
+    val checkDuplicates: Preference<Boolean> = preferenceStore.getBoolean("check_duplicates_on_add", true)
+
+    // region Grouping
+
+    /** Dynamic grouping mode, library-wide (raito.presentation.library.LibraryGroup; 0 = BY_DEFAULT). */
+    val groupLibraryBy: Preference<Int> = preferenceStore.getInt("group_library_by", 0)
+
+    // The "group_novel_library_by" key is retired (DEAD_NOVEL_GROUP_BY_KEY): grouping describes the list,
+    // not a content type, so both read [groupLibraryBy] and one kernel call groups the mixed library.
+
+    /** Header keys of collapsed user categories (BY_DEFAULT grouping). */
+    val collapsedCategories: Preference<Set<String>> = preferenceStore.getStringSet("collapsed_categories", emptySet())
+
+    /** Header keys of collapsed dynamic-group categories. */
+    val collapsedDynamicCategories: Preference<Set<String>> =
+        preferenceStore.getStringSet("collapsed_dynamic_categories", emptySet())
+
+    /** Push collapsed dynamic groups to the bottom of the list. */
+    val collapsedDynamicAtBottom: Preference<Boolean> = preferenceStore.getBoolean("collapsed_dynamic_at_bottom", false)
+
+    val categorySortOrder: Preference<CategorySortOrder> = preferenceStore.getObjectFromInt(
+        key = "pref_category_sort_order",
+        defaultValue = CategorySortOrder.MANUAL,
+        serializer = CategorySortOrder::stored,
+        deserializer = CategorySortOrder::fromStored,
+    )
+
+    // endregion
+
+    // region Content type
+
+    /** The same key as RaitoSourcePreferences.novelsEnabled (the Settings switch): off, novels are hidden. */
+    val novelsEnabled: Preference<Boolean> = preferenceStore.getBoolean("pref_novels_enabled", true)
+
+    /** Sticky All/Manga/Novels chip on the Library tab. Its own key, distinct from the Browse
+     *  and download-queue content-type filters, so each surface remembers its last type. */
+    val libraryContentType: Preference<ContentType> = NovelAwareContentTypePreference(
+        preferenceStore.getEnum("library_content_type", ContentType.MANGA),
+        novelsEnabled,
+    )
+
+    // endregion
+
+    // region Badges
+
+    /** Reading progress on each cover, as a percent or as read/total chapters. */
+    val progressBadge: Preference<LibraryProgressMode> =
+        preferenceStore.getEnum("library_progress_badge", LibraryProgressMode.OFF)
+
+    /** Show the source/extension icon on each cover. */
+    val sourceBadge: Preference<Boolean> = preferenceStore.getBoolean("source_badge", true)
+
+    // endregion
+
+    // region Update errors
+
+    /** Opt-out: record manga library update failures and expose them in the Update errors screen.
+     *  Off falls back to the dump file a failed-update notification opens instead. */
+    val trackUpdateErrors: Preference<Boolean> = preferenceStore.getBoolean("track_update_errors", true)
+
+    /** Opt-out: the novel half of [trackUpdateErrors], same fallback. */
+    val trackNovelUpdateErrors: Preference<Boolean> = preferenceStore.getBoolean("track_novel_update_errors", true)
+
+    // endregion
+
+    // region Category display
+
+    val showCategoryInTitle: Preference<Boolean> = preferenceStore.getBoolean("category_in_title", false)
+
+    // Default off so Mihon's swipeable category pager stays the default; the single-list view
+    // (show-all) is the opt-in Raito addition. Toggle lives in the library display settings.
+    val showAllCategories: Preference<Boolean> = preferenceStore.getBoolean("show_all_categories", false)
+
+    // The "show_empty_categories_filtering" key is retired (DEAD_SHOW_EMPTY_CATEGORIES_KEY): empty
+    // categories are always hidden now, on every chip, so the toggle had nothing left to control.
+
+    // Off so a hidden category stays hidden; turning this on reveals hidden categories in the library.
+    val showHiddenCategories: Preference<Boolean> = preferenceStore.getBoolean("show_hidden_categories", false)
+
+    // Per-chip last category page for the tabbed pager. Manga rides Mihon's own lastUsedCategory
+    // key; these cover the Novels and All chips, whose pagers index different category lists, so
+    // one shared key restored the wrong page after a chip switch. App state, as Mihon's is.
+    val lastUsedNovelCategory: Preference<Int> =
+        preferenceStore.getInt(Preference.appStateKey("raito_last_used_novel_category"), 0)
+    val lastUsedAllCategory: Preference<Int> =
+        preferenceStore.getInt(Preference.appStateKey("raito_last_used_all_category"), 0)
+
+    // endregion
+
+    // region Hopper
+
+    val hideHopper: Preference<Boolean> = preferenceStore.getBoolean("hide_hopper", false)
+
+    val autohideHopper: Preference<Boolean> = preferenceStore.getBoolean("autohide_hopper", true)
+
+    /** Hopper position gravity (0 = left, 1 = center, 2 = right). */
+    val hopperGravity: Preference<Int> = preferenceStore.getInt("hopper_gravity", 1)
+
+    /** Hopper long-press action index (search / expand-collapse / display / group / random / random-global). */
+    val hopperLongPressAction: Preference<Int> = preferenceStore.getInt("hopper_long_press", 0)
+
+    // endregion
+
+    // region Filters (net-new dims Mihon lacks; ported from Komikku, re-typed onto Mihon)
+
+    /** Adult-content filter. Komikku's `filterLewd`; lewdness by raito.util.isAdultEntry. */
+    val filterLewd: Preference<TriState> = preferenceStore.getEnum("pref_filter_library_lewd", TriState.DISABLED)
+
+    /** Master switch for the include/exclude category filter. */
+    val filterCategories: Preference<Boolean> = preferenceStore.getBoolean("pref_filter_library_categories", false)
+
+    /** Category ids (as strings) a manga must belong to at least one of. Empty = no include constraint. */
+    val filterCategoriesInclude: Preference<Set<String>> =
+        preferenceStore.getStringSet("pref_filter_library_categories_include", emptySet())
+
+    /** Category ids (as strings) a manga must not belong to any of. */
+    val filterCategoriesExclude: Preference<Set<String>> =
+        preferenceStore.getStringSet("pref_filter_library_categories_exclude", emptySet())
+
+    // endregion
+
+    // region Novel library filters: RETIRED
+    // The library filter preferences unified onto the manga keys, following the sort
+    // unification: a filter describes the list, not a content type. Every `novel_library_filter_*` key
+    // (the tri-state axes, lewd, the per-tracker filters, the category include/exclude set) is dead and
+    // skipped on restore via DEAD_NOVEL_FILTER_KEY_PREFIX below, like the sort keys. The novel global
+    // sort and Random seed keys retired the same way (DEAD_NOVEL_SORT_KEY).
+    // endregion
+
+    // region Merging (persisted group tables; the pref-based keys below stay only for the one-time migration)
+
+    /** Master switch for source merging (manga + novels). Off resolves every series standalone and hides
+     *  the merge UI without deleting groups, so turning it back on restores them. Lives in Settings. */
+    val seriesMergingEnabled: Preference<Boolean> = preferenceStore.getBoolean("series_merging_enabled", true)
+
+    /** Manual merge groups: each entry is a comma-joined, sorted manga-id group (e.g. "1,5,9"). */
+    val mangaManualMerges: Preference<Set<String>> = preferenceStore.getStringSet(MANGA_MANUAL_MERGES_KEY, emptySet())
+
+    /** Explicit unmerges: normalized "min,max" id pairs that must never be grouped. */
+    val mangaManualUnmerges: Preference<Set<String>> = preferenceStore.getStringSet(
+        MANGA_MANUAL_UNMERGES_KEY,
+        emptySet(),
+    )
+
+    /** Whether adding a same-titled series offers to group it with the match. Repurposed from silent
+     *  auto-merge; the one-time pref-to-group migration also reads it. */
+    val autoMergeSameTitle: Preference<Boolean> = preferenceStore.getBoolean("auto_merge_same_title", true)
+
+    /** On a merged library cover, show the grouped sources' icons instead of a numeric group count. */
+    val showMergeSourceIcons: Preference<Boolean> = preferenceStore.getBoolean("merge_source_icons", true)
+
+    /** Source ids ranked highest-priority-first; the trunk source when stitching a merged chapter list. */
+    val preferredMangaSources: Preference<List<Long>> = preferenceStore.getLongArray(
+        "preferred_manga_sources",
+        emptyList(),
+    )
+
+    /** Novel-source ids ranked highest-priority-first; the trunk source for a merged novel chapter list.
+     *  Novel source ids are Strings (plugin slugs), so this is a string list rather than a long array. */
+    val preferredNovelSources: Preference<List<String>> = preferenceStore.getStringList("preferred_novel_sources")
+
+    /** Mirror a tracker added to one source onto every favorited member of its merged group. */
+    val syncTrackerLinksGrouped: Preference<Boolean> = preferenceStore.getBoolean("sync_tracker_links_grouped", true)
+
+    // Novel merge. Renaming a key needs a migration that moves the value (see the class KDoc).
+
+    /** Manual novel merge groups: each entry is a comma-joined, sorted novel-id group (e.g. "1,5,9"). */
+    val novelManualMerges: Preference<Set<String>> = preferenceStore.getStringSet(NOVEL_MANUAL_MERGES_KEY, emptySet())
+
+    /** Explicit novel unmerges: normalized "min,max" id pairs that must never be grouped. */
+    val novelManualUnmerges: Preference<Set<String>> = preferenceStore.getStringSet(
+        NOVEL_MANUAL_UNMERGES_KEY,
+        emptySet(),
+    )
+
+    /** Whether adding a same-titled novel offers to group it with the match (the novel twin of
+     *  [autoMergeSameTitle], pinned by EntryMergeManagerTest over the shared `suggestGroupingOnAdd`).
+     *  Repurposed from silent auto-merge: grouping is now an explicit choice. */
+    val novelAutoMergeSameTitle: Preference<Boolean> = preferenceStore.getBoolean("novel_auto_merge_same_title", true)
+
+    /** Read only by the one-time pref-to-group migration, which honors it when reconstructing the groups
+     *  a same-title auto-merge would have formed. Nothing resolves membership from author any more, so it
+     *  is not surfaced in Settings; it stays declared because that migration still reads it. */
+    val novelAutoMergeRequireAuthor: Preference<Boolean> =
+        preferenceStore.getBoolean("novel_auto_merge_require_author", true)
+
+    // The novel merge-source-icons key ("novel_merge_source_icons") is retired with the filter keys:
+    // both content types read [showMergeSourceIcons]. Skipped on restore (DEAD_NOVEL_MERGE_ICONS_KEY).
+
+    // endregion
+
+    companion object {
+        // The merge prefs store entry IDs, which change on restore, so the backup restorer rebuilds them
+        // from {url, source} refs and the generic preference restore must skip these keys (both manga
+        // and novel; see BackupMangaMerge / BackupNovelMerge).
+        const val MANGA_MANUAL_MERGES_KEY = "manga_manual_merges"
+        const val MANGA_MANUAL_UNMERGES_KEY = "manga_manual_unmerges"
+        const val NOVEL_MANUAL_MERGES_KEY = "novel_manual_merges"
+        const val NOVEL_MANUAL_UNMERGES_KEY = "novel_manual_unmerges"
+
+        // Retired novel global-sort keys: both content types now read LibraryPreferences.sortingMode /
+        // randomSortSeed. The stored value was dropped, not migrated, because a value written before the
+        // category unification can carry the old flag layout (Downloaded/TrackerMean swapped) and the two
+        // readings are indistinguishable. Skipped on restore so an old backup can't resurrect them.
+        const val DEAD_NOVEL_SORT_KEY = "novel_library_default_sort"
+        const val DEAD_NOVEL_RANDOM_SEED_KEY = "novel_library_random_seed"
+
+        // Retired novel filter keys (every novel_library_filter_* key: the tri-state axes, lewd, the
+        // per-tracker filters, the category include/exclude set), plus the novel merge-icons toggle:
+        // the library filter preferences unified onto the manga keys. Values dropped, not migrated
+        // (filters are casually re-picked); skipped on restore so an old backup can't resurrect them.
+        const val DEAD_NOVEL_FILTER_KEY_PREFIX = "novel_library_filter_"
+        const val DEAD_NOVEL_MERGE_ICONS_KEY = "novel_merge_source_icons"
+
+        // Retired with the one empty-category rule (empty categories always hide): the toggle had
+        // nothing left to control. Skipped on restore like the other retired keys.
+        const val DEAD_SHOW_EMPTY_CATEGORIES_KEY = "show_empty_categories_filtering"
+
+        // Retired novel grouping key: grouping unified onto group_library_by, following the sort and
+        // filter unifications, so one kernel call can group manga and novels into shared buckets. Value
+        // dropped, not migrated (a group mode is casually re-picked); skipped on restore.
+        const val DEAD_NOVEL_GROUP_BY_KEY = "group_novel_library_by"
+
+        // The Novels and All chips' saved pages as plain keys, before they became app state. Values
+        // dropped, not migrated (each pager reopens on its first page once); skipped on restore.
+        const val DEAD_LAST_USED_NOVEL_PAGE_KEY = "raito_last_used_novel_category"
+        const val DEAD_LAST_USED_ALL_PAGE_KEY = "raito_last_used_all_category"
+    }
+}

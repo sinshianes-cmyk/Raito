@@ -1,0 +1,343 @@
+package eu.kanade.tachiyomi.data.library
+
+import android.app.Notification
+import android.content.Context
+import android.graphics.BitmapFactory
+import android.net.Uri
+import androidx.core.app.NotificationCompat
+import androidx.core.app.NotificationManagerCompat
+import dev.zacsweers.metro.Inject
+import eu.kanade.tachiyomi.R
+import eu.kanade.tachiyomi.core.security.SecurityPreferences
+import eu.kanade.tachiyomi.data.download.Downloader
+import eu.kanade.tachiyomi.data.notification.NotificationHandler
+import eu.kanade.tachiyomi.data.notification.NotificationReceiver
+import eu.kanade.tachiyomi.data.notification.Notifications
+import eu.kanade.tachiyomi.source.UnmeteredSource
+import eu.kanade.tachiyomi.util.lang.chop
+import eu.kanade.tachiyomi.util.system.cancelNotification
+import eu.kanade.tachiyomi.util.system.notificationBuilder
+import eu.kanade.tachiyomi.util.system.notify
+import raito.data.notification.UpdateProgressThrottle
+import raito.data.notification.hiddenEntryIds
+import raito.data.notification.mainActivityPendingIntent
+import raito.data.notification.newChaptersEntry
+import raito.data.notification.newChaptersSummary
+import raito.data.notification.notificationCover
+import raito.data.notification.offersDownloadAction
+import raito.data.notification.postedEntries
+import raito.data.notification.setNewChaptersEntry
+import raito.data.notification.setNewChaptersSummary
+import raito.data.notification.updateProgressPercent
+import raito.data.updateerror.setUpdateErrorContent
+import raito.data.updateerror.updateErrorPendingIntent
+import raito.domain.entry.EntryId
+import raito.domain.entry.GetEntryCustomInfo
+import raito.domain.entry.withCustomInfo
+import raito.domain.library.ContentType
+import raito.domain.manga.AdultContentChecker
+import tachiyomi.core.common.Constants
+import tachiyomi.core.common.i18n.stringResource
+import tachiyomi.domain.chapter.model.Chapter
+import tachiyomi.domain.library.model.LibraryManga
+import tachiyomi.domain.manga.model.Manga
+import tachiyomi.domain.source.service.SourceManager
+import tachiyomi.i18n.MR
+import mihon.icons.materialsymbols.R as MaterialSymbolsR
+
+@Inject
+class LibraryUpdateNotifier(
+    private val context: Context,
+    private val securityPreferences: SecurityPreferences,
+    private val sourceManager: SourceManager,
+    // RK: deferred, so the checker (and the extension manager behind it) is still only built when a
+    // notification actually has to test one, as the `by lazy` below did before.
+    private val adultCheckerProvider: () -> AdultContentChecker,
+    private val getEntryCustomInfo: GetEntryCustomInfo, // RK
+) {
+
+    // RK: percentFormatter moved to raito.data.notification.updateProgressPercent, shared with novels
+
+    // RK: hide adult titles + covers from the "new chapters" notification (lock-screen privacy).
+    private val adultChecker by lazy { adultCheckerProvider() }
+
+    // RK: resolved once per batch, because the adult verdict now suspends and the notification
+    //     builders below do not, so it cannot be asked per row.
+    private suspend fun hiddenContentIds(entries: List<Manga>): Set<Long> = hiddenEntryIds(
+        entries,
+        securityPreferences.hideNotificationContent.get(),
+        securityPreferences.hideAdultNotificationContent.get(),
+        Manga::id,
+        adultChecker::adultIdsAmong,
+    )
+
+    // RK: named and drawn by Edit info; the hidden-content verdict above reads the source values
+    private suspend fun List<Manga>.shown(): List<Manga> =
+        getEntryCustomInfo.overlay(this, { EntryId.Manga(it.id) }) { withCustomInfo(it) }
+
+    /**
+     * Pending intent of action that cancels the library update
+     */
+    private val cancelIntent by lazy {
+        NotificationReceiver.cancelLibraryUpdatePendingBroadcast(context)
+    }
+
+    /**
+     * Bitmap of the app for notifications.
+     */
+    private val notificationBitmap by lazy {
+        BitmapFactory.decodeResource(context.resources, R.mipmap.ic_launcher)
+    }
+
+    /**
+     * Cached progress notification to avoid creating a lot.
+     */
+    val progressNotificationBuilder by lazy {
+        context.notificationBuilder(Notifications.CHANNEL_LIBRARY_PROGRESS) {
+            setContentTitle(context.stringResource(MR.strings.app_name))
+            setSmallIcon(MaterialSymbolsR.drawable.rounded_refresh)
+            setLargeIcon(notificationBitmap)
+            setOngoing(true)
+            setOnlyAlertOnce(true)
+            addAction(
+                MaterialSymbolsR.drawable.rounded_close,
+                context.stringResource(MR.strings.action_cancel),
+                cancelIntent,
+            )
+        }
+    }
+
+    private val progressThrottle = UpdateProgressThrottle() // RK
+
+    /**
+     * Shows the notification containing the currently updating manga and the progress.
+     *
+     * RK: called from several update coroutines at once, so it skips updates that come faster than the system would
+     * show them anyway.
+     *
+     * @param manga the manga that are being updated.
+     * @param current the current progress.
+     * @param total the total progress.
+     */
+    // RK: suspends for the adult verdict, which keeps adult titles out of the progress text too
+    suspend fun showProgressNotification(manga: List<Manga>, current: Int, total: Int) {
+        // RK: upstream's @Synchronized cannot hold across the suspension, so the throttle is an atomic kernel
+        if (!progressThrottle.tryPass(isFinal = current >= total)) return
+        progressNotificationBuilder
+            .setContentTitle(
+                context.stringResource(
+                    MR.strings.notification_updating_progress,
+                    updateProgressPercent(current, total), // RK
+                ),
+            )
+
+        if (!securityPreferences.hideNotificationContent.get()) {
+            // RK -->
+            val hidden = hiddenContentIds(manga)
+            val updatingText = manga.filterNot { it.id in hidden }.shown().joinToString("\n") { it.title.chop(40) }
+            // RK <--
+            progressNotificationBuilder.setStyle(NotificationCompat.BigTextStyle().bigText(updatingText))
+        }
+
+        context.notify(
+            Notifications.ID_LIBRARY_PROGRESS,
+            progressNotificationBuilder
+                .setProgress(total, current, false)
+                .build(),
+        )
+    }
+
+    /**
+     * Warn when excessively checking any single source.
+     */
+    suspend fun showQueueSizeWarningNotificationIfNeeded(mangaToUpdate: List<LibraryManga>) {
+        val maxUpdatesFromSource = mangaToUpdate
+            .groupBy { it.manga.source }
+            .filter { (sourceId, _) -> sourceManager.get(sourceId) !is UnmeteredSource }
+            .maxOfOrNull { it.value.size } ?: 0
+
+        if (maxUpdatesFromSource <= MANGA_PER_SOURCE_QUEUE_WARNING_THRESHOLD) {
+            return
+        }
+
+        context.notify(
+            Notifications.ID_LIBRARY_SIZE_WARNING,
+            Notifications.CHANNEL_LIBRARY_PROGRESS,
+        ) {
+            setContentTitle(context.stringResource(MR.strings.label_warning))
+            setStyle(
+                NotificationCompat.BigTextStyle().bigText(context.stringResource(MR.strings.notification_size_warning)),
+            )
+            setSmallIcon(MaterialSymbolsR.drawable.rounded_filled_warning)
+            setTimeoutAfter(Downloader.WARNING_NOTIF_TIMEOUT_MS)
+            setContentIntent(NotificationHandler.openUrl(context, HELP_WARNING_URL))
+        }
+    }
+
+    /**
+     * Shows notification containing update entries that failed with action to open full log.
+     *
+     * @param failed Number of entries that failed to update.
+     * @param uri Uri for error log file containing all titles that failed.
+     * @param tracked Whether the failures were recorded, which decides where the tap goes. // RK
+     */
+    fun showUpdateErrorNotification(failed: Int, uri: Uri, tracked: Boolean) { // RK: tracked picks the tap target
+        if (failed == 0) {
+            return
+        }
+
+        context.notify(
+            Notifications.ID_LIBRARY_ERROR,
+            Notifications.CHANNEL_LIBRARY_ERROR,
+        ) {
+            // RK: the text, icon and tap are shared with the novel updater and the gallery checker; the
+            //     tap opens the Update errors screen when failures are recorded and the shared dump when not.
+            setUpdateErrorContent(context, failed, updateErrorPendingIntent(context, ContentType.MANGA, uri, tracked))
+        }
+    }
+
+    /**
+     * Shows the notification containing the result of the update done by the service.
+     *
+     * @param updates a list of manga with new updates.
+     */
+    suspend fun showUpdateNotifications(sourceUpdates: List<Pair<Manga, Array<Chapter>>>) { // RK: overlaid below
+        val hidden = hiddenContentIds(sourceUpdates.map { it.first }) // RK: adult entries hide title and cover
+        // RK: the rest names and draws each entry by its Edit info
+        val updates = sourceUpdates.map { it.first }.shown().zip(sourceUpdates.map { it.second })
+
+        // Parent group notification
+        context.notify(
+            Notifications.ID_NEW_CHAPTERS,
+            Notifications.CHANNEL_NEW_CHAPTERS,
+        ) {
+            setContentTitle(context.stringResource(MR.strings.notification_new_chapters))
+            // RK: the text and title list are shared with the novel updater, a hidden entry read generically
+            setNewChaptersSummary(
+                context,
+                newChaptersSummary(
+                    updates.map { (manga, _) -> manga.title.takeUnless { manga.id in hidden } },
+                    securityPreferences.hideNotificationContent.get(),
+                ),
+            )
+
+            setSmallIcon(R.drawable.ic_raito) // RK: Raito icon
+            setLargeIcon(notificationBitmap)
+
+            setGroup(Notifications.GROUP_NEW_CHAPTERS)
+            setGroupAlertBehavior(NotificationCompat.GROUP_ALERT_SUMMARY)
+            setGroupSummary(true)
+            priority = NotificationCompat.PRIORITY_HIGH
+
+            setContentIntent(mainActivityPendingIntent(context, Constants.SHORTCUT_UPDATES)) // RK: shared with novels
+            setAutoCancel(true)
+        }
+
+        // Per-manga notification
+        // RK: which entries get a row is shared with novels: none while content is hidden, and capped,
+        //     because everything a package posts past Android's 50 live notifications is refused.
+        val posted = postedEntries(updates, securityPreferences.hideNotificationContent.get())
+        if (posted.isNotEmpty()) {
+            context.notify(
+                posted.map { (manga, chapters) ->
+                    NotificationManagerCompat.NotificationWithIdAndTag(
+                        manga.id.hashCode(),
+                        // RK: hide the title + cover for adult manga
+                        createNewChaptersNotification(manga, chapters, manga.id in hidden),
+                    )
+                },
+            )
+        }
+    }
+
+    // RK: hideContent blanks the title, chapter list and cover for hidden entries
+    private suspend fun createNewChaptersNotification(
+        manga: Manga,
+        chapters: Array<Chapter>,
+        // RK: when true, show a generic title + count and no cover (adult / hidden content)
+        hideContent: Boolean = false,
+    ): Notification {
+        val icon = if (hideContent) null else context.notificationCover(manga) // RK: shared with novels
+        return context.notificationBuilder(Notifications.CHANNEL_NEW_CHAPTERS) {
+            // RK: the title, chapter list and hidden-entry wording are shared with the novel updater
+            setNewChaptersEntry(
+                context,
+                newChaptersEntry(
+                    manga.title.takeUnless { hideContent },
+                    chapters.map { it.chapterNumber },
+                    chapters.size,
+                ),
+            )
+
+            setSmallIcon(R.drawable.ic_raito) // RK: Raito icon
+
+            if (icon != null) {
+                setLargeIcon(icon)
+            }
+
+            setGroup(Notifications.GROUP_NEW_CHAPTERS)
+            setGroupAlertBehavior(NotificationCompat.GROUP_ALERT_SUMMARY)
+            priority = NotificationCompat.PRIORITY_HIGH
+
+            // Open first chapter on tap
+            setContentIntent(NotificationReceiver.openChapterPendingActivity(context, manga, chapters.first()))
+            setAutoCancel(true)
+
+            // Mark chapters as read action
+            addAction(
+                MaterialSymbolsR.drawable.rounded_check,
+                context.stringResource(MR.strings.action_mark_as_read),
+                NotificationReceiver.markAsReadPendingBroadcast(
+                    context,
+                    manga,
+                    chapters,
+                    Notifications.ID_NEW_CHAPTERS,
+                ),
+            )
+            // View chapters action
+            addAction(
+                MaterialSymbolsR.drawable.rounded_book,
+                context.stringResource(MR.strings.action_view_chapters),
+                NotificationReceiver.openChapterPendingActivity(
+                    context,
+                    manga,
+                    Notifications.ID_NEW_CHAPTERS,
+                ),
+            )
+            // Download chapters action
+            // Only add the action when chapters is within threshold
+            if (offersDownloadAction(chapters.size)) { // RK: the threshold is shared with novels
+                addAction(
+                    android.R.drawable.stat_sys_download_done,
+                    context.stringResource(MR.strings.action_download),
+                    NotificationReceiver.downloadChaptersPendingBroadcast(
+                        context,
+                        manga,
+                        chapters,
+                        Notifications.ID_NEW_CHAPTERS,
+                    ),
+                )
+            }
+        }.build()
+    }
+
+    /**
+     * Cancels the progress notification.
+     */
+    fun cancelProgressNotification() {
+        context.cancelNotification(Notifications.ID_LIBRARY_PROGRESS)
+    }
+
+    // RK: getMangaIcon and NOTIF_ICON_SIZE moved to raito.data.notification.notificationCover, which
+    //     the novel updater draws its covers with too
+
+    // RK: getNewChaptersDescription moved to raito.data.notification.setNewChaptersEntry and
+    //     getNotificationIntent to raito.data.notification.mainActivityPendingIntent, both shared with novels
+
+    companion object {
+        const val HELP_WARNING_URL = // RK: Raito's docs site
+            "${Constants.URL_DOCS}/faq/library#why-am-i-being-warned-about-bulk-updates-and-downloads"
+    }
+}
+
+private const val MANGA_PER_SOURCE_QUEUE_WARNING_THRESHOLD = 60

@@ -1,0 +1,123 @@
+package eu.kanade.presentation.more.settings.screen
+
+import eu.kanade.presentation.components.AlertDialog
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.window.DialogProperties
+import eu.kanade.tachiyomi.util.system.toast
+import exh.uconfig.EHConfigurator
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
+import mihon.app.di.appGraph
+import tachiyomi.core.common.util.lang.launchUI
+import tachiyomi.i18n.MR
+import tachiyomi.presentation.core.i18n.stringResource
+import kotlin.time.Duration.Companion.seconds
+
+@Composable
+fun ConfigureExhDialog(run: Boolean, onRunning: () -> Unit) {
+    val context = LocalContext.current
+    val exhPreferences = remember { context.appGraph.exhPreferences }
+    var warnDialogOpen by remember { mutableStateOf(false) }
+    var configureDialogOpen by remember { mutableStateOf(false) }
+    var configureFailedDialogOpen by remember { mutableStateOf<Exception?>(null) }
+
+    LaunchedEffect(run) {
+        if (run) {
+            if (exhPreferences.exhShowSettingsUploadWarning().get()) {
+                warnDialogOpen = true
+            } else {
+                configureDialogOpen = true
+            }
+            onRunning()
+        }
+    }
+
+    if (warnDialogOpen) {
+        AlertDialog(
+            onDismissRequest = { warnDialogOpen = false },
+            properties = DialogProperties(
+                dismissOnBackPress = false,
+                dismissOnClickOutside = false,
+            ),
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        exhPreferences.exhShowSettingsUploadWarning().set(false)
+                        configureDialogOpen = true
+                        warnDialogOpen = false
+                    },
+                ) {
+                    Text(text = stringResource(MR.strings.action_ok))
+                }
+            },
+            title = {
+                Text(text = stringResource(MR.strings.settings_profile_note))
+            },
+            text = {
+                Text(text = stringResource(MR.strings.settings_profile_note_message))
+            },
+        )
+    }
+    if (configureDialogOpen) {
+        LaunchedEffect(Unit) {
+            withContext(Dispatchers.IO + NonCancellable) {
+                try {
+                    delay(0.2.seconds)
+                    context.appGraph.ehConfigurator.configureAll()
+                    launchUI {
+                        context.toast(MR.strings.eh_settings_successfully_uploaded)
+                    }
+                } catch (e: Exception) {
+                    configureFailedDialogOpen = e
+                } finally {
+                    configureDialogOpen = false
+                }
+            }
+        }
+        AlertDialog(
+            onDismissRequest = {},
+            properties = DialogProperties(
+                dismissOnBackPress = false,
+                dismissOnClickOutside = false,
+            ),
+            confirmButton = {},
+            title = {
+                Text(text = stringResource(MR.strings.eh_settings_uploading_to_server))
+            },
+            text = {
+                Text(text = stringResource(MR.strings.eh_settings_uploading_to_server_message))
+            },
+        )
+    }
+    if (configureFailedDialogOpen != null) {
+        AlertDialog(
+            onDismissRequest = { configureFailedDialogOpen = null },
+            confirmButton = {
+                TextButton(onClick = { configureFailedDialogOpen = null }) {
+                    Text(text = stringResource(MR.strings.action_ok))
+                }
+            },
+            title = {
+                Text(text = stringResource(MR.strings.eh_settings_configuration_failed))
+            },
+            text = {
+                Text(
+                    text = stringResource(
+                        MR.strings.eh_settings_configuration_failed_message,
+                        configureFailedDialogOpen?.message.orEmpty(),
+                    ),
+                )
+            },
+        )
+    }
+}

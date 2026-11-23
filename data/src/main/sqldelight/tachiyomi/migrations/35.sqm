@@ -1,0 +1,11 @@
+-- Drop cross-source chapter identities whose chapter is gone. They are derived, nothing reads them
+-- (every query joins back to the chapter table), and reconciliation rewrites what is needed.
+-- An unguarded write left them: a key for a chapter a sync had deleted and re-added under a new id.
+-- chapter_match_key.sq now guards that write inside the statement.
+-- Left behind they are fatal: the driver verifies foreign keys after migrating, so the next migration
+-- would crash on startup for anyone carrying one.
+DELETE FROM chapter_match_key
+WHERE chapter_id NOT IN (SELECT _id FROM chapters);
+
+DELETE FROM novel_chapter_match_key
+WHERE chapter_id NOT IN (SELECT _id FROM novel_chapters);

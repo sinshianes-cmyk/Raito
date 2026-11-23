@@ -1,0 +1,110 @@
+package eu.kanade.presentation.components
+
+import androidx.compose.animation.animateContentSize
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ColumnScope
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.wrapContentSize
+import androidx.compose.foundation.pager.HorizontalPager
+import androidx.compose.foundation.pager.PagerState
+import androidx.compose.foundation.pager.rememberPagerState
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.launch
+import mihon.icons.materialsymbols.MaterialSymbols
+import mihon.icons.materialsymbols.rounded.MoreVert
+import raito.presentation.components.PillTabRow
+import tachiyomi.i18n.MR
+import tachiyomi.presentation.core.components.LocalPagerSwipeSetter
+import tachiyomi.presentation.core.i18n.stringResource
+
+object TabbedDialogPaddings {
+    val Horizontal = 24.dp
+    val Vertical = 8.dp
+}
+
+@Composable
+fun TabbedDialog(
+    onDismissRequest: () -> Unit,
+    tabTitles: List<String>,
+    modifier: Modifier = Modifier,
+    tabOverflowMenuContent: (@Composable ColumnScope.(() -> Unit) -> Unit)? = null,
+    pagerState: PagerState = rememberPagerState { tabTitles.size },
+    // RK: icon tabs, one per title, as tsundoku's reader sheet draws them; the titles become their labels.
+    tabIcons: List<ImageVector>? = null,
+    content: @Composable (Int) -> Unit,
+) {
+    AdaptiveSheet(
+        modifier = modifier,
+        onDismissRequest = onDismissRequest,
+    ) {
+        val scope = rememberCoroutineScope()
+
+        Column {
+            Row {
+                // RK --> DropSauce sheet tabs: the picked tab on a tonal pill
+                PillTabRow(
+                    modifier = Modifier.weight(1f),
+                    labels = tabTitles,
+                    selectedIndex = pagerState.currentPage,
+                    onSelect = { scope.launch { pagerState.animateScrollToPage(it) } },
+                    icons = tabIcons,
+                )
+                // RK <--
+
+                tabOverflowMenuContent?.let { MoreMenu(it) }
+            }
+
+            // RK --> a drag on a slider or chip row locks the pager swipe
+            // Swipe-between-tabs stays on, but content can lock it for the duration of a drag (see
+            // Modifier.lockPagerSwipeWhileDragging) so a horizontal drag on a slider or a
+            // horizontally-scrolling chip row doesn't leak into the pager and switch tabs. Swiping the
+            // rest of a page still changes tabs.
+            var pagerSwipeEnabled by remember { mutableStateOf(true) }
+            CompositionLocalProvider(LocalPagerSwipeSetter provides { enabled -> pagerSwipeEnabled = enabled }) {
+                HorizontalPager(
+                    modifier = Modifier.animateContentSize(),
+                    state = pagerState,
+                    verticalAlignment = Alignment.Top,
+                    userScrollEnabled = pagerSwipeEnabled,
+                    pageContent = { page -> content(page) },
+                )
+            }
+            // RK <--
+        }
+    }
+}
+
+@Composable
+private fun MoreMenu(
+    content: @Composable ColumnScope.(() -> Unit) -> Unit,
+) {
+    var expanded by remember { mutableStateOf(false) }
+    Box(modifier = Modifier.wrapContentSize(Alignment.TopStart)) {
+        IconButton(onClick = { expanded = true }) {
+            Icon(
+                imageVector = MaterialSymbols.Rounded.MoreVert,
+                contentDescription = stringResource(MR.strings.label_more),
+            )
+        }
+        DropdownMenu(
+            expanded = expanded,
+            onDismissRequest = { expanded = false },
+        ) {
+            content { expanded = false }
+        }
+    }
+}

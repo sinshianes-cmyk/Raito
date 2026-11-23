@@ -1,0 +1,47 @@
+package raito.domain.track
+
+import eu.kanade.tachiyomi.data.database.models.Track
+import eu.kanade.tachiyomi.data.track.Tracker
+import raito.domain.novel.track.NovelTrackUpdater
+
+/**
+ * The tracker-write surface the unified track dialog ([raito.presentation.track.EntryTrackInfoDialogHomeScreen])
+ * writes through, so manga and novel share one dialog stack. Both content types already push the same mutable
+ * [Track] (DbTrack); only the persistence sink differs, so a manga write delegates straight to the tracker
+ * while a novel write routes through [NovelTrackUpdater] into `novel_tracks`. [EntryTrackPort.writer] picks one.
+ */
+interface TrackWriter {
+    suspend fun setRemoteStatus(tracker: Tracker, track: Track, status: Long)
+    suspend fun setRemoteLastChapterRead(tracker: Tracker, track: Track, chapterNumber: Int)
+    suspend fun setRemoteScore(tracker: Tracker, track: Track, scoreString: String)
+    suspend fun setRemoteStartDate(tracker: Tracker, track: Track, epochMillis: Long)
+    suspend fun setRemoteFinishDate(tracker: Tracker, track: Track, epochMillis: Long)
+    suspend fun setRemotePrivate(tracker: Tracker, track: Track, private: Boolean)
+}
+
+/** Manga writes call the tracker's own `setRemoteX` (BaseTracker persists to `manga_track`). Stateless. */
+object MangaTrackWriter : TrackWriter {
+    override suspend fun setRemoteStatus(tracker: Tracker, track: Track, status: Long) {
+        tracker.setRemoteStatus(track, status)
+    }
+
+    override suspend fun setRemoteLastChapterRead(tracker: Tracker, track: Track, chapterNumber: Int) {
+        tracker.setRemoteLastChapterRead(track, chapterNumber)
+    }
+
+    override suspend fun setRemoteScore(tracker: Tracker, track: Track, scoreString: String) {
+        tracker.setRemoteScore(track, scoreString)
+    }
+
+    override suspend fun setRemoteStartDate(tracker: Tracker, track: Track, epochMillis: Long) {
+        tracker.setRemoteStartDate(track, epochMillis)
+    }
+
+    override suspend fun setRemoteFinishDate(tracker: Tracker, track: Track, epochMillis: Long) {
+        tracker.setRemoteFinishDate(track, epochMillis)
+    }
+
+    override suspend fun setRemotePrivate(tracker: Tracker, track: Track, private: Boolean) {
+        tracker.setRemotePrivate(track, private)
+    }
+}

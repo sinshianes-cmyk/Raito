@@ -1,0 +1,49 @@
+package eu.kanade.tachiyomi.data.track.hikka.dto
+
+import eu.kanade.tachiyomi.data.track.hikka.HikkaApi
+import eu.kanade.tachiyomi.data.track.hikka.stringToNumber
+import eu.kanade.tachiyomi.data.track.hikka.toTrackStatus
+import eu.kanade.tachiyomi.data.track.model.TrackSearch
+import kotlinx.serialization.SerialName
+import kotlinx.serialization.Serializable
+
+@Serializable
+data class HKRead(
+    val reference: String,
+    val note: String?,
+    val updated: Long,
+    val created: Long,
+    val status: String,
+    val chapters: Int,
+    val volumes: Int,
+    val rereads: Int,
+    val score: Int,
+    @SerialName("start_date")
+    val startDate: Long? = null,
+    @SerialName("end_date")
+    val endDate: Long? = null,
+    val content: HKManga? = null,
+) {
+    // RK: contentType ("manga"/"novel") keeps a novel bind on the /novel content tree; defaults to
+    // manga so the existing manga callers are unchanged.
+    fun toTrack(trackerId: Long, contentType: String = "manga"): TrackSearch {
+        return TrackSearch.create(trackerId).apply {
+            val mangaContent = this@HKRead.content
+            if (mangaContent != null) {
+                title = mangaContent.titleUa ?: mangaContent.titleEn ?: mangaContent.titleOriginal
+                remote_id = stringToNumber(mangaContent.slug)
+                library_id = stringToNumber(mangaContent.slug)
+                total_chapters = mangaContent.chapters?.toLong() ?: 0
+                // RK: novel binds use the /novel tree
+                tracking_url = "${HikkaApi.BASE_URL}/$contentType/${mangaContent.slug}"
+            }
+
+            last_chapter_read = this@HKRead.chapters.toDouble()
+            score = this@HKRead.score.toDouble()
+            status = toTrackStatus(this@HKRead.status)
+
+            started_reading_date = startDate?.let { it * 1000 } ?: 0L
+            finished_reading_date = endDate?.let { it * 1000 } ?: 0L
+        }
+    }
+}

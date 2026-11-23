@@ -1,0 +1,255 @@
+// RK: whole file, rebuilt on the searchable settings DSL, see docs/dev/subsystems/architecture.md
+package eu.kanade.presentation.more.settings.screen.about
+
+import android.content.Context
+import android.text.format.DateFormat
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.ReadOnlyComposable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalUriHandler
+import androidx.compose.ui.unit.dp
+import cafe.adriel.voyager.navigator.LocalNavigator
+import cafe.adriel.voyager.navigator.currentOrThrow
+import eu.kanade.domain.ui.UiPreferences
+import eu.kanade.presentation.more.LogoHeader
+import eu.kanade.presentation.more.settings.Preference
+import eu.kanade.presentation.more.settings.screen.SearchableSettings
+import eu.kanade.presentation.util.rememberIs24HourSystem
+import eu.kanade.tachiyomi.BuildConfig
+import eu.kanade.tachiyomi.data.updater.RELEASE_URL
+import eu.kanade.tachiyomi.ui.more.NewUpdateScreen
+import eu.kanade.tachiyomi.util.lang.toDateTimestampString
+import eu.kanade.tachiyomi.util.system.copyToClipboard
+import eu.kanade.tachiyomi.util.system.isNightlyBuildType
+import eu.kanade.tachiyomi.util.system.toast
+import eu.kanade.tachiyomi.util.system.updaterEnabled
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import kotlinx.datetime.TimeZone
+import kotlinx.datetime.toLocalDateTime
+import logcat.LogPriority
+import mihon.app.di.appGraph
+import mihon.icons.materialsymbols.MaterialSymbols
+import mihon.icons.materialsymbols.rounded.Public
+import mihon.icons.simpleicons.Github
+import mihon.icons.simpleicons.SimpleIcons
+import tachiyomi.core.common.Constants
+import tachiyomi.core.common.util.lang.withIOContext
+import tachiyomi.core.common.util.lang.withUIContext
+import tachiyomi.core.common.util.system.logcat
+import tachiyomi.domain.release.interactor.GetApplicationRelease
+import tachiyomi.i18n.MR
+import tachiyomi.presentation.core.components.ExpressiveLoadingIndicator
+import tachiyomi.presentation.core.components.LinkIcon
+import tachiyomi.presentation.core.i18n.stringResource
+import uy.kohesive.injekt.Injekt
+import uy.kohesive.injekt.api.get
+import java.util.Locale
+import kotlin.time.Instant
+
+/**
+ * About, built on the preference DSL like every other settings screen so its rows reach settings
+ * search: someone looking for "licenses" or "check for updates" finds them by name.
+ *
+ * The logo and the link row are [Preference.PreferenceItem.CustomPreference]s with a blank title,
+ * which the search index skips (it filters on a non-blank title), so neither becomes a junk result.
+ */
+object AboutScreen : SearchableSettings {
+
+    @ReadOnlyComposable
+    @Composable
+    override fun getTitleRes() = MR.strings.pref_category_about
+
+    @Composable
+    override fun getPreferences(): List<Preference> {
+        val scope = rememberCoroutineScope()
+        val context = LocalContext.current
+        val uriHandler = LocalUriHandler.current
+        val navigator = LocalNavigator.currentOrThrow
+        val crashLogUtil = remember { context.appGraph.crashLogUtil }
+        val is24HourSystem = rememberIs24HourSystem()
+        var isCheckingUpdates by remember { mutableStateOf(false) }
+
+        return listOfNotNull(
+            Preference.PreferenceItem.CustomPreference(title = "") {
+                LogoHeader(iconPadding = PaddingValues(vertical = 56.dp))
+            },
+            Preference.PreferenceItem.TextPreference(
+                title = stringResource(MR.strings.version),
+                // Keyed on the system 12/24h setting, which can change while the app is backgrounded.
+                // Date/time prefs only change in Appearance, which recreates this screen on return.
+                subtitle = remember(is24HourSystem) { getVersionName(withBuildDate = true) },
+                onClick = { context.copyToClipboard("Debug information", crashLogUtil.getDebugInfo()) },
+            ),
+            Preference.PreferenceItem.TextPreference(
+                title = stringResource(MR.strings.check_for_updates),
+                widget = {
+                    AnimatedVisibility(visible = isCheckingUpdates) {
+                        ExpressiveLoadingIndicator(modifier = Modifier.size(32.dp))
+                    }
+                },
+                onClick = {
+                    if (!isCheckingUpdates) {
+                        scope.launch {
+                            isCheckingUpdates = true
+                            checkVersion(
+                                context = context,
+                                onAvailableUpdate = { result ->
+                                    navigator.push(
+                                        NewUpdateScreen(
+                                            versionName = result.release.version,
+                                            changelogInfo = result.release.info,
+                                            releaseLink = result.release.releaseLink,
+                                            downloadLink = result.release.downloadLink,
+                                        ),
+                                    )
+                                },
+                                onFinish = { isCheckingUpdates = false },
+                            )
+                        }
+                    }
+                },
+            ).takeIf { updaterEnabled },
+            Preference.PreferenceItem.TextPreference(
+                title = stringResource(MR.strings.whats_new),
+                onClick = { uriHandler.openUri(RELEASE_URL) },
+            ).takeIf { !BuildConfig.DEBUG },
+            Preference.PreferenceGroup(
+                title = stringResource(MR.strings.pref_category_legal),
+                preferenceItems = listOf(
+                    Preference.PreferenceItem.TextPreference(
+                        title = stringResource(MR.strings.licenses),
+                        onClick = { navigator.push(OpenSourceLicensesScreen()) },
+                    ),
+                    // RK: Raito's own privacy policy, on the docs site.
+                    Preference.PreferenceItem.TextPreference(
+                        title = stringResource(MR.strings.privacy_policy),
+                        onClick = { uriHandler.openUri("${Constants.URL_SITE}/privacy/") },
+                    ),
+                ),
+            ),
+            // RK: Raito has no socials or Discord; the site and the source repo are the whole list.
+            Preference.PreferenceGroup(
+                title = stringResource(MR.strings.pref_category_links),
+                preferenceItems = listOf(
+                    Preference.PreferenceItem.CustomPreference(title = "") {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(vertical = 8.dp),
+                            horizontalArrangement = Arrangement.Center,
+                        ) {
+                            LinkIcon(
+                                label = stringResource(MR.strings.website),
+                                icon = MaterialSymbols.Rounded.Public,
+                                url = Constants.URL_SITE,
+                            )
+                            LinkIcon(
+                                label = "GitHub",
+                                icon = SimpleIcons.Github,
+                                url = "https://github.com/unseensnick/Raito",
+                            )
+                        }
+                    },
+                ),
+            ),
+        )
+    }
+
+    /**
+     * Checks version and shows a user prompt if an update is available.
+     */
+    private suspend fun checkVersion(
+        context: Context,
+        onAvailableUpdate: (GetApplicationRelease.Result.NewUpdate) -> Unit,
+        onFinish: () -> Unit,
+    ) {
+        val updateChecker = context.appGraph.updateChecker
+        withUIContext {
+            try {
+                when (val result = updateChecker.checkForUpdate(forceCheck = true)) {
+                    is GetApplicationRelease.Result.NewUpdate -> {
+                        onAvailableUpdate(result)
+                    }
+                    is GetApplicationRelease.Result.NoNewUpdate -> {
+                        context.toast(MR.strings.update_check_no_new_updates)
+                    }
+                    is GetApplicationRelease.Result.OsTooOld -> {
+                        context.toast(MR.strings.update_check_eol)
+                    }
+                }
+            } catch (e: Exception) {
+                context.toast(e.message)
+                logcat(LogPriority.ERROR, e)
+            } finally {
+                onFinish()
+            }
+        }
+    }
+
+    fun getVersionName(withBuildDate: Boolean): String {
+        return when {
+            BuildConfig.DEBUG -> {
+                "Debug ${BuildConfig.COMMIT_SHA}".let {
+                    if (withBuildDate) {
+                        "$it (${getFormattedBuildTime()})"
+                    } else {
+                        it
+                    }
+                }
+            }
+            isNightlyBuildType -> {
+                "Nightly r${BuildConfig.COMMIT_COUNT}".let {
+                    if (withBuildDate) {
+                        "$it (${BuildConfig.COMMIT_SHA}, ${getFormattedBuildTime()})"
+                    } else {
+                        "$it (${BuildConfig.COMMIT_SHA})"
+                    }
+                }
+            }
+            else -> {
+                "Stable ${BuildConfig.VERSION_NAME}".let {
+                    if (withBuildDate) {
+                        "$it (${getFormattedBuildTime()})"
+                    } else {
+                        it
+                    }
+                }
+            }
+        }
+    }
+
+    internal fun getFormattedBuildTime(): String {
+        return try {
+            // Not a composable, so Injekt survives here only as a Context locator.
+            val context = Injekt.get<Context>()
+            val uiPreferences = context.appGraph.uiPreferences
+            Instant.parse(BuildConfig.BUILD_TIME)
+                .toLocalDateTime(TimeZone.currentSystemDefault())
+                .toDateTimestampString(
+                    UiPreferences.dateTimeFormat(
+                        uiPreferences.dateFormat.get(),
+                        uiPreferences.timeFormat.get(),
+                        Locale.getDefault(),
+                        DateFormat.is24HourFormat(context),
+                    ),
+                )
+        } catch (_: Exception) {
+            BuildConfig.BUILD_TIME
+        }
+    }
+}

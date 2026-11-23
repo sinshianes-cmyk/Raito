@@ -1,0 +1,28 @@
+-- Novel Updates home-screen widget: add the novel's page url to novelUpdatesView so a widget cover
+-- tap can open the novel's details via the SHORTCUT_NOVEL deep link (source + url). The view names its
+-- columns explicitly (no novels.*), so an installed DB needs the view dropped and recreated; matches the
+-- updated definition in view/novelUpdatesView.sq (which only reaches fresh installs via Schema.create()).
+DROP VIEW IF EXISTS novelUpdatesView;
+
+CREATE VIEW novelUpdatesView AS
+SELECT
+    novels._id AS novelId,
+    novels.title AS novelTitle,
+    novel_chapters._id AS chapterId,
+    novel_chapters.name AS chapterName,
+    novel_chapters.url AS chapterUrl,
+    novel_chapters.read,
+    novel_chapters.bookmark,
+    novel_chapters.last_text_progress AS lastTextProgress,
+    novels.source,
+    novels.favorite,
+    novels.thumbnail_url AS thumbnailUrl,
+    novels.cover_last_modified AS coverLastModified,
+    novel_chapters.date_fetch AS dateFetch,
+    novel_chapters.is_downloaded AS isDownloaded,
+    novels.url AS novelUrl
+FROM novels JOIN novel_chapters
+ON novels._id = novel_chapters.novel_id
+WHERE novels.favorite = 1
+AND novel_chapters.date_fetch > coalesce(novels.date_added, 0)
+ORDER BY novel_chapters.date_fetch DESC;

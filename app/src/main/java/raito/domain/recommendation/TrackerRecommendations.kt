@@ -1,0 +1,61 @@
+package raito.domain.recommendation
+
+import eu.kanade.tachiyomi.data.track.Tracker
+import eu.kanade.tachiyomi.source.model.SManga
+import kotlinx.serialization.json.Json
+
+/**
+ * Base contract for a tracker-backed recommendation provider: given a manga the user is viewing,
+ * return titles that tracker considers similar: by remote id for a manga the user tracks there (the
+ * media context and taste seeds), else through ONE title search, never a fan-out. Providers hit a
+ * public endpoint over the shared client from [RecommendationProviders], never the tracker's
+ * authenticated client, which would throw for a logged-out user. Candidates are tagged
+ * [RECOMMENDS_SOURCE]: their URL fits no installed extension, so a tap routes through global search.
+ */
+abstract class TrackerRecommendations(private val tracker: Tracker) {
+
+    /** `parseAs` is a context function, so call sites wrap it in `with(json) { ... }`. */
+    protected abstract val json: Json
+
+    /** The tracker's own name, the one Settings shows, so the origin label reads the same. */
+    val trackerName: String get() = tracker.name
+
+    /** The tracker's stable id (from `TrackerManager`), stamped onto every candidate for id matching. */
+    val trackerId: Long get() = tracker.id
+
+    abstract suspend fun getRecsById(remoteId: Long): List<RelatedMangaCandidate>
+
+    abstract suspend fun getRecsBySearch(title: String): List<RelatedMangaCandidate>
+
+    /**
+     * The tracker's view of one media the user already tracks: recommendations plus genres, for the
+     * taste-driven injection, which needs the tracker's own "similar" list (cross-rec) and its clean
+     * genres (tag-search).
+     */
+    abstract suspend fun getMediaContext(remoteId: Long): MediaContext
+
+    data class MediaContext(
+        val genres: List<String>,
+        val recommendations: List<RelatedMangaCandidate>,
+    )
+
+    protected fun candidate(
+        url: String,
+        title: String,
+        thumbnailUrl: String?,
+        remoteId: Long? = null,
+        altTitles: List<String> = emptyList(),
+    ): RelatedMangaCandidate = RelatedMangaCandidate(
+        sourceId = RECOMMENDS_SOURCE,
+        manga = SManga.create().apply {
+            this.url = url
+            this.title = title
+            this.thumbnail_url = thumbnailUrl
+            this.initialized = true
+        },
+        altTitles = altTitles,
+        origin = RecommendationOrigin.Tracker(trackerName),
+        trackerId = trackerId,
+        remoteId = remoteId,
+    )
+}

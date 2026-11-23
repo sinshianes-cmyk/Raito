@@ -1,0 +1,170 @@
+package raito.novel.download
+
+import com.hippo.unifile.UniFile
+import dev.zacsweers.metro.AppScope
+import dev.zacsweers.metro.Inject
+import dev.zacsweers.metro.SingleIn
+import eu.kanade.tachiyomi.data.download.DownloadProvider
+import eu.kanade.tachiyomi.data.download.Downloader
+import eu.kanade.tachiyomi.util.storage.DiskUtil
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.flow.launchIn
+import kotlinx.coroutines.flow.onEach
+import mihon.core.metro.AppCoroutineScope
+import raito.domain.download.renameDownloadFolder
+import raito.domain.novel.model.Novel
+import raito.domain.novel.model.NovelChapter
+import tachiyomi.domain.library.service.LibraryPreferences
+import tachiyomi.domain.storage.service.StorageManager
+
+/**
+ * Resolves on-disk locations for downloaded novel chapter text, mirroring the manga [DownloadProvider]:
+ * `<novel downloads dir>/<source>/<novel title>/<chapter name>[_<url hash>].html`, the chapter part named by
+ * manga's rule, hash setting included. Derived from stable metadata rather than numeric DB ids, so a download
+ * survives reinstall, restore and storage moves. The `<source>` segment keys on the PLUGIN ID, not a display name,
+ * which a plugin update can change (the manga side keys on display name because its numeric source ids are stable).
+ * One self-contained HTML file per chapter, written to a temp name and renamed on success.
+ */
+@Inject
+@SingleIn(AppScope::class)
+class NovelDownloadProvider(
+    @AppCoroutineScope private val scope: CoroutineScope,
+    private val storageManager: StorageManager,
+    private val downloadProvider: DownloadProvider,
+    private val libraryPreferences: LibraryPreferences,
+) {
+
+    private var downloadsDir = storageManager.getNovelDownloadsDirectory()
+
+    init {
+        storageManager.changes.onEach {
+            downloadsDir = storageManager.getNovelDownloadsDirectory()
+        }.launchIn(scope)
+    }
+
+    // Name derivation. The string overloads are the real API (so callers with denormalized rows, e.g.
+    // the Updates screen, don't need to rebuild a Novel); the typed overloads are thin shims. Source is
+    // novel-specific (plugin id); title + chapter reuse the manga provider so both content types produce
+    // byte-identical folder/file names for the same inputs.
+
+    fun sourceDirName(source: String): String =
+        DiskUtil.buildValidFilename(
+            source,
+            disallowNonAscii = libraryPreferences.disallowNonAsciiFilenames.get(),
+        )
+
+    fun novelDirName(title: String): String = downloadProvider.getMangaDirName(title)
+
+    /** The on-disk file name a chapter's download is written to: `<manga-style chapter dir name>.html`. */
+    fun chapterFileName(
+        chapterName: String,
+        chapterUrl: String,
+        enableChapterNameHash: Boolean = libraryPreferences.enableChapterNameHash.get(),
+    ): String = downloadProvider.getChapterDirName(
+        chapterName,
+        null,
+        chapterUrl,
+        enableChapterNameHash = enableChapterNameHash,
+    ) + HTML_EXT
+
+    /**
+     * File names a chapter's download might sit under, current first: the manga provider's names for it under
+     * every file-name setting, so changing one doesn't orphan a download. No `.cbz`: novels are text-only.
+     */
+    fun validChapterFileNames(chapterName: String, chapterUrl: String): List<String> =
+        downloadProvider.getChapterNameVariants(chapterName, null, chapterUrl).map { it + HTML_EXT }
+
+    fun sourceDirName(novel: Novel): String = sourceDirName(novel.source)
+    fun novelDirName(novel: Novel): String = novelDirName(novel.title)
+    fun chapterFileName(chapter: NovelChapter): String = chapterFileName(chapter.name, chapter.url)
+    fun validChapterFileNames(chapter: NovelChapter): List<String> =
+        validChapterFileNames(chapter.name, chapter.url)
+
+    private fun novelDir(novel: Novel): UniFile? =
+        downloadsDir?.createDirectory(sourceDirName(novel))?.createDirectory(novelDirName(novel))
+
+    /** The novel's download directory, or null when nothing has been downloaded yet. Public for the
+     *  details overflow's Open folder, through [NovelDownloadManager.findNovelDir]. */
+    fun findNovelDir(novel: Novel): UniFile? =
+        downloadsDir?.findFile(sourceDirName(novel))?.findFile(novelDirName(novel))
+
+    fun findChapterFile(novel: Novel, chapter: NovelChapter): UniFile? {
+        val dir = findNovelDir(novel) ?: return null
+        return validChapterFileNames(chapter).firstNotNullOfOrNull { dir.findFile(it) }
+    }
+
+    fun readChapter(novel: Novel, chapter: NovelChapter): String? =
+        findChapterFile(novel, chapter)?.takeIf { it.exists() }
+            ?.openInputStream()?.bufferedReader()?.use { it.readText() }
+
+    /**
+     * Persist a chapter's HTML, creating parent dirs. Writes to a temp file then renames, so a scan
+     * never sees a partial file. False when no storage dir is configured or the rename fails.
+     */
+    fun writeChapter(
+        novel: Novel,
+        chapter: NovelChapter,
+        html: String,
+        finalName: String = chapterFileName(chapter),
+    ): Boolean {
+        val dir = novelDir(novel) ?: return false
+        val tmpName = finalName + Downloader.TMP_DIR_SUFFIX
+        dir.findFile(tmpName)?.delete()
+        val tmp = dir.createFile(tmpName) ?: return false
+        tmp.openOutputStream().bufferedWriter().use { it.write(html) }
+        // Drop any prior final file so a re-download's rename doesn't fail on an existing target.
+        dir.findFile(finalName)?.delete()
+        return tmp.renameTo(finalName)
+    }
+
+    /**
+     * Deletes [chapters]' files, all [novel]'s, each the first of its names found, as Mihon's findChapterDirs
+     * picks. Lists the folder once, where a lookup per chapter costs a few storage-provider queries each.
+     */
+    fun deleteChapters(novel: Novel, chapters: List<NovelChapter>) {
+        val files = findNovelDir(novel)?.listFiles()?.associateBy { it.name } ?: return
+        chapters.forEach { chapter -> validChapterFileNames(chapter).firstNotNullOfOrNull(files::get)?.delete() }
+    }
+
+    /** Deletes the novel's folder, then its source's folder once that is empty, as manga's does. */
+    fun deleteNovel(novel: Novel) {
+        findNovelDir(novel)?.delete()
+        val sourceDir = downloadsDir?.findFile(sourceDirName(novel))
+        if (sourceDir?.listFiles()?.isEmpty() == true) sourceDir.delete()
+    }
+
+    /**
+     * Moves the novel's folder to [newTitle]'s name by [renameDownloadFolder]. False when there was nothing to move
+     * or the move failed.
+     */
+    fun renameNovel(novel: Novel, newTitle: String): Boolean {
+        val dir = findNovelDir(novel) ?: return false
+        val newName = novelDirName(newTitle)
+        if (dir.name == newName) return false
+        return renameDownloadFolder(dir, newName)
+    }
+
+    /** Free bytes on the volume novel downloads go to, or -1 when it cannot be read. */
+    fun availableSpace(): Long = downloadsDir?.let(DiskUtil::getAvailableStorageSpace) ?: -1L
+
+    fun isNovelDirEmpty(novel: Novel): Boolean = findNovelDir(novel)?.listFiles()?.isEmpty() == true
+
+    /**
+     * Rename a downloaded chapter's file when its title changes, so the stable-name path follows the new
+     * title (mirrors the manga [eu.kanade.tachiyomi.data.download.DownloadManager] rename-on-sync, pinned by
+     * RenameOnSyncConformanceTest, and named by the manga provider's getChapterDirName on both sides).
+     * No-op when nothing is downloaded or the name is unchanged; returns true only when a file was
+     * actually renamed.
+     */
+    fun renameChapter(novel: Novel, oldChapter: NovelChapter, newChapter: NovelChapter): Boolean {
+        val dir = findNovelDir(novel) ?: return false
+        val oldFile = validChapterFileNames(oldChapter).firstNotNullOfOrNull { dir.findFile(it) } ?: return false
+        val newName = chapterFileName(newChapter)
+        if (oldFile.name == newName) return false
+        return oldFile.renameTo(newName)
+    }
+
+    companion object {
+        private const val HTML_EXT = ".html"
+    }
+}

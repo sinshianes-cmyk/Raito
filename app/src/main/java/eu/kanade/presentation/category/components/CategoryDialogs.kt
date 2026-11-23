@@ -1,0 +1,387 @@
+package eu.kanade.presentation.category.components
+
+import tachiyomi.presentation.core.components.material.ScreenHorizontalPadding
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.selection.selectable
+import androidx.compose.foundation.verticalScroll
+import eu.kanade.presentation.components.AlertDialog
+import androidx.compose.material3.Checkbox
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.RadioButton
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.material3.TriStateCheckbox
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableLongStateOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.semantics.Role
+import eu.kanade.core.preference.asToggleableState
+import eu.kanade.presentation.category.visualName
+import raito.domain.category.CategoryContentType
+import raito.presentation.category.categoryContentTypeLabel
+import tachiyomi.core.common.preference.CheckboxState
+import tachiyomi.domain.category.model.Category
+import tachiyomi.i18n.MR
+import tachiyomi.presentation.core.components.material.padding
+import tachiyomi.presentation.core.i18n.pluralStringResource
+import tachiyomi.presentation.core.i18n.stringResource
+
+@Composable
+fun CategoryCreateDialog(
+    onDismissRequest: () -> Unit,
+    // RK: the content type is chosen here and fixed afterwards; rename stays name-only.
+    onCreate: (String, Long) -> Unit,
+    categories: List<String>,
+    // RK: what the screen's content-type chip is showing; universal when it is on All.
+    initialContentType: Long = CategoryContentType.UNIVERSAL,
+) {
+    var name by remember { mutableStateOf("") }
+    // RK: starts on the library the user is looking at, and works in both when that is All.
+    var contentType by remember { mutableLongStateOf(initialContentType) }
+
+    val focusRequester = remember { FocusRequester() }
+    val nameAlreadyExists = remember(name) { categories.contains(name) }
+
+    AlertDialog(
+        onDismissRequest = onDismissRequest,
+        confirmButton = {
+            TextButton(
+                enabled = name.isNotEmpty() && !nameAlreadyExists,
+                onClick = {
+                    onCreate(name, contentType) // RK
+                    onDismissRequest()
+                },
+            ) {
+                Text(text = stringResource(MR.strings.action_add))
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismissRequest) {
+                Text(text = stringResource(MR.strings.action_cancel))
+            }
+        },
+        title = {
+            Text(text = stringResource(MR.strings.action_add_category))
+        },
+        text = {
+            // RK: a Column so the content-type picker can sit under the name field
+            Column {
+                OutlinedTextField(
+                    modifier = Modifier
+                        .focusRequester(focusRequester),
+                    value = name,
+                    onValueChange = { name = it },
+                    label = {
+                        Text(text = stringResource(MR.strings.name))
+                    },
+                    supportingText = {
+                        val msgRes = if (name.isNotEmpty() && nameAlreadyExists) {
+                            MR.strings.error_category_exists
+                        } else {
+                            MR.strings.information_required_plain
+                        }
+                        Text(text = stringResource(msgRes))
+                    },
+                    isError = name.isNotEmpty() && nameAlreadyExists,
+                    singleLine = true,
+                )
+
+                // RK --> which libraries the new category applies to
+                Text(
+                    text = stringResource(MR.strings.category_content_type),
+                    style = MaterialTheme.typography.labelMedium,
+                    modifier = Modifier.padding(
+                        start = MaterialTheme.padding.extraSmall,
+                        top = MaterialTheme.padding.small,
+                        bottom = MaterialTheme.padding.extraSmall,
+                    ),
+                )
+                CategoryContentTypeOptions(
+                    selected = contentType,
+                    onSelect = { contentType = it },
+                )
+                // RK <--
+            }
+        },
+    )
+
+    LaunchedEffect(focusRequester) {
+        focusRequester.requestFocus()
+    }
+}
+
+// RK: the three content types as a radio group, in the order All / Manga only / Novels only.
+@Composable
+private fun CategoryContentTypeOptions(
+    selected: Long,
+    onSelect: (Long) -> Unit,
+) {
+    listOf(CategoryContentType.UNIVERSAL, CategoryContentType.MANGA, CategoryContentType.NOVEL).forEach { type ->
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .selectable(
+                    selected = selected == type,
+                    onClick = { onSelect(type) },
+                    role = Role.RadioButton,
+                )
+                .padding(vertical = MaterialTheme.padding.extraSmall),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            RadioButton(selected = selected == type, onClick = null)
+            Text(
+                text = stringResource(categoryContentTypeLabel(type)),
+                modifier = Modifier.padding(start = MaterialTheme.padding.small),
+            )
+        }
+    }
+}
+
+@Composable
+fun CategoryRenameDialog(
+    onDismissRequest: () -> Unit,
+    onRename: (String) -> Unit,
+    categories: List<String>,
+    category: String,
+) {
+    var name by remember { mutableStateOf(category) }
+    var valueHasChanged by remember { mutableStateOf(false) }
+
+    val focusRequester = remember { FocusRequester() }
+    val nameAlreadyExists = remember(name) { categories.contains(name) }
+
+    AlertDialog(
+        onDismissRequest = onDismissRequest,
+        confirmButton = {
+            TextButton(
+                enabled = valueHasChanged && name.isNotEmpty() && !nameAlreadyExists,
+                onClick = {
+                    onRename(name)
+                    onDismissRequest()
+                },
+            ) {
+                Text(text = stringResource(MR.strings.action_ok))
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismissRequest) {
+                Text(text = stringResource(MR.strings.action_cancel))
+            }
+        },
+        title = {
+            Text(text = stringResource(MR.strings.action_rename_category))
+        },
+        text = {
+            OutlinedTextField(
+                modifier = Modifier.focusRequester(focusRequester),
+                value = name,
+                onValueChange = {
+                    valueHasChanged = name != it
+                    name = it
+                },
+                label = { Text(text = stringResource(MR.strings.name)) },
+                supportingText = {
+                    val msgRes = if (valueHasChanged && nameAlreadyExists) {
+                        MR.strings.error_category_exists
+                    } else {
+                        MR.strings.information_required_plain
+                    }
+                    Text(text = stringResource(msgRes))
+                },
+                isError = valueHasChanged && nameAlreadyExists,
+                singleLine = true,
+            )
+        },
+    )
+
+    LaunchedEffect(focusRequester) {
+        focusRequester.requestFocus()
+    }
+}
+
+@Composable
+fun CategoryDeleteDialog(
+    onDismissRequest: () -> Unit,
+    onDelete: () -> Unit,
+    category: String,
+) {
+    AlertDialog(
+        onDismissRequest = onDismissRequest,
+        confirmButton = {
+            TextButton(onClick = {
+                onDelete()
+                onDismissRequest()
+            }) {
+                Text(text = stringResource(MR.strings.action_ok))
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismissRequest) {
+                Text(text = stringResource(MR.strings.action_cancel))
+            }
+        },
+        title = {
+            Text(text = stringResource(MR.strings.delete_category))
+        },
+        text = {
+            Text(text = stringResource(MR.strings.delete_category_confirmation, category))
+        },
+    )
+}
+
+// RK: bulk-delete confirmation for multi-select; the deferred delete + undo snackbar follow on confirm.
+@Composable
+fun CategoryDeleteSelectedDialog(
+    count: Int,
+    onDismissRequest: () -> Unit,
+    onDelete: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onDismissRequest,
+        confirmButton = {
+            TextButton(onClick = {
+                onDelete()
+                onDismissRequest()
+            }) {
+                Text(text = stringResource(MR.strings.action_ok))
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismissRequest) {
+                Text(text = stringResource(MR.strings.action_cancel))
+            }
+        },
+        title = {
+            Text(text = stringResource(MR.strings.delete_category))
+        },
+        text = {
+            Text(text = pluralStringResource(MR.plurals.delete_categories_confirmation, count, count))
+        },
+    )
+}
+
+@Composable
+fun ChangeCategoryDialog(
+    initialSelection: List<CheckboxState<Category>>,
+    onDismissRequest: () -> Unit,
+    onEditCategories: () -> Unit,
+    onConfirm: (List<Long>, List<Long>) -> Unit,
+    // RK: names what the batch is filing when two prompts run back to back, one per content type.
+    title: String? = null,
+) {
+    if (initialSelection.isEmpty()) {
+        AlertDialog(
+            onDismissRequest = onDismissRequest,
+            confirmButton = {
+                tachiyomi.presentation.core.components.material.TextButton(
+                    onClick = {
+                        onDismissRequest()
+                        onEditCategories()
+                    },
+                ) {
+                    Text(text = stringResource(MR.strings.action_edit_categories))
+                }
+            },
+            title = {
+                Text(text = title ?: stringResource(MR.strings.action_move_category)) // RK: caller-supplied title
+            },
+            text = {
+                Text(text = stringResource(MR.strings.information_empty_category_dialog))
+            },
+        )
+        return
+    }
+    var selection by remember { mutableStateOf(initialSelection) }
+    AlertDialog(
+        onDismissRequest = onDismissRequest,
+        confirmButton = {
+            Row {
+                tachiyomi.presentation.core.components.material.TextButton(onClick = {
+                    onDismissRequest()
+                    onEditCategories()
+                }) {
+                    Text(text = stringResource(MR.strings.action_edit))
+                }
+                Spacer(modifier = Modifier.weight(1f))
+                tachiyomi.presentation.core.components.material.TextButton(onClick = onDismissRequest) {
+                    Text(text = stringResource(MR.strings.action_cancel))
+                }
+                tachiyomi.presentation.core.components.material.TextButton(
+                    onClick = {
+                        onDismissRequest()
+                        onConfirm(
+                            selection
+                                .filter { it is CheckboxState.State.Checked || it is CheckboxState.TriState.Include }
+                                .map { it.value.id },
+                            selection
+                                .filter { it is CheckboxState.State.None || it is CheckboxState.TriState.None }
+                                .map { it.value.id },
+                        )
+                    },
+                ) {
+                    Text(text = stringResource(MR.strings.action_ok))
+                }
+            }
+        },
+        title = {
+            Text(text = title ?: stringResource(MR.strings.action_move_category)) // RK: caller-supplied title
+        },
+        text = {
+            Column(
+                modifier = Modifier.verticalScroll(rememberScrollState()),
+            ) {
+                selection.forEach { checkbox ->
+                    val onChange: (CheckboxState<Category>) -> Unit = {
+                        val index = selection.indexOf(it)
+                        if (index != -1) {
+                            val mutableList = selection.toMutableList()
+                            mutableList[index] = it.next()
+                            selection = mutableList.toList()
+                        }
+                    }
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { onChange(checkbox) },
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        when (checkbox) {
+                            is CheckboxState.TriState -> {
+                                TriStateCheckbox(
+                                    state = checkbox.asToggleableState(),
+                                    onClick = { onChange(checkbox) },
+                                )
+                            }
+                            is CheckboxState.State -> {
+                                Checkbox(
+                                    checked = checkbox.isChecked,
+                                    onCheckedChange = { onChange(checkbox) },
+                                )
+                            }
+                        }
+
+                        Text(
+                            text = checkbox.value.visualName,
+                            modifier = Modifier.padding(horizontal = ScreenHorizontalPadding),
+                        )
+                    }
+                }
+            }
+        },
+    )
+}

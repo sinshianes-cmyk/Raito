@@ -1,0 +1,472 @@
+package eu.kanade.presentation.library.components
+
+import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.spring
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsPressedAsState
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxScope
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.RowScope
+import androidx.compose.foundation.layout.aspectRatio
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.FilledIconButton
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButtonDefaults
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Text
+import androidx.compose.material3.contentColorFor
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Shadow
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import eu.kanade.presentation.manga.components.MangaCover
+import mihon.icons.materialsymbols.MaterialSymbols
+import mihon.icons.materialsymbols.roundedfilled.PlayArrow
+import raito.presentation.library.CoverBadgeRow // RK
+import raito.presentation.theme.Dimens // RK
+import tachiyomi.i18n.MR
+import tachiyomi.presentation.core.components.BadgeGroup
+import tachiyomi.presentation.core.i18n.stringResource
+import tachiyomi.presentation.core.util.selectedBackground
+
+object CommonMangaItemDefaults {
+    val GridHorizontalSpacer = Dimens.ListSpacing - Dimens.GridOuter * 2
+    val GridVerticalSpacer = Dimens.ListSpacing - Dimens.GridOuter * 2
+
+    @Suppress("ConstPropertyName")
+    const val BrowseFavoriteCoverAlpha = 0.34f
+}
+
+private val ContinueReadingButtonSizeSmall = 28.dp
+private val ContinueReadingButtonSizeLarge = 32.dp
+
+private val ContinueReadingButtonIconSizeSmall = 16.dp
+private val ContinueReadingButtonIconSizeLarge = 20.dp
+
+private val ContinueReadingButtonGridPadding = 6.dp
+private val ContinueReadingButtonListSpacing = 8.dp
+
+internal const val GRID_SELECTED_COVER_ALPHA = 0.76f // RK: internal, RecommendationGridItem dims its cover alike
+
+// RK: Komikku's value; a cover at or below this height/width ratio is wide enough to letterbox
+private const val RATIO_SWITCH_TO_PANORAMA = 0.75f
+
+/**
+ * Layout of grid list item with title overlaying the cover.
+ * Accepts null [title] for a cover-only view.
+ */
+@Composable
+fun MangaCompactGridItem(
+    coverData: Any, // RK: Any (not MangaCover) so raito.domain.novel.model.NovelCover renders through these cells too
+    onClick: () -> Unit,
+    onLongClick: () -> Unit,
+    isSelected: Boolean = false,
+    title: String? = null,
+    onClickContinueReading: (() -> Unit)? = null,
+    coverAlpha: Float = 1f,
+    coverBadgeStart: @Composable (RowScope.() -> Unit)? = null,
+    coverBadgeEnd: @Composable (RowScope.() -> Unit)? = null,
+) {
+    GridItemSelectable(
+        isSelected = isSelected,
+        onClick = onClick,
+        onLongClick = onLongClick,
+    ) {
+        MangaGridCover(
+            cover = {
+                MangaCover.Grid(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .alpha(if (isSelected) GRID_SELECTED_COVER_ALPHA else coverAlpha),
+                    data = coverData,
+                    shape = Dimens.CoverShapeLarge,
+                )
+            },
+            badgesStart = coverBadgeStart,
+            badgesEnd = coverBadgeEnd,
+            content = {
+                if (title != null) {
+                    CoverTextOverlay(
+                        title = title,
+                        onClickContinueReading = onClickContinueReading,
+                    )
+                } else if (onClickContinueReading != null) {
+                    ContinueReadingButton(
+                        size = ContinueReadingButtonSizeLarge,
+                        iconSize = ContinueReadingButtonIconSizeLarge,
+                        onClick = onClickContinueReading,
+                        modifier = Modifier
+                            .padding(ContinueReadingButtonGridPadding)
+                            .align(Alignment.BottomEnd),
+                    )
+                }
+            },
+        )
+    }
+}
+
+/**
+ * Title overlay for [MangaCompactGridItem]
+ */
+@Composable
+private fun BoxScope.CoverTextOverlay(
+    title: String,
+    onClickContinueReading: (() -> Unit)? = null,
+) {
+    Box(
+        modifier = Modifier
+            .clip(RoundedCornerShape(bottomStart = Dimens.CoverCornerLarge, bottomEnd = Dimens.CoverCornerLarge))
+            .background(
+                Brush.verticalGradient(
+                    0f to Color.Transparent,
+                    0.55f to Color(0x44000000),
+                    1f to Color(0xB3000000),
+                ),
+            )
+            .height(Dimens.GridScrimHeight)
+            .fillMaxWidth()
+            .align(Alignment.BottomCenter),
+    )
+    Row(
+        modifier = Modifier.align(Alignment.BottomStart),
+        verticalAlignment = Alignment.Bottom,
+    ) {
+        GridItemTitle(
+            modifier = Modifier
+                .weight(1f)
+                .padding(start = 12.dp, end = 12.dp, bottom = 8.dp),
+            title = title,
+            style = MaterialTheme.typography.titleSmall.copy(
+                color = Color.White,
+                shadow = Shadow(
+                    color = Color(0x80000000),
+                    offset = Offset(0f, 1f),
+                    blurRadius = 3f,
+                ),
+            ),
+            minLines = 1,
+        )
+        if (onClickContinueReading != null) {
+            ContinueReadingButton(
+                size = ContinueReadingButtonSizeSmall,
+                iconSize = ContinueReadingButtonIconSizeSmall,
+                onClick = onClickContinueReading,
+                modifier = Modifier.padding(
+                    end = ContinueReadingButtonGridPadding,
+                    bottom = ContinueReadingButtonGridPadding,
+                ),
+            )
+        }
+    }
+}
+
+/**
+ * Layout of grid list item with title below the cover.
+ */
+@Composable
+fun MangaComfortableGridItem(
+    coverData: Any, // RK: Any (not MangaCover) so raito.domain.novel.model.NovelCover renders through these cells too
+    title: String,
+    onClick: () -> Unit,
+    onLongClick: () -> Unit,
+    isSelected: Boolean = false,
+    titleMaxLines: Int = 2,
+    coverAlpha: Float = 1f,
+    coverBadgeStart: (@Composable RowScope.() -> Unit)? = null,
+    coverBadgeEnd: (@Composable RowScope.() -> Unit)? = null,
+    onClickContinueReading: (() -> Unit)? = null,
+    // RK -->
+    // Panorama shows a wide cover whole instead of cropped, in the same Book-ratio cell. The ratio is
+    // measured on every load, since a mode switch keeps the loaded image and fires no new load.
+    usePanoramaCover: Boolean = false,
+) {
+    val coverRatio = remember { mutableFloatStateOf(1f) }
+    val coverIsWide = usePanoramaCover && coverRatio.floatValue <= RATIO_SWITCH_TO_PANORAMA
+    // RK <--
+    GridItemSelectable(
+        isSelected = isSelected,
+        onClick = onClick,
+        onLongClick = onLongClick,
+    ) {
+        Column {
+            MangaGridCover(
+                cover = {
+                    MangaCover.Grid(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .alpha(if (isSelected) GRID_SELECTED_COVER_ALPHA else coverAlpha),
+                        data = coverData,
+                        shape = Dimens.CoverShapeLarge,
+                        // RK -->
+                        scale = if (coverIsWide) ContentScale.Fit else ContentScale.Crop,
+                        onSuccess = {
+                            val image = it.result.image
+                            coverRatio.floatValue = image.height.toFloat() / image.width
+                        },
+                        // RK <--
+                    )
+                },
+                badgesStart = coverBadgeStart,
+                badgesEnd = coverBadgeEnd,
+                content = {
+                    if (onClickContinueReading != null) {
+                        ContinueReadingButton(
+                            size = ContinueReadingButtonSizeLarge,
+                            iconSize = ContinueReadingButtonIconSizeLarge,
+                            onClick = onClickContinueReading,
+                            modifier = Modifier
+                                .padding(ContinueReadingButtonGridPadding)
+                                .align(Alignment.BottomEnd),
+                        )
+                    }
+                },
+            )
+            GridItemTitle(
+                modifier = Modifier.padding(horizontal = 4.dp, vertical = Dimens.MarginSmall / 2),
+                title = title,
+                style = MaterialTheme.typography.titleSmall,
+                minLines = 2,
+                maxLines = titleMaxLines,
+            )
+        }
+    }
+}
+
+/**
+ * Common cover layout to add contents to be drawn on top of the cover.
+ */
+// RK: internal so RecommendationGridItem can reuse this Book-ratio cover box
+@Composable
+internal fun MangaGridCover(
+    modifier: Modifier = Modifier,
+    cover: @Composable BoxScope.() -> Unit = {},
+    badgesStart: (@Composable RowScope.() -> Unit)? = null,
+    badgesEnd: (@Composable RowScope.() -> Unit)? = null,
+    content: @Composable (BoxScope.() -> Unit)? = null,
+) {
+    Box(
+        modifier = modifier
+            .fillMaxWidth()
+            .aspectRatio(MangaCover.Grid.ratio),
+    ) {
+        cover()
+        content?.invoke(this)
+        // RK -->
+        // Upstream aligned the two badge groups independently (TopStart / TopEnd) in this Box, so on a
+        // narrow cover the end group painted over the start group and an unread count of 408 rendered
+        // as "4". CoverBadgeRow gives them one shared width instead, and degrades the end group.
+        if (badgesStart != null || badgesEnd != null) {
+            CoverBadgeRow(
+                modifier = Modifier
+                    .padding(4.dp)
+                    .fillMaxWidth()
+                    .align(Alignment.TopStart),
+                badgesStart = badgesStart,
+                badgesEnd = badgesEnd,
+            )
+        }
+        // RK <--
+    }
+}
+
+// RK: internal so RecommendationGridItem can reuse it
+@Composable
+internal fun GridItemTitle(
+    title: String,
+    style: TextStyle,
+    minLines: Int,
+    modifier: Modifier = Modifier,
+    maxLines: Int = 2,
+) {
+    Text(
+        modifier = modifier,
+        text = title,
+        fontSize = 12.sp,
+        lineHeight = 18.sp,
+        minLines = minLines,
+        maxLines = maxLines,
+        overflow = TextOverflow.Ellipsis,
+        style = style,
+    )
+}
+
+/**
+ * Wrapper for grid items to handle selection state, click and long click.
+ */
+// RK: internal so RecommendationGridItem can reuse it
+@Composable
+internal fun GridItemSelectable(
+    isSelected: Boolean,
+    onClick: () -> Unit,
+    onLongClick: () -> Unit,
+    modifier: Modifier = Modifier,
+    content: @Composable () -> Unit,
+) {
+    val interactionSource = remember { MutableInteractionSource() }
+    val pressed by interactionSource.collectIsPressedAsState()
+    val scale by animateFloatAsState(
+        targetValue = if (pressed) 0.96f else 1f,
+        animationSpec = spring(dampingRatio = Spring.DampingRatioMediumBouncy, stiffness = Spring.StiffnessMedium),
+        label = "gridItemPressScale",
+    )
+    Box(
+        modifier = modifier
+            .graphicsLayer {
+                scaleX = scale
+                scaleY = scale
+            }
+            .clip(Dimens.SelectorShape)
+            .combinedClickable(
+                interactionSource = interactionSource,
+                indication = null,
+                onClick = onClick,
+                onLongClick = onLongClick,
+            )
+            .selectedOutline(isSelected = isSelected, color = MaterialTheme.colorScheme.primary)
+            .padding(Dimens.GridOuter),
+    ) {
+        content()
+    }
+}
+
+/**
+ * @see GridItemSelectable
+ */
+private fun Modifier.selectedOutline(
+    isSelected: Boolean,
+    color: Color,
+) = if (isSelected) {
+    this
+        .background(color.copy(alpha = 0.16f), Dimens.SelectorShape)
+        .border(BorderStroke(Dimens.SelectionStroke, color), Dimens.SelectorShape)
+} else {
+    this
+}
+
+/**
+ * Layout of list item.
+ */
+@Composable
+fun MangaListItem(
+    coverData: Any, // RK: Any (not MangaCover) so raito.domain.novel.model.NovelCover renders through these cells too
+    title: String,
+    onClick: () -> Unit,
+    onLongClick: () -> Unit,
+    // RK: split into two groups like the grid cells, so the badge ladder can degrade the end group
+    badgeStart: (@Composable RowScope.() -> Unit)? = null,
+    badgeEnd: (@Composable RowScope.() -> Unit)? = null,
+    isSelected: Boolean = false,
+    coverAlpha: Float = 1f,
+    onClickContinueReading: (() -> Unit)? = null,
+) {
+    Row(
+        modifier = Modifier
+            .padding(horizontal = 4.dp)
+            .clip(Dimens.SelectorShape)
+            .selectedBackground(isSelected)
+            .heightIn(min = Dimens.ListItemMinHeight)
+            .combinedClickable(
+                onClick = onClick,
+                onLongClick = onLongClick,
+            )
+            .padding(
+                start = Dimens.ListCoverMarginStart - 4.dp,
+                end = Dimens.MarginSmall,
+                top = Dimens.ListCoverMarginVertical,
+                bottom = Dimens.ListCoverMarginVertical,
+            ),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        MangaCover.Square(
+            modifier = Modifier
+                .size(Dimens.ListCoverSize)
+                .alpha(coverAlpha),
+            data = coverData,
+            shape = Dimens.CoverShape,
+        )
+        Text(
+            text = title,
+            modifier = Modifier
+                .padding(start = Dimens.ListTextMarginStart, end = Dimens.MarginSmall)
+                .weight(1f),
+            maxLines = 2,
+            overflow = TextOverflow.Ellipsis,
+            style = MaterialTheme.typography.titleSmall,
+        )
+        // RK -->
+        // Capped at half the row: the list has no overdraw problem, since these follow a weighted
+        // title, but a four-source merged row used to ellipsize that title down to a word or two.
+        if (badgeStart != null || badgeEnd != null) {
+            CoverBadgeRow(
+                modifier = Modifier,
+                badgesStart = badgeStart,
+                badgesEnd = badgeEnd,
+                spread = false,
+                widthFraction = 0.5f,
+            )
+        }
+        // RK <--
+        if (onClickContinueReading != null) {
+            ContinueReadingButton(
+                size = ContinueReadingButtonSizeSmall,
+                iconSize = ContinueReadingButtonIconSizeSmall,
+                onClick = onClickContinueReading,
+                modifier = Modifier.padding(start = ContinueReadingButtonListSpacing),
+            )
+        }
+    }
+}
+
+@Composable
+private fun ContinueReadingButton(
+    size: Dp,
+    iconSize: Dp,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Box(modifier = modifier) {
+        FilledIconButton(
+            onClick = onClick,
+            shape = MaterialTheme.shapes.small,
+            colors = IconButtonDefaults.filledIconButtonColors(
+                containerColor = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.9f),
+                contentColor = contentColorFor(MaterialTheme.colorScheme.primaryContainer),
+            ),
+            modifier = Modifier.size(size),
+        ) {
+            Icon(
+                imageVector = MaterialSymbols.RoundedFilled.PlayArrow,
+                contentDescription = stringResource(MR.strings.action_resume),
+                modifier = Modifier.size(iconSize),
+            )
+        }
+    }
+}

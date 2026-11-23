@@ -1,0 +1,202 @@
+package raito.domain.recommendation
+
+import eu.kanade.tachiyomi.data.track.Tracker
+import eu.kanade.tachiyomi.data.track.anilist.AnilistApi
+import eu.kanade.tachiyomi.network.POST
+import eu.kanade.tachiyomi.network.awaitSuccess
+import eu.kanade.tachiyomi.network.jsonMime
+import eu.kanade.tachiyomi.network.parseAs
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
+import okhttp3.OkHttpClient
+import okhttp3.RequestBody.Companion.toRequestBody
+import raito.data.track.isAnilistNovel
+import raito.domain.recommendation.dto.ALMediaContextResponse
+import raito.domain.recommendation.dto.ALRecsEdge
+import raito.domain.recommendation.dto.ALRecsMedia
+import raito.domain.recommendation.dto.ALRecsMediaRecommendation
+import raito.domain.recommendation.dto.ALRecsResponse
+import raito.domain.recommendation.dto.ALRecsTitle
+
+/**
+ * AniList public GraphQL recommendations (`Media.recommendations`). No auth required, so the shared
+ * recs client is fine. AniList is the one provider that reports alternative titles (romaji / english
+ * / native / synonyms), so its candidates carry [RelatedMangaCandidate.altTitles] for stronger dedup.
+ */
+class AnilistRecommendations(
+    private val client: OkHttpClient,
+    tracker: Tracker,
+    override val json: Json,
+) : TrackerRecommendations(tracker) {
+
+    override suspend fun getRecsById(remoteId: Long): List<RelatedMangaCandidate> {
+        val payload = buildJsonObject {
+            put("query", QUERY_BY_ID)
+            put("variables", buildJsonObject { put("id", remoteId) })
+        }
+        return execute(payload)
+    }
+
+    override suspend fun getRecsBySearch(title: String): List<RelatedMangaCandidate> {
+        val payload = buildJsonObject {
+            put("query", QUERY_BY_SEARCH)
+            put("variables", buildJsonObject { put("search", title) })
+        }
+        // The search variant returns multiple medias whose own titles loosely match, light novels among
+        // them; keep only the manga that contain the query in some title variant before pulling recs.
+        return execute(payload) { media -> !isAnilistNovel(media.format) && media.matchesQuery(title) }
+    }
+
+    override suspend fun getMediaContext(remoteId: Long): MediaContext {
+        val payload = buildJsonObject {
+            put("query", QUERY_MEDIA_CONTEXT)
+            put("variables", buildJsonObject { put("id", remoteId) })
+        }
+        val body = payload.toString().toRequestBody(jsonMime)
+        val media = with(json) {
+            client.newCall(POST(ENDPOINT, body = body)).awaitSuccess().parseAs<ALMediaContextResponse>()
+        }.data.media ?: return MediaContext(emptyList(), emptyList())
+
+        return MediaContext(
+            genres = media.genres,
+            recommendations = media.recommendations?.edges.orEmpty().toCandidates(),
+        )
+    }
+
+    private suspend fun execute(
+        payload: JsonObject,
+        filter: (ALRecsMedia) -> Boolean = { true },
+    ): List<RelatedMangaCandidate> {
+        val body = payload.toString().toRequestBody(jsonMime)
+        val data = with(json) {
+            client.newCall(POST(ENDPOINT, body = body)).awaitSuccess().parseAs<ALRecsResponse>()
+        }
+
+        return data.data.page.media
+            .filter(filter)
+            .flatMap { it.recommendations?.edges.orEmpty() }
+            .toCandidates()
+    }
+
+    private fun List<ALRecsEdge>.toCandidates(): List<RelatedMangaCandidate> =
+        mapNotNull { it.node?.mediaRecommendation }
+            .mapNotNull { rec ->
+                val url = rec.siteUrl ?: return@mapNotNull null
+                // Drop a recommendation with no usable title rather than surface a placeholder card.
+                val title = rec.pickTitle() ?: return@mapNotNull null
+                candidate(
+                    url = url,
+                    title = title,
+                    thumbnailUrl = rec.coverImage?.large,
+                    remoteId = rec.id,
+                    altTitles = rec.altTitles(),
+                )
+            }
+
+    private fun ALRecsMedia.matchesQuery(query: String): Boolean {
+        if (title?.contains(query) == true) return true
+        return synonyms.any { it.contains(query, ignoreCase = true) }
+    }
+
+    private fun ALRecsTitle.contains(query: String): Boolean =
+        romaji?.contains(query, ignoreCase = true) == true ||
+            english?.contains(query, ignoreCase = true) == true ||
+            native?.contains(query, ignoreCase = true) == true
+
+    private fun ALRecsMediaRecommendation.pickTitle(): String? {
+        val english = title?.english
+        val romaji = title?.romaji
+        val native = title?.native
+        val synonym = synonyms.firstOrNull()
+        val isJp = countryOfOrigin == "JP"
+
+        return when {
+            !english.isNullOrBlank() -> english
+            isJp && !romaji.isNullOrBlank() -> romaji
+            !synonym.isNullOrBlank() -> synonym
+            !isJp && !romaji.isNullOrBlank() -> romaji
+            else -> native?.takeIf { it.isNotBlank() }
+        }
+    }
+
+    private fun ALRecsMediaRecommendation.altTitles(): List<String> =
+        (listOfNotNull(title?.romaji, title?.english, title?.native) + synonyms)
+            .filter { it.isNotBlank() }
+
+    companion object {
+        private const val ENDPOINT = AnilistApi.API_URL
+
+        private val QUERY_BY_ID = """
+            query Recommendations(${'$'}id: Int!) {
+              Page {
+                media(id: ${'$'}id, type: MANGA) {
+                  recommendations {
+                    edges {
+                      node {
+                        mediaRecommendation {
+                          id
+                          countryOfOrigin
+                          siteUrl
+                          title { romaji english native }
+                          synonyms
+                          coverImage { large }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+        """.trimIndent()
+
+        private val QUERY_MEDIA_CONTEXT = """
+            query MediaContext(${'$'}id: Int!) {
+              Media(id: ${'$'}id, type: MANGA) {
+                genres
+                recommendations {
+                  edges {
+                    node {
+                      mediaRecommendation {
+                        id
+                        countryOfOrigin
+                        siteUrl
+                        title { romaji english native }
+                        synonyms
+                        coverImage { large }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+        """.trimIndent()
+
+        private val QUERY_BY_SEARCH = """
+            query Recommendations(${'$'}search: String!) {
+              Page {
+                media(search: ${'$'}search, type: MANGA) {
+                  format
+                  title { romaji english native }
+                  synonyms
+                  recommendations {
+                    edges {
+                      node {
+                        mediaRecommendation {
+                          id
+                          countryOfOrigin
+                          siteUrl
+                          title { romaji english native }
+                          synonyms
+                          coverImage { large }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+        """.trimIndent()
+    }
+}

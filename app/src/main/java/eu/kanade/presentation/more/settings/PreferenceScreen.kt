@@ -1,0 +1,123 @@
+package eu.kanade.presentation.more.settings
+
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.util.fastForEachIndexed
+import eu.kanade.presentation.more.settings.screen.HighlightKey
+import eu.kanade.presentation.more.settings.screen.SearchableSettings
+import eu.kanade.presentation.more.settings.widget.PreferenceGroupHeader
+import kotlinx.coroutines.delay
+import raito.presentation.settings.CardPosition // RK
+import raito.presentation.settings.LocalPreferenceCardPosition // RK
+import tachiyomi.presentation.core.components.ScrollbarLazyColumn
+import kotlin.time.Duration.Companion.seconds
+
+/**
+ * Preference Screen composable which contains a list of [Preference] items
+ * @param items [Preference] items which should be displayed on the preference screen. An item can be a single [PreferenceItem] or a group ([Preference.PreferenceGroup])
+ * @param modifier [Modifier] to be applied to the preferenceScreen layout
+ */
+@Composable
+fun PreferenceScreen(
+    items: List<Preference>,
+    modifier: Modifier = Modifier,
+    contentPadding: PaddingValues = PaddingValues(0.dp),
+) {
+    val state = rememberLazyListState()
+    val highlightKey = SearchableSettings.highlightKey
+    if (highlightKey != null) {
+        LaunchedEffect(Unit) {
+            val i = items.findHighlightedIndex(highlightKey)
+            if (i >= 0) {
+                delay(0.5.seconds)
+                state.animateScrollToItem(i)
+            }
+            SearchableSettings.highlightKey = null
+        }
+    }
+
+    ScrollbarLazyColumn(
+        modifier = modifier,
+        state = state,
+        contentPadding = contentPadding,
+    ) {
+        items.fastForEachIndexed { i, preference ->
+            when (preference) {
+                // Create Preference Group
+                is Preference.PreferenceGroup -> {
+                    if (!preference.visible) return@fastForEachIndexed
+
+                    item {
+                        Column {
+                            PreferenceGroupHeader(
+                                title = preference.title,
+                                // RK: a heading result carries HighlightKey.heading, not the bare title
+                                highlighted = highlightKey != null &&
+                                    HighlightKey.heading(preference.title).matches(highlightKey),
+                            )
+                        }
+                    }
+                    // RK --> each row is a tonal card; corners follow its place among the group's visible rows
+                    itemsIndexed(preference.preferenceItems) { _, item ->
+                        val visible = preference.preferenceItems.filter { it.visible }
+                        val position = CardPosition(
+                            index = visible.indexOf(item).coerceAtLeast(0),
+                            total = visible.size.coerceAtLeast(1),
+                        )
+                        CompositionLocalProvider(LocalPreferenceCardPosition provides position) {
+                            PreferenceItem(
+                                item = item,
+                                highlightKey = highlightKey,
+                                // RK: the group this item sits in, so highlighting is group-aware.
+                                groupTitle = preference.title,
+                            )
+                        }
+                    }
+                    // RK <--
+                    item {
+                        if (i < items.lastIndex) {
+                            Spacer(modifier = Modifier.height(12.dp))
+                        }
+                    }
+                }
+
+                // Create Preference Item
+                is Preference.PreferenceItem<*, *> -> item {
+                    // RK: a lone item is a single rounded card
+                    CompositionLocalProvider(LocalPreferenceCardPosition provides CardPosition(0, 1)) {
+                        PreferenceItem(
+                            item = preference,
+                            highlightKey = highlightKey,
+                            groupTitle = null, // RK: top-level item, no group
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+// RK --> match on (group, title) so the scroll lands on the exact row when two rows share a title
+private fun List<Preference>.findHighlightedIndex(highlightKey: HighlightKey): Int {
+    return flatMap { pref ->
+        if (pref is Preference.PreferenceGroup) {
+            buildList<HighlightKey?> {
+                add(HighlightKey.heading(pref.title)) // Header
+                addAll(pref.preferenceItems.map { groupItem -> HighlightKey(pref.title, groupItem.title) })
+                add(null) // Spacer
+            }
+        } else {
+            listOf(HighlightKey(null, pref.title))
+        }
+    }.indexOfFirst { it != null && it.matches(highlightKey) }
+}
+// RK <--

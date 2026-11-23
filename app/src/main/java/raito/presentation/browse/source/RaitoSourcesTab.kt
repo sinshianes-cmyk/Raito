@@ -1,0 +1,286 @@
+package raito.presentation.browse.source
+
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.lazy.LazyListState
+import androidx.compose.foundation.lazy.items
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import cafe.adriel.voyager.core.screen.Screen
+import cafe.adriel.voyager.navigator.LocalNavigator
+import cafe.adriel.voyager.navigator.currentOrThrow
+import dev.zacsweers.metrox.viewmodel.assistedMetroViewModel
+import dev.zacsweers.metrox.viewmodel.metroViewModel
+import eu.kanade.presentation.browse.SourceItem
+import eu.kanade.presentation.browse.SourceLatestButton
+import eu.kanade.presentation.browse.SourcePinButton
+import eu.kanade.presentation.components.AppBar
+import eu.kanade.presentation.components.TabContent
+import eu.kanade.tachiyomi.ui.browse.source.SourcesViewModel
+import eu.kanade.tachiyomi.ui.browse.source.browse.BrowseSourceViewModel.Listing
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.launch
+import mihon.app.di.appGraph
+import mihon.icons.materialsymbols.MaterialSymbols
+import mihon.icons.materialsymbols.rounded.FilterList
+import mihon.icons.materialsymbols.rounded.TravelExplore
+import raito.domain.library.ContentType
+import raito.domain.source.SourceKey
+import raito.novel.source.NovelSource
+import raito.presentation.browse.EntrySourceOptionsDialog
+import raito.presentation.browse.RaitoBrowseViewModel
+import raito.presentation.browse.browseLanguageLabel
+import raito.presentation.browse.catalogue.EntryCatalogueScreen
+import raito.presentation.browse.components.BrowseSectionHeader
+import raito.presentation.browse.components.ContentWarningBadge
+import raito.presentation.browse.components.NovelSourceRow
+import raito.presentation.browse.components.formatLabel
+import raito.presentation.browse.components.sourceDetail
+import raito.presentation.browse.globalsearch.EntryGlobalSearchScreen
+import raito.presentation.browse.sourceLanguageLabel
+import raito.presentation.components.ContentTypeBadge
+import raito.presentation.components.ContentTypeFilterChips
+import raito.presentation.components.rememberChipListState
+import tachiyomi.domain.source.model.Source
+import tachiyomi.i18n.MR
+import tachiyomi.presentation.core.components.ScrollbarLazyColumn
+import tachiyomi.presentation.core.components.material.topSmallPaddingValues
+import tachiyomi.presentation.core.i18n.stringResource
+import tachiyomi.presentation.core.screens.EmptyScreen
+import tachiyomi.presentation.core.screens.LoadingScreen
+import tachiyomi.presentation.core.util.plus
+
+/**
+ * The Browse "Sources" tab: one list of every enabled source, manga and light novel together, with
+ * the content-type chip as a filter over it rather than a switch between two lists.
+ *
+ * Assembly, sectioning, search and the row dialog live in [SourcesEngine]; this draws what it is given and
+ * routes a tap. Replaces Mihon's `sourcesTab()` via a `// RK` island at its call site; the replaced
+ * builder is deleted (see the off-path manifest).
+ */
+@Composable
+fun Screen.raitoSourcesTab(browseViewModel: RaitoBrowseViewModel): TabContent {
+    val navigator = LocalNavigator.currentOrThrow
+    val context = LocalContext.current
+    val mangaModel = metroViewModel<SourcesViewModel>()
+    val novelModel = metroViewModel<NovelSourcesViewModel>()
+    val providers = remember(mangaModel, novelModel) {
+        listOf(
+            MangaSourcesProvider(mangaModel, context.appGraph.extensionManager.loadedExtensionsFlow),
+            NovelSourcesProvider(novelModel),
+        )
+    }
+    val engine = assistedMetroViewModel<SourcesEngine, SourcesEngine.Factory> {
+        create(providers, browseViewModel.searchQuery)
+    }
+    val state by engine.state.collectAsStateWithLifecycle()
+
+    return TabContent(
+        titleRes = MR.strings.label_sources,
+        searchEnabled = true,
+        actions = listOfNotNull(
+            AppBar.Action(
+                title = stringResource(MR.strings.action_global_search),
+                icon = MaterialSymbols.Rounded.TravelExplore,
+                onClick = {
+                    // One screen for both types; from Browse it opens on whatever the chip holds.
+                    navigator.push(EntryGlobalSearchScreen())
+                },
+            ),
+            // One filter screen for both types, opening on the chip it was reached from. Routing
+            // All and Manga to the manga screen left every plugin unreachable from the default chip.
+            AppBar.Action(
+                title = stringResource(MR.strings.action_filter),
+                icon = MaterialSymbols.Rounded.FilterList,
+                onClick = { navigator.push(EntrySourcesFilterScreen(state.contentType)) },
+            ),
+        ),
+        content = { contentPadding, snackbarHostState ->
+            Column {
+                ContentTypeFilterChips(
+                    selected = state.contentType,
+                    onSelect = browseViewModel::setContentType,
+                )
+                when {
+                    state.isLoading -> LoadingScreen(Modifier.padding(contentPadding))
+                    state.isEmpty -> EmptyScreen(
+                        stringRes = if (state.isSearching) {
+                            MR.strings.no_results_found
+                        } else {
+                            MR.strings.source_empty_screen
+                        },
+                        modifier = Modifier.padding(contentPadding),
+                    )
+                    else -> SourcesList(
+                        items = state.items,
+                        listState = rememberChipListState(state.contentType),
+                        showContentType = state.contentType == ContentType.ALL,
+                        showsFormat = state.showsFormat,
+                        showLatest = state.showLatest,
+                        contentPadding = contentPadding,
+                        onClickItem = { row, latest ->
+                            navigator.push(
+                                EntryCatalogueScreen(
+                                    row.key,
+                                    startLatest = latest ||
+                                        (row.supportsLatest && context.appGraph.raitoSourcePreferences.defaultListingLatest.get()),
+                                ),
+                            )
+                        },
+                        onClickPin = engine::togglePin,
+                        onLongClickItem = engine::showDialog,
+                    )
+                }
+            }
+
+            state.dialog?.let { dialog ->
+                EntrySourceOptionsDialog(
+                    title = dialog.row.name,
+                    isPinned = dialog.row.isPinned,
+                    showToggleDisable = dialog.canDisable,
+                    showToggleIncognito = dialog.canToggleIncognito,
+                    isIncognito = dialog.isIncognito,
+                    onClickPin = {
+                        engine.togglePin(dialog.row)
+                        engine.closeDialog()
+                    },
+                    onClickToggleDisable = {
+                        engine.toggleDisable(dialog.row)
+                        engine.closeDialog()
+                    },
+                    // Left open, so the switch is seen to flip.
+                    onClickToggleIncognito = { engine.toggleIncognito(dialog) },
+                    onDismiss = engine::closeDialog,
+                )
+            }
+
+            val internalErrString = stringResource(MR.strings.internal_error)
+            LaunchedEffect(Unit) {
+                mangaModel.events.collectLatest { event ->
+                    when (event) {
+                        SourcesViewModel.Event.FailedFetchingSources ->
+                            launch { snackbarHostState.showSnackbar(internalErrString) }
+                    }
+                }
+            }
+        },
+    )
+}
+
+@Composable
+internal fun SourcesList(
+    items: List<SourcesListItem>,
+    showContentType: Boolean,
+    /** Novel sources of more than one packaging are listed, so each row names its own. */
+    showsFormat: Boolean,
+    showLatest: Boolean,
+    listState: LazyListState,
+    contentPadding: PaddingValues,
+    /** The row that was tapped, and whether it was its Latest button rather than the row. */
+    onClickItem: (BrowseSourceRow, Boolean) -> Unit,
+    onClickPin: (BrowseSourceRow) -> Unit,
+    onLongClickItem: (BrowseSourceRow) -> Unit,
+) {
+    val context = LocalContext.current
+    ScrollbarLazyColumn(state = listState, contentPadding = contentPadding + topSmallPaddingValues) {
+        items(
+            items = items,
+            contentType = {
+                when (it) {
+                    is SourcesListItem.Header -> "header"
+                    is SourcesListItem.Row -> "item"
+                }
+            },
+            key = {
+                when (it) {
+                    is SourcesListItem.Header -> "header-${it.key}"
+                    is SourcesListItem.Row -> "source-${it.row.key}-${it.row.isUsedLast}"
+                }
+            },
+        ) { item ->
+            when (item) {
+                is SourcesListItem.Header -> BrowseSectionHeader(
+                    title = browseLanguageLabel(item.key, context),
+                    modifier = Modifier.animateItem(),
+                )
+                is SourcesListItem.Row -> SourceRow(
+                    modifier = Modifier.animateItem(),
+                    row = item.row,
+                    showContentType = showContentType,
+                    showsFormat = showsFormat,
+                    showLatest = showLatest,
+                    onClickItem = onClickItem,
+                    onClickPin = onClickPin,
+                    onLongClickItem = onLongClickItem,
+                )
+            }
+        }
+    }
+}
+
+/** One row, drawn by whichever leaf owns its content type. */
+@Composable
+private fun SourceRow(
+    row: BrowseSourceRow,
+    showContentType: Boolean,
+    showsFormat: Boolean,
+    /** Whether a row that supports Latest shows its button. */
+    showLatest: Boolean,
+    /** The row that was tapped, and whether it was its Latest button rather than the row. */
+    onClickItem: (BrowseSourceRow, Boolean) -> Unit,
+    onClickPin: (BrowseSourceRow) -> Unit,
+    onLongClickItem: (BrowseSourceRow) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val languageLabel = sourceLanguageLabel(row.lang, LocalContext.current)
+    val badge: @Composable () -> Unit = {
+        if (showContentType) ContentTypeBadge(row.key.contentType)
+        ContentWarningBadge(row.contentWarning)
+    }
+    val latestShown = showLatest && row.supportsLatest
+    when (row.key) {
+        is SourceKey.Manga -> {
+            SourceItem(
+                modifier = modifier,
+                source = row.source as Source,
+                title = row.title,
+                languageLabel = languageLabel,
+                showLatest = latestShown,
+                onClickItem = { _, listing -> onClickItem(row, listing == Listing.Latest) },
+                onLongClickItem = { onLongClickItem(row) },
+                onClickPin = { onClickPin(row) },
+                badge = badge,
+            )
+        }
+        is SourceKey.Novel -> {
+            val source = row.source as NovelSource
+            NovelSourceRow(
+                modifier = modifier,
+                name = row.title,
+                subtitle = sourceDetail(
+                    language = languageLabel,
+                    format = formatLabel(row.format, showsFormat),
+                ),
+                iconUrl = source.iconUrl,
+                onClickItem = { onClickItem(row, false) },
+                onLongClickItem = { onLongClickItem(row) },
+                badge = badge,
+                action = {
+                    if (latestShown) {
+                        SourceLatestButton(onClick = { onClickItem(row, true) })
+                    }
+                    SourcePinButton(
+                        isPinned = row.isPinned,
+                        onClick = { onClickPin(row) },
+                    )
+                },
+            )
+        }
+    }
+}

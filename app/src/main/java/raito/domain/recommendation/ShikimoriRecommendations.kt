@@ -1,0 +1,75 @@
+package raito.domain.recommendation
+
+import eu.kanade.tachiyomi.data.track.Tracker
+import eu.kanade.tachiyomi.data.track.shikimori.ShikimoriApi
+import eu.kanade.tachiyomi.network.GET
+import eu.kanade.tachiyomi.network.awaitSuccess
+import eu.kanade.tachiyomi.network.parseAs
+import kotlinx.serialization.json.Json
+import okhttp3.Headers
+import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.OkHttpClient
+import raito.data.track.RAITO_TRACKER_USER_AGENT
+import raito.domain.recommendation.dto.SMMangaDetail
+import raito.domain.recommendation.dto.SMRecsManga
+
+/**
+ * Shikimori similar-manga recommendations (`/api/mangas/{id}/similar`). The endpoint is public, so
+ * no OAuth is used (reusing Shikimori's auth interceptor would throw for a logged-out user). But
+ * Shikimori IP-bans on a browser User-Agent, so every request carries the UA the signed-in calls send,
+ * which the shared client's default UA interceptor leaves untouched when already set.
+ *
+ * The compact manga object carries no synonyms, so candidates dedup on primary title only.
+ */
+class ShikimoriRecommendations(
+    private val client: OkHttpClient,
+    tracker: Tracker,
+    override val json: Json,
+) : TrackerRecommendations(tracker) {
+
+    private val headers = Headers.headersOf("User-Agent", RAITO_TRACKER_USER_AGENT)
+
+    override suspend fun getRecsById(remoteId: Long): List<RelatedMangaCandidate> {
+        val url = "$API_URL/mangas".toHttpUrl().newBuilder()
+            .addPathSegment(remoteId.toString())
+            .addPathSegment("similar")
+            .build()
+
+        val data = with(json) { client.newCall(GET(url, headers)).awaitSuccess().parseAs<List<SMRecsManga>>() }
+        return data.map { it.toCandidate() }
+    }
+
+    override suspend fun getMediaContext(remoteId: Long): MediaContext {
+        val url = "$API_URL/mangas".toHttpUrl().newBuilder()
+            .addPathSegment(remoteId.toString())
+            .build()
+        val data = with(json) { client.newCall(GET(url, headers)).awaitSuccess().parseAs<SMMangaDetail>() }
+        return MediaContext(genres = data.genres.map { it.name }, recommendations = getRecsById(remoteId))
+    }
+
+    override suspend fun getRecsBySearch(title: String): List<RelatedMangaCandidate> {
+        val url = "$API_URL/mangas".toHttpUrl().newBuilder()
+            .addQueryParameter("search", title)
+            // Light novels sit under /api/ranobe today, so this excludes nothing yet; it pins the manga
+            // kind as the other three providers do, with the exclusion upstream's GraphQL search sends.
+            .addQueryParameter("kind", "!light_novel,!novel")
+            .addQueryParameter("limit", "1")
+            .build()
+
+        val data = with(json) { client.newCall(GET(url, headers)).awaitSuccess().parseAs<List<SMRecsManga>>() }
+        val firstId = data.firstOrNull()?.id ?: return emptyList()
+        return getRecsById(firstId)
+    }
+
+    private fun SMRecsManga.toCandidate(): RelatedMangaCandidate = candidate(
+        url = BASE_URL + url,
+        title = name,
+        thumbnailUrl = (image?.original ?: image?.preview)?.let { BASE_URL + it },
+        remoteId = id,
+    )
+
+    companion object {
+        private const val BASE_URL = ShikimoriApi.BASE_URL
+        private const val API_URL = "$BASE_URL/api"
+    }
+}

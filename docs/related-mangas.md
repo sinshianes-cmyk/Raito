@@ -1,0 +1,149 @@
+---
+title: Recommendations
+description: Suggestions for what to read next, drawn from the source, your trackers and your taste.
+---
+
+# Recommendations
+
+_Dev record: [recommendations.md](dev/subsystems/recommendations.md). Doc map: [README.md](README.md)._
+
+A manga's details page has a **Related** row of similar titles, so finishing something leads somewhere.
+Its settings are in <nav to="recommendations">.
+
+Suggestions come from the source you are reading, from public tracker recommendations, and, once you let Raito pull your tracker library, from what you have already read.
+The row is then reordered toward your taste, and can hide things you have already seen.
+
+::: info Manga only
+Light novels have no equivalent yet.
+:::
+
+## Where it appears
+
+By default the row sits on the details page, below the description (on a wide screen, above the chapter list).
+While it loads, a placeholder holds its place so the page does not jump; if nothing comes back, the row hides itself rather than sitting empty.
+
+<img
+  class="only-light"
+  src="/docs/related-mangas/related.light.webp"
+  alt="The Related row on a series' details"
+  width="414"
+  height="272"
+  loading="lazy"
+  decoding="async"
+/>
+<img
+  class="only-dark"
+  src="/docs/related-mangas/related.dark.webp"
+  alt="The Related row on a series' details"
+  width="414"
+  height="272"
+  loading="lazy"
+  decoding="async"
+/>
+
+Prefer it out of the way?
+**Related manga placement** <Badge type="info" text="On the details page" /> in <nav to="recommendations">, under **Sources**, moves it into the three-dot menu instead.
+
+Results are reused for about half an hour; after that they show straight away while a fresh set loads in the background.
+They are held in memory only, so they are gone once Android closes the app.
+On a merged series the row is fetched for the entry you opened; switching source with the chip row does not fetch it again.
+
+## Where the suggestions come from
+
+::: tip Sources
+**The source itself.** Sources that publish a "related" list contribute it directly. Ones that do not simply add nothing.
+
+**A search on the title.** The full title and up to three of its longest keywords (short and common words are skipped) are each searched on the current source, so the row fills in as results arrive.
+
+**Public tracker recommendations**, from AniList, MyAnimeList, MangaUpdates and Shikimori. No sign-in needed, and no account of yours is read.
+:::
+
+Two more streams need you signed in to AniList, MyAnimeList, MangaUpdates or Shikimori, and only fire on a manga that is itself tracked there.
+Both live in <nav to="recommendations">, under **Suggestions from your tracking**, a section that appears once you are signed in to one of those four, with both **Tracker recommendations** and **Show related manga** left on.
+
+- **Because you're reading…** <Badge type="info" text="On" /> takes titles you rated highly (Completed or Reading) on the tracker the open manga is tracked on, keeps the ones that tracker also links to the manga you have open, and pulls in what those are compared to. It reads them from that tracker's taste profile pull (below), so it adds nothing until that tracker's library has been pulled. MangaUpdates has no pull, so it never feeds this one. Narrow, since it only fires when one of your highly rated titles is linked to the open manga.
+- **Matching your taste** <Badge type="info" text="On" /> searches the current source for up to three of this manga's own genres that your taste profile favours. It is a plain text search for the genre name, so on a source whose search only matches titles the results are hit and miss.
+
+Turn off **Tracker recommendations** <Badge type="info" text="On" /> in **Sources** and every tracker-backed stream stops, leaving the source's own suggestions.
+Each of the four trackers also has its own switch under it, which stops only that tracker's own recommendations; the two streams above keep using any of the four the manga is tracked on.
+
+## Your taste profile
+
+The two streams above, and the reordering below, read a taste profile: the genres you read, weighted by how you rated and what you did with each series.
+Completed counts most for a genre, then Reading, then On-hold. Dropped counts against it, and Plan to read counts for nothing either way.
+
+Building it reads your tracker library through your sign-in, so nothing is pulled until you opt in per tracker.
+
+::: tip How to build a taste profile
+1. Go to <nav to="recommendations"> and find **Taste profile**.
+1. Turn on the trackers you want pulled. AniList, MyAnimeList, Kitsu, Shikimori and Bangumi are offered, and each appears only once you are signed in to it.
+1. Tap **Refresh now**.
+:::
+
+Your library is then cached locally, so the row does not call out to every tracker each time you open a page.
+It is pulled again in the background when you open a manga's details with the related row turned on and a tracker's cached copy is more than six hours old, and **Auto-refresh library** <Badge type="info" text="Off" /> can also re-pull it weekly or monthly.
+**Refresh now** shows when each tracker was last pulled, and has a short cooldown between presses.
+
+The cache is not included in your backups. After a restore it rebuilds from your trackers on the next pull. Tracker sign-ins come back only if the backup was made with **Include sensitive settings** ticked; otherwise sign in to each tracker again first.
+Turning a tracker's pull off drops its cached entries the next time the cache refreshes (opening a manga's details page is enough), so it stops shaping the row from then on; turning it back on rebuilds them on the next pull.
+
+## Reordering the row
+
+With **Rerank by taste** <Badge type="info" text="On" /> the source's suggestions are reordered toward your taste.
+Tracker recommendations keep the order they arrived in.
+The row holds 30, and up to 12 of those places are kept for tracker recommendations, taken in turn from each tracker, so a source with plenty of its own suggestions cannot crowd them out.
+
+Two sliders shape it, and both are hidden while reranking is off.
+
+- **Recommendation style** <Badge type="info" text="25%" /> weighs your taste against the order the suggestions arrived in. At 0% your taste no longer scores titles, though titles that turn up in more than one search or tracker still rise, and the serendipity share and the genre limit below still apply; at 100% it is ordered almost entirely by taste.
+- **Serendipity** <Badge type="info" text="20%" /> decides how much weight unfamiliar genres get, and keeps that share of the source's suggestions at the top of the list in the order they arrived. That reservation is what stops a high style setting from showing you the same five genres forever. On a long list it can take up the whole row, so the taste-ranked picks then start further along, in **See all**.
+
+No more than two of the taste-ranked picks may share a dominant genre; the rest are pushed further down, so one genre cannot take over the taste-ranked picks.
+
+With no taste profile built, the taste half of the reordering is skipped; titles that turn up in more than one of the row's searches or suggestion lists are still pulled forward.
+
+## Hiding things you have seen
+
+Every filter is off by default, so nothing is hidden until you say so.
+They apply whether or not reranking is on.
+
+All five live in <nav to="recommendations">, under **Filters**.
+
+- **Hide manga already in my library**, matched by title across sources and trackers. With it off, those titles stay in the list, dimmed and badged as in your library.
+- **Hide reading & completed**, by tracker status.
+- **Hide dropped**.
+- **Hide on-hold**.
+- **Hide plan-to-read**.
+
+## Opening a suggestion
+
+A suggestion from a source opens its details page on that source, ready to read.
+
+A suggestion from a tracker opens global search with the title filled in, so you can pick a source you actually have installed.
+Tracker links do not belong to any extension, so opening one directly would leave you with a library entry nothing can fetch.
+
+## Seeing all of them
+
+The row shows a slice.
+Several sources plus tracker fan-out routinely produce far more, and when there is more than the row can hold, **See all (N)** appears beside the **Related** heading.
+
+That opens a full grid with the same ordering and filters and no cap, using the same number of columns as your library grid (as many as fit, by default).
+
+Three icons sit in its toolbar. **Select** is always there; the other two appear only when they have something to do:
+
+- **Group by source** splits the grid into labelled sections, so you can see what came from where: *From `<source>`*, *From your `<tracker>` recommendations*, *Because you're reading `<title>`*, *Matching your taste: `<genre>`*. It appears once the suggestions come from more than one place.
+- **Show hidden** brings back whatever your filters removed, without changing the filters. It appears only when something is actually hidden.
+
+::: tip How to add several at once
+1. Long-press a cover to start selecting, or tap **Select** in the toolbar.
+1. Tap the others you want, or **Select all**.
+1. Tap **Add to library**.
+:::
+
+Everything selected goes into one set of categories, following your **Default category** setting.
+Tracker suggestions are skipped, since they map to no installed source, and a snackbar tells you how many: *Added 5 to library, skipped 2*.
+
+::: warning Bulk add does not check for duplicates
+Adding one at a time asks whether a match already in your library should be migrated or grouped.
+Adding in bulk does not, because the point of the grid is speed.
+:::

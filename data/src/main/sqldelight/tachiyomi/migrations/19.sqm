@@ -1,0 +1,5 @@
+-- RK: Raito's own migration; Mihon's 19.sqm is unrelated, see upstream-sync.md
+-- Ported from Mihon mihonapp/mihon#3454 (extension stores may have a separate extension-list file):
+-- existing installs need the new nullable column; extension_store.sq's CREATE TABLE covers fresh ones.
+-- Raito-numbered (19, not Mihon's 13) because Raito's migration sequence diverged long ago.
+ALTER TABLE extension_store ADD COLUMN extension_list_url TEXT;

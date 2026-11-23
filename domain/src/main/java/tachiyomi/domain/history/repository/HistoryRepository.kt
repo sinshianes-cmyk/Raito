@@ -1,0 +1,42 @@
+package tachiyomi.domain.history.repository
+
+import kotlinx.coroutines.flow.Flow
+import tachiyomi.domain.history.model.History
+import tachiyomi.domain.history.model.HistoryUpdate
+import tachiyomi.domain.history.model.HistoryWithRelations
+
+interface HistoryRepository {
+
+    // RK: the two category id lists are Raito's, from the recents filter; empty means no constraint.
+    fun getHistory(
+        query: String,
+        includedCategories: List<Long> = emptyList(),
+        excludedCategories: List<Long> = emptyList(),
+    ): Flow<List<HistoryWithRelations>>
+
+    suspend fun getLastHistory(): HistoryWithRelations?
+
+    suspend fun getTotalReadDuration(): Long
+
+    suspend fun getHistoryByMangaId(mangaId: Long): List<History>
+
+    suspend fun getHistoryByMangaIds(mangaIds: List<Long>): Map<Long, List<History>>
+
+    suspend fun resetHistory(historyId: Long)
+
+    // RK: batch reset for EHentai gallery-version reconciliation.
+    suspend fun resetHistory(historyIds: List<Long>)
+
+    suspend fun resetHistoryByMangaId(mangaId: Long)
+
+    suspend fun deleteAllHistory(): Boolean
+
+    // RK: Clear history's partial ranges (raito.domain.history.HistoryClearRange).
+    suspend fun deleteHistorySince(since: kotlin.time.Instant): Boolean
+
+    suspend fun deleteHistoryOutsideLibrary(): Boolean
+
+    suspend fun deleteResetHistory()
+
+    suspend fun upsertHistory(historyUpdate: HistoryUpdate)
+}

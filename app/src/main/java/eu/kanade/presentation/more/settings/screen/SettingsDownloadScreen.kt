@@ -1,0 +1,255 @@
+package eu.kanade.presentation.more.settings.screen
+
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.ReadOnlyComposable
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
+import androidx.compose.ui.platform.LocalContext
+import cafe.adriel.voyager.navigator.LocalNavigator
+import cafe.adriel.voyager.navigator.currentOrThrow
+import dev.icerock.moko.resources.StringResource
+import eu.kanade.presentation.category.visualName
+import eu.kanade.presentation.more.settings.Preference
+import eu.kanade.presentation.more.settings.screen.novel.NovelSourceDelaysScreen
+import eu.kanade.presentation.more.settings.screen.novel.downloadDelayLabel
+import mihon.app.di.appGraph
+import raito.domain.novel.NovelPreferences
+import raito.novel.download.NovelDownloadPacing
+import raito.presentation.library.sortedByCategoryPref
+import raito.presentation.settings.categoryFilterPreference
+import tachiyomi.domain.category.model.Category
+import tachiyomi.i18n.MR
+import tachiyomi.presentation.core.i18n.pluralStringResource
+import tachiyomi.presentation.core.i18n.stringResource
+import tachiyomi.presentation.core.util.collectAsState
+import tachiyomi.core.common.preference.Preference as PreferenceData
+
+object SettingsDownloadScreen : SearchableSettings {
+
+    @ReadOnlyComposable
+    @Composable
+    override fun getTitleRes() = MR.strings.pref_category_downloads
+
+    @Composable
+    override fun getPreferences(): List<Preference> {
+        val context = LocalContext.current
+        val getCategories = remember { context.appGraph.getCategories }
+        // RK --> in the category sort order, as every other category picker lists them
+        val raitoLibraryPreferences = remember { context.appGraph.raitoLibraryPreferences }
+        val allCategories by remember { getCategories.subscribe().sortedByCategoryPref(raitoLibraryPreferences) }
+            .collectAsState(initial = emptyList())
+        // RK <--
+
+        val downloadPreferences = remember { context.appGraph.downloadPreferences }
+        // RK: light-novel download options
+        val novelPreferences = remember { context.appGraph.novelPreferences }
+        val getNovelCategories = remember { context.appGraph.getNovelCategories }
+        val novelCategories by remember {
+            getNovelCategories.subscribe().sortedByCategoryPref(raitoLibraryPreferences) // RK
+        }.collectAsState(initial = emptyList())
+        return listOf(
+            Preference.PreferenceItem.SwitchPreference(
+                preference = downloadPreferences.downloadOnlyOverWifi,
+                title = stringResource(MR.strings.connected_to_wifi),
+            ),
+            Preference.PreferenceItem.SwitchPreference(
+                preference = downloadPreferences.saveChaptersAsCBZ,
+                title = stringResource(MR.strings.save_chapter_as_cbz),
+            ),
+            Preference.PreferenceItem.SliderPreference(
+                preference = downloadPreferences.parallelSourceLimit,
+                valueRange = 1..10,
+                title = stringResource(MR.strings.pref_download_concurrent_sources),
+            ),
+            Preference.PreferenceItem.SliderPreference(
+                preference = downloadPreferences.parallelPageLimit,
+                valueRange = 1..15,
+                title = stringResource(MR.strings.pref_download_concurrent_pages),
+                subtitle = stringResource(MR.strings.pref_download_concurrent_pages_summary),
+            ),
+            // RK --> duplicated manga/novel download options, split into content-type sub-groups so each
+            // row reads clean and the two never drift (the manga/novel builders are parameter-identical).
+            deleteChaptersGroup(
+                contentType = MR.strings.content_type_manga,
+                removeAfterMarkedAsRead = downloadPreferences.removeAfterMarkedAsRead,
+                removeAfterReadSlots = downloadPreferences.removeAfterReadSlots,
+                removeBookmarkedChapters = downloadPreferences.removeBookmarkedChapters,
+                excludeCategories = downloadPreferences.removeExcludeCategories,
+                categories = allCategories,
+            ),
+            deleteChaptersGroup(
+                contentType = MR.strings.content_type_novels,
+                removeAfterMarkedAsRead = novelPreferences.removeAfterMarkedAsRead(),
+                removeAfterReadSlots = novelPreferences.removeAfterReadSlots(),
+                removeBookmarkedChapters = novelPreferences.removeBookmarkedChapters(),
+                excludeCategories = novelPreferences.removeExcludeCategories(),
+                categories = novelCategories,
+            ),
+            autoDownloadGroup(
+                contentType = MR.strings.content_type_manga,
+                downloadNew = downloadPreferences.downloadNewChapters,
+                downloadNewUnreadOnly = downloadPreferences.downloadNewUnreadChaptersOnly,
+                includedCategories = downloadPreferences.downloadNewChapterCategories,
+                excludedCategories = downloadPreferences.downloadNewChapterCategoriesExclude,
+                categories = allCategories,
+                autoDownloadWhileReading = downloadPreferences.autoDownloadWhileReading,
+                // Only manga's reader needs the current and next chapter on disk before it downloads
+                // ahead (ReaderViewModel.downloadNextChapters); the novel reader has no such gate.
+                showDownloadAheadInfo = true,
+            ),
+            autoDownloadGroup(
+                contentType = MR.strings.content_type_novels,
+                downloadNew = novelPreferences.downloadNewChapters(),
+                downloadNewUnreadOnly = novelPreferences.downloadNewUnreadChaptersOnly(),
+                includedCategories = novelPreferences.downloadNewChapterCategories(),
+                excludedCategories = novelPreferences.downloadNewChapterCategoriesExclude(),
+                categories = novelCategories,
+                autoDownloadWhileReading = novelPreferences.autoDownloadWhileReading(),
+                showDownloadAheadInfo = false,
+            ),
+            novelPacingGroup(novelPreferences),
+            // RK <--
+        )
+    }
+
+    // RK --> the group builders take their preferences as parameters, so manga and novels share them
+    // One builder, called once per content type, so the manga and novel delete-chapters groups can't drift.
+    @Composable
+    private fun deleteChaptersGroup(
+        contentType: StringResource,
+        removeAfterMarkedAsRead: PreferenceData<Boolean>,
+        removeAfterReadSlots: PreferenceData<Int>,
+        removeBookmarkedChapters: PreferenceData<Boolean>,
+        excludeCategories: PreferenceData<Set<String>>,
+        categories: List<Category>,
+    ): Preference.PreferenceGroup {
+        val slotEntries = mapOf(
+            -1 to stringResource(MR.strings.disabled),
+            0 to stringResource(MR.strings.last_read_chapter),
+            1 to stringResource(MR.strings.second_to_last),
+            2 to stringResource(MR.strings.third_to_last),
+            3 to stringResource(MR.strings.fourth_to_last),
+            4 to stringResource(MR.strings.fifth_to_last),
+        )
+        return Preference.PreferenceGroup(
+            title = contentTypedCategory(MR.strings.pref_category_delete_chapters, contentType),
+            preferenceItems = listOf(
+                Preference.PreferenceItem.SwitchPreference(
+                    preference = removeAfterMarkedAsRead,
+                    title = stringResource(MR.strings.pref_remove_after_marked_as_read),
+                ),
+                Preference.PreferenceItem.ListPreference(
+                    preference = removeAfterReadSlots,
+                    entries = slotEntries,
+                    title = stringResource(MR.strings.pref_remove_after_read),
+                    subtitleProvider = { value, entries -> entries[value].orEmpty() },
+                ),
+                Preference.PreferenceItem.SwitchPreference(
+                    preference = removeBookmarkedChapters,
+                    title = stringResource(MR.strings.pref_remove_bookmarked_chapters),
+                ),
+                excludeCategoriesPreference(excludeCategories, categories),
+            ),
+        )
+    }
+
+    /** An "Excluded categories" multi-select showing the selected category names as its subtitle. */
+    @Composable
+    private fun excludeCategoriesPreference(
+        preference: PreferenceData<Set<String>>,
+        categories: List<Category>,
+    ): Preference.PreferenceItem.MultiSelectListPreference<String> {
+        return Preference.PreferenceItem.MultiSelectListPreference(
+            preference = preference,
+            entries = categories.associate { it.id.toString() to it.visualName },
+            title = stringResource(MR.strings.pref_remove_exclude_categories),
+            subtitleProvider = { value, entries ->
+                value.mapNotNull { entries[it] }.sorted().joinToString()
+            },
+        )
+    }
+
+    // RK: novels only, since manga extensions rate-limit their own clients and LN plugins cannot.
+    @Composable
+    private fun novelPacingGroup(novelPreferences: NovelPreferences): Preference.PreferenceGroup {
+        val navigator = LocalNavigator.currentOrThrow
+        val perSource by novelPreferences.downloadSourceDelays().collectAsState()
+        val setCount = NovelDownloadPacing.parse(perSource).size
+        return Preference.PreferenceGroup(
+            title = contentTypedCategory(MR.strings.pref_category_download_pacing, MR.strings.content_type_novels),
+            preferenceItems = listOf(
+                Preference.PreferenceItem.ListPreference(
+                    preference = novelPreferences.downloadChapterDelayMs(),
+                    entries = NovelDownloadPacing.DELAY_OPTIONS_MS.associateWith { downloadDelayLabel(it) },
+                    title = stringResource(MR.strings.pref_novel_chapter_delay),
+                ),
+                Preference.PreferenceItem.TextPreference(
+                    title = stringResource(MR.strings.pref_novel_source_delay),
+                    subtitle = if (setCount == 0) {
+                        stringResource(MR.strings.pref_novel_source_delay_none)
+                    } else {
+                        pluralStringResource(MR.plurals.pref_novel_source_delay_count, count = setCount, setCount)
+                    },
+                    onClick = { navigator.push(NovelSourceDelaysScreen()) },
+                ),
+            ),
+        )
+    }
+
+    // One builder per content type; the manga and novel auto-download groups stay identical. Download-ahead
+    // (preload while reading) lives here too, since it's another form of automatic downloading.
+    @Composable
+    private fun autoDownloadGroup(
+        contentType: StringResource,
+        downloadNew: PreferenceData<Boolean>,
+        downloadNewUnreadOnly: PreferenceData<Boolean>,
+        includedCategories: PreferenceData<Set<String>>,
+        excludedCategories: PreferenceData<Set<String>>,
+        categories: List<Category>,
+        autoDownloadWhileReading: PreferenceData<Int>,
+        showDownloadAheadInfo: Boolean,
+    ): Preference.PreferenceGroup {
+        val enabled by downloadNew.collectAsState()
+        val aheadEntries = listOf(0, 2, 3, 5, 10)
+            .associateWith {
+                if (it == 0) {
+                    stringResource(MR.strings.disabled)
+                } else {
+                    pluralStringResource(MR.plurals.next_unread_chapters, count = it, it)
+                }
+            }
+        return Preference.PreferenceGroup(
+            title = contentTypedCategory(MR.strings.pref_category_auto_download, contentType),
+            preferenceItems = listOfNotNull(
+                Preference.PreferenceItem.SwitchPreference(
+                    preference = downloadNew,
+                    title = stringResource(MR.strings.pref_download_new),
+                ),
+                Preference.PreferenceItem.SwitchPreference(
+                    preference = downloadNewUnreadOnly,
+                    title = stringResource(MR.strings.pref_download_new_unread_chapters_only),
+                    visible = enabled,
+                ),
+                categoryFilterPreference(
+                    categories,
+                    includedCategories,
+                    excludedCategories,
+                    MR.strings.pref_download_new_categories_details,
+                    visible = enabled,
+                ),
+                Preference.PreferenceItem.ListPreference(
+                    preference = autoDownloadWhileReading,
+                    entries = aheadEntries,
+                    title = stringResource(MR.strings.auto_download_while_reading),
+                ),
+                if (showDownloadAheadInfo) {
+                    Preference.PreferenceItem.InfoPreference(stringResource(MR.strings.download_ahead_info))
+                } else {
+                    null
+                },
+            ),
+        )
+    }
+    // RK <--
+}

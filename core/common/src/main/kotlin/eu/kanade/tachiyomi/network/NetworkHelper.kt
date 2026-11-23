@@ -1,0 +1,110 @@
+package eu.kanade.tachiyomi.network
+
+import android.content.Context
+import dev.zacsweers.metro.AppScope
+import dev.zacsweers.metro.Inject
+import dev.zacsweers.metro.SingleIn
+import eu.kanade.tachiyomi.network.interceptor.CloudflareInterceptor
+import eu.kanade.tachiyomi.network.interceptor.FlareSolverrClient
+import eu.kanade.tachiyomi.network.interceptor.UncaughtExceptionInterceptor
+import eu.kanade.tachiyomi.network.interceptor.UserAgentInterceptor
+import eu.kanade.tachiyomi.network.interceptor.pinFlareSolverrUserAgents // RK
+import kotlinx.coroutines.CoroutineScope
+import mihon.core.metro.AppCoroutineScope
+import okhttp3.Cache
+import okhttp3.OkHttpClient
+import okhttp3.logging.HttpLoggingInterceptor
+import java.io.File
+import kotlin.time.Duration.Companion.minutes
+import kotlin.time.Duration.Companion.seconds
+
+@Inject
+@SingleIn(AppScope::class)
+class NetworkHelper(
+    @AppCoroutineScope private val scope: CoroutineScope,
+    private val context: Context,
+    private val preferences: NetworkPreferences,
+) {
+
+    val cookieJar = AndroidCookieJar()
+
+    // RK -->
+    val flareSolverr = FlareSolverrClient(cookieJar, preferences)
+    // RK <--
+
+    private fun clientBuilder(): OkHttpClient.Builder = run {
+        val builder = OkHttpClient.Builder()
+            .cookieJar(cookieJar)
+            .connectTimeout(30.seconds)
+            .readTimeout(30.seconds)
+            .callTimeout(2.minutes)
+            .cache(
+                Cache(
+                    directory = File(context.cacheDir, "network_cache"),
+                    maxSize = 5L * 1024 * 1024, // 5 MiB
+                ),
+            )
+            .addInterceptor(UncaughtExceptionInterceptor())
+            .addInterceptor(UserAgentInterceptor(::defaultUserAgentProvider))
+            // RK: ahead of the logging interceptor, so verbose logs show the User-Agent actually sent.
+            .pinFlareSolverrUserAgents(flareSolverr::pinnedUserAgentFor)
+
+        if (preferences.verboseLogging.get()) {
+            val httpLoggingInterceptor = HttpLoggingInterceptor().apply {
+                level = HttpLoggingInterceptor.Level.HEADERS
+                if (preferences.redactSensitiveHeaders.get()) {
+                    redactHeader("Authorization")
+                    redactHeader("Auth")
+                    // RK --> source cookies too; Hikka's OAuth token rides the Auth header above
+                    redactHeader("Cookie")
+                    redactHeader("Set-Cookie")
+                    // RK <--
+                }
+            }
+            builder.addNetworkInterceptor(httpLoggingInterceptor)
+        }
+
+        // RK --> proxy and SSL bypass; the selector reads prefs per call so changes apply without restart
+        ProxyProvider(preferences).also {
+            builder.proxySelector(it.selector).proxyAuthenticator(it.authenticator)
+        }
+        if (preferences.ignoreSslErrors.get()) builder.disableCertificateVerification()
+        // RK <--
+
+        when (preferences.dohProvider.get()) {
+            PREF_DOH_CLOUDFLARE -> builder.dohCloudflare()
+            PREF_DOH_GOOGLE -> builder.dohGoogle()
+            PREF_DOH_ADGUARD -> builder.dohAdGuard()
+            PREF_DOH_QUAD9 -> builder.dohQuad9()
+            PREF_DOH_ALIDNS -> builder.dohAliDNS()
+            PREF_DOH_DNSPOD -> builder.dohDNSPod()
+            PREF_DOH_360 -> builder.doh360()
+            PREF_DOH_QUAD101 -> builder.dohQuad101()
+            PREF_DOH_MULLVAD -> builder.dohMullvad()
+            PREF_DOH_CONTROLD -> builder.dohControlD()
+            PREF_DOH_NJALLA -> builder.dohNajalla()
+            PREF_DOH_SHECAN -> builder.dohShecan()
+            PREF_DOH_ZERO_MS -> builder.dohZeroMs() // RK
+            else -> builder
+        }
+    }
+
+    val client: OkHttpClient by lazy {
+        clientBuilder()
+            .addInterceptor(
+                // RK --> pass preferences + the FlareSolverr client for the FS bypass path
+                CloudflareInterceptor(context, cookieJar, scope, ::defaultUserAgentProvider, preferences, flareSolverr),
+                // RK <--
+            )
+            .build()
+    }
+
+    /**
+     * @deprecated Since extension-lib 1.5
+     */
+    @Deprecated("The regular client handles Cloudflare by default")
+    @Suppress("UNUSED")
+    val cloudflareClient: OkHttpClient get() = client
+
+    fun defaultUserAgentProvider() = preferences.defaultUserAgent.get().trim()
+}

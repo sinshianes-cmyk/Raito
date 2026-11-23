@@ -1,0 +1,120 @@
+package raito.domain.manga
+
+import dev.zacsweers.metro.AppScope
+import dev.zacsweers.metro.Inject
+import dev.zacsweers.metro.SingleIn
+import raito.domain.library.ContentType
+import raito.domain.library.RaitoLibraryPreferences
+import raito.domain.merge.ChapterUnit
+import raito.domain.merge.GroupChapterFlags
+import raito.domain.merge.MergeScope
+import raito.domain.merge.ReconcileMergedChapters
+import raito.domain.merge.renderMergedReadingOrder
+import tachiyomi.domain.chapter.model.Chapter
+import tachiyomi.domain.manga.interactor.GetMangaWithChapters
+import tachiyomi.domain.manga.model.Manga
+import tachiyomi.domain.source.service.SourceManager
+
+/**
+ * One-shot merge group resolver for manga: given an entry, it resolves the whole group and returns the
+ * cross-source chapter list in reading order, plus the group's manga keyed by id so the reader can
+ * build a per-source page loader. The list is read from the STORED stitch, never stitched here, so the
+ * reader, the details screen and the library badge cannot reach different answers. Returns exactly the
+ * single-source list when not merged.
+ */
+@Inject
+@SingleIn(AppScope::class)
+class MergedChapterProvider(
+    private val getMangaWithChapters: GetMangaWithChapters,
+    private val mergeManager: MangaMergeManager,
+    private val sourceManager: SourceManager,
+    private val raitoLibraryPreferences: RaitoLibraryPreferences,
+    private val reconcile: ReconcileMergedChapters,
+) {
+
+    /** The resolved group: every member manga keyed by id, the unified reading-ordered chapters, and
+     *  each member's source name for per-source labels (empty when not merged). */
+    class Group(
+        val mangaById: Map<Long, Manga>,
+        val chapters: List<Chapter>,
+        val sourceNameByMangaId: Map<Long, String>,
+        /** The stored stitch behind [chapters], so a reader acting on a row can reach the group's
+         *  other copies of it without matching numbers the sources disagree on. */
+        val stitch: List<ChapterUnit> = emptyList(),
+        /** Every member's chapters, which is where the copies [chapters] stands in for live. A caller
+         *  asking a cross-source question (bookmarked anywhere, on disk anywhere) needs them. */
+        val pooledChapters: List<Chapter> = chapters,
+    ) {
+        val isMerged: Boolean get() = mangaById.size > 1
+    }
+
+    suspend fun load(anchor: Manga): Group {
+        val ids = mergeManager.computeRelatedIds(anchor.id)
+        if (ids.size <= 1) {
+            return Group(
+                mangaById = mapOf(anchor.id to anchor),
+                chapters = getMangaWithChapters.awaitChapters(anchor.id, applyScanlatorFilter = true),
+                sourceNameByMangaId = emptyMap(),
+            )
+        }
+        val mangaById = ids.associateWith { getMangaWithChapters.awaitManga(it) }
+        val chaptersBySource = ids.associateWith { getMangaWithChapters.awaitChapters(it, applyScanlatorFilter = true) }
+        val sourceNameByMangaId = mangaById.mapValues { sourceManager.getOrStub(it.value.source).name }
+        val pooled = chaptersBySource.values.flatten()
+        val stitch = stitchOf(anchor.id)
+        val merged = merged(pooled, stitch)
+        return Group(
+            mangaById = mangaById,
+            chapters = merged,
+            sourceNameByMangaId = sourceNameByMangaId,
+            stitch = stitch,
+            pooledChapters = pooled,
+        )
+    }
+
+    /**
+     * The group's stored stitch, rebuilt first when it is stale. Empty when the entry is not in a
+     * group, which [merged] reads as nothing to merge. Reading it rather than stitching here is what
+     * keeps a screen from producing a second answer to the question the library badge asks of the
+     * same rows.
+     */
+    suspend fun stitchOf(anchorId: Long): List<ChapterUnit> =
+        mergeManager.groupIdOf(anchorId)?.let { reconcile.currentStitch(ContentType.MANGA, it) }.orEmpty()
+
+    /** [chapters] as the merged reading order [stitch] describes. */
+    fun merged(chapters: List<Chapter>, stitch: List<ChapterUnit>): List<Chapter> =
+        renderMergedReadingOrder(chapters, stitch, { it.id }) { chapter, order -> chapter.copy(sourceOrder = order) }
+
+    /** The member manga ids in trunk order (first = trunk), for ordering the manage-sources rows so the
+     *  primary sits on top. Uses the stitch's own ranking; [memberRanking] is the caller's
+     *  already-resolved per-group override (empty = the global ranking wins). */
+    fun rankedMemberIds(
+        chaptersBySource: Map<Long, List<Chapter>>,
+        sourceIdByManga: Map<Long, Long>,
+        memberRanking: List<Long>,
+    ): List<Long> = ChapterAggregation.rankedMemberIds(
+        chaptersBySource,
+        sourceIdByManga,
+        raitoLibraryPreferences.preferredMangaSources.get(),
+        memberRanking,
+    )
+}
+
+/** [shown]'s flags across the whole group, as the library's resume and download ask them; a null group
+ *  answers each row for itself. Twin of `NovelGroupChapters.groupFlags`, pinned by
+ *  MergedResumeDownloadedConformanceTest. */
+fun MergedChapterProvider.Group?.groupFlags(
+    shown: List<Chapter>,
+    onDisk: (pooled: List<Chapter>) -> Set<Long>,
+): GroupChapterFlags<Chapter> {
+    val pooled = this?.pooledChapters ?: shown
+    return GroupChapterFlags(
+        MergeScope.Group,
+        pooled,
+        shown,
+        this?.stitch.orEmpty(),
+        { it.id },
+        { it.read },
+        { it.bookmark },
+    ) { onDisk(pooled) }
+}

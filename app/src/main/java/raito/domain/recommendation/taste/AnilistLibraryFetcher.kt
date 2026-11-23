@@ -1,0 +1,45 @@
+package raito.domain.recommendation.taste
+
+import eu.kanade.tachiyomi.data.track.Tracker
+import eu.kanade.tachiyomi.data.track.anilist.Anilist
+import eu.kanade.tachiyomi.data.track.anilist.dto.ALLibraryEntry
+import eu.kanade.tachiyomi.data.track.anilist.toApiStatus
+import raito.domain.recommendation.RaitoRecommendationPreferences
+import tachiyomi.core.common.preference.Preference
+
+/**
+ * Pulls the user's full AniList manga library in one GraphQL call and normalizes each entry into a
+ * [TrackedEntry] for the taste-profile cache.
+ *
+ * Score: AniList is asked for `POINT_100` directly, so it is a 0..100 integer whatever the user's
+ * display format; divided by 100, and raw 0 (unrated) becomes -1.0 so the compute formula can tell
+ * "rated low" from "no rating". Tags are the union of broad `genres` and specific `tags[].name`.
+ */
+class AnilistLibraryFetcher(
+    private val anilist: Anilist,
+    preferences: RaitoRecommendationPreferences,
+) : TrackerLibraryFetcher {
+
+    override val tracker: Tracker get() = anilist
+
+    override val pullPreference: Preference<Boolean> = preferences.pullLibraryFromAnilist
+
+    override suspend fun fetchLibrary(): List<TrackedEntry> =
+        anilist.getUserLibrary().map { it.toTrackedEntry() }
+
+    private fun ALLibraryEntry.toTrackedEntry(): TrackedEntry = TrackedEntry(
+        trackerId = trackerId,
+        remoteId = media.id,
+        title = media.title.userPreferred,
+        score = normalizeTrackerScore(scoreRaw, 100),
+        status = anilist.trackStatusOfRemote(status) { it.toApiStatus().rawValue },
+        tags = collectTags(),
+        // Cross-tracker dedup keys: malId via AniList's Media.idMal (often null for manhwa/manhua);
+        // anilistId is our own remote id so a Kitsu entry's anilist mapping can join on the 2nd key.
+        malId = media.idMal,
+        anilistId = media.id,
+    )
+
+    private fun ALLibraryEntry.collectTags(): List<String> =
+        (media.genres + media.tags.map { it.name }).toTagKeys()
+}

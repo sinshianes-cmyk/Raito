@@ -1,0 +1,69 @@
+package raito.domain.recommendation
+
+import eu.kanade.tachiyomi.data.track.Tracker
+import eu.kanade.tachiyomi.network.GET
+import eu.kanade.tachiyomi.network.awaitSuccess
+import eu.kanade.tachiyomi.network.parseAs
+import kotlinx.serialization.json.Json
+import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.OkHttpClient
+import raito.data.track.isMyAnimeListNovel
+import raito.domain.recommendation.dto.JikanImages
+import raito.domain.recommendation.dto.JikanMangaResponse
+import raito.domain.recommendation.dto.JikanRecsResponse
+import raito.domain.recommendation.dto.JikanSearchResponse
+
+/**
+ * MyAnimeList recommendations via the public Jikan API. MAL's own API has no recommendations
+ * endpoint, so Jikan is the standard substitute. Public, no auth. Jikan reports no alternative
+ * titles here, so these candidates dedup on primary title only.
+ */
+class MyAnimeListRecommendations(
+    private val client: OkHttpClient,
+    tracker: Tracker,
+    override val json: Json,
+) : TrackerRecommendations(tracker) {
+
+    override suspend fun getRecsById(remoteId: Long): List<RelatedMangaCandidate> {
+        val url = JIKAN_URL.toHttpUrl().newBuilder()
+            .addPathSegment("manga")
+            .addPathSegment(remoteId.toString())
+            .addPathSegment("recommendations")
+            .build()
+
+        val data = with(json) { client.newCall(GET(url)).awaitSuccess().parseAs<JikanRecsResponse>() }
+        return data.data.map { it.entry }.map { rec ->
+            candidate(url = rec.url, title = rec.title, thumbnailUrl = rec.images?.pickImage(), remoteId = rec.malId)
+        }
+    }
+
+    override suspend fun getMediaContext(remoteId: Long): MediaContext {
+        val url = JIKAN_URL.toHttpUrl().newBuilder()
+            .addPathSegment("manga")
+            .addPathSegment(remoteId.toString())
+            .build()
+        val data = with(json) { client.newCall(GET(url)).awaitSuccess().parseAs<JikanMangaResponse>() }.data
+        return MediaContext(
+            genres = (data.genres + data.themes).map { it.name },
+            recommendations = getRecsById(remoteId),
+        )
+    }
+
+    override suspend fun getRecsBySearch(title: String): List<RelatedMangaCandidate> {
+        val url = JIKAN_URL.toHttpUrl().newBuilder()
+            .addPathSegment("manga")
+            .addQueryParameter("q", title)
+            .build()
+
+        val data = with(json) { client.newCall(GET(url)).awaitSuccess().parseAs<JikanSearchResponse>() }
+        val firstMalId = data.data.firstOrNull { !isMyAnimeListNovel(it.type) }?.malId ?: return emptyList()
+        return getRecsById(firstMalId)
+    }
+
+    private fun JikanImages.pickImage(): String? = webp?.imageUrl ?: jpg?.imageUrl
+
+    companion object {
+        /** Jikan, MyAnimeList's public mirror; the shared client rate-limits this host. */
+        const val JIKAN_URL = "https://api.jikan.moe/v4/"
+    }
+}

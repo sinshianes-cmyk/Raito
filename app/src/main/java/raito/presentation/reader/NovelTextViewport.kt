@@ -1,0 +1,2034 @@
+package raito.presentation.reader
+
+import android.annotation.SuppressLint
+import android.content.Context
+import android.graphics.Canvas
+import android.graphics.Paint
+import android.graphics.Rect
+import android.graphics.drawable.ColorDrawable
+import android.os.Handler
+import android.os.Looper
+import android.text.Spannable
+import android.text.SpannableStringBuilder
+import android.text.Spanned
+import android.text.method.ArrowKeyMovementMethod
+import android.view.GestureDetector
+import android.view.KeyEvent
+import android.view.MotionEvent
+import android.view.View
+import android.view.ViewConfiguration
+import android.view.ViewGroup
+import android.view.ViewTreeObserver
+import android.widget.LinearLayout
+import android.widget.TextView
+import androidx.core.view.ViewCompat
+import androidx.core.view.children
+import androidx.core.view.isVisible
+import androidx.recyclerview.widget.DiffUtil
+import androidx.recyclerview.widget.LinearLayoutManager
+import androidx.recyclerview.widget.RecyclerView
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import raito.domain.novel.NovelPageLayout
+import raito.domain.novel.tts.TtsHighlightStyle
+import raito.domain.reader.ChapterProgress
+import raito.domain.reader.fraction
+import raito.novel.font.NovelFontManager
+import raito.presentation.reader.text.AnchorSpan
+import raito.presentation.reader.text.CHAPTER_IMAGE_WAIT_MS
+import raito.presentation.reader.text.CHAPTER_SWIPE_MIN_DP
+import raito.presentation.reader.text.ChapterScrollProgress
+import raito.presentation.reader.text.ChapterTextBlock
+import raito.presentation.reader.text.ChunkParagraph
+import raito.presentation.reader.text.LinkOnlyMovementMethod
+import raito.presentation.reader.text.MarkForegroundSpan
+import raito.presentation.reader.text.MarkUnderlineSpan
+import raito.presentation.reader.text.NovelBoundaryFailureView
+import raito.presentation.reader.text.NovelChapterSeamView
+import raito.presentation.reader.text.NovelSeam
+import raito.presentation.reader.text.NovelTextRenderer
+import raito.presentation.reader.text.NovelTextStyle
+import raito.presentation.reader.text.NovelWindowReach
+import raito.presentation.reader.text.PAGE_SWIPE_MIN_DP
+import raito.presentation.reader.text.ParagraphShape
+import raito.presentation.reader.text.ReadAloudBoxDecoration
+import raito.presentation.reader.text.ReadAloudMark
+import raito.presentation.reader.text.ReaderControlSpan
+import raito.presentation.reader.text.ResumeVeil
+import raito.presentation.reader.text.chapterSwipeStep
+import raito.presentation.reader.text.chunkRange
+import raito.presentation.reader.text.hasTravelled
+import raito.presentation.reader.text.linksAt
+import raito.presentation.reader.text.pageSwipeStep
+import raito.presentation.reader.text.readAloudParagraphs
+import raito.presentation.reader.text.shownCharOffset
+import raito.presentation.reader.text.shownCharPrefix
+import tachiyomi.core.common.preference.Preference
+import tachiyomi.core.common.util.lang.withUIContext
+import kotlin.math.abs
+import kotlin.math.roundToInt
+
+/**
+ * The native light-novel viewport: the chapter as real text views rather than a WebView.
+ *
+ * The container is a recycler over a window of chapters, one item each: the chapter being read and
+ * the neighbours the host grows it by ([append], [prepend]) as the reader crosses into them.
+ */
+class NovelTextViewport(
+    private val context: Context,
+    /** The user's added fonts, which a chapter's text is set in when one is chosen. */
+    private val fontManager: NovelFontManager,
+    /** Selection and clickable links are exclusive: the movement method that drags cannot click. */
+    private val textSelectable: Boolean,
+    /** Scrolling, or the same column a page at a time ([NovelPaging]). A change rebuilds the viewport. */
+    private val pageLayout: NovelPageLayout,
+    private val callbacks: NovelViewportCallbacks,
+    /** Auto-scroll's speed, which the engine runs this at while it is on. */
+    autoScrollSpeed: Preference<Float>,
+    /** Seconds per page while auto-scroll turns pages instead. */
+    autoScrollInterval: Preference<Int>,
+) : ReaderViewport, TextViewport, ChapterWindow {
+
+    private val paged = pageLayout.isPaged
+
+    /** The height of the page on screen in paged reading, below which the mask hides the next page's lines.
+     *  Null until a page has been shown, and always while scrolling. */
+    private var shownPageHeight: Float? = null
+
+    /** A page snap posted and not yet run ([requestSnap]). */
+    private var snapPending = false
+
+    /** A page jump asked for and not yet laid out ([placePage] until [pageShown]). */
+    private var pageJumpPending = false
+
+    /** The chapter, page and item top of the last snap that moved the column, cleared once one lands. */
+    private var failedSnap: Triple<Long, Int, Int>? = null
+
+    /** The page a stepped auto-scroll counts on, changed whenever another page shows. */
+    private val shownPage = MutableStateFlow(ShownPage(Unit, ready = false))
+
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private val renderer = NovelTextRenderer(context, scope, ::jumpToAnchor)
+    private val mainHandler = Handler(Looper.getMainLooper())
+
+    /** Up while a chapter's saved percent waits on its pictures ([waitOutImages]), so the reader never sees
+     *  the chapter's top meanwhile or scrolls the landing away. Declared above the recycler that reads it. */
+    private val resumeVeil: ResumeVeil = ResumeVeil { up ->
+        recycler.foreground =
+            settings?.takeIf { up }?.let { ColorDrawable(readerBackgroundColorInt(it.backgroundColor)) }
+    }
+
+    /** The latest settings the viewport was given, which every chapter is built with. The host hands
+     *  the window verbs the value it read when the window changed, and a change may have landed since. */
+    private var settings: NovelReaderSettings? = null
+
+    /**
+     * The chapters the window holds, in reading order. Everything that was once "the open chapter" is
+     * per slot, because two chapters on screen have their own heights, their own restore positions
+     * and their own renders.
+     */
+    private val slots = mutableListOf<ChapterSlot>()
+
+    /** One chapter's views and the state that belongs to it rather than to the viewport. */
+    private class ChapterSlot(
+        val chapter: NovelReaderViewModel.LoadedChapter,
+        val block: ChapterTextBlock,
+        /** What the chunk views are styled with, so a restyle that landed mid-render is caught on join. */
+        var styledWith: NovelReaderSettings,
+    ) {
+        /** Applied once this chapter's text has a height to land in, and cleared only once it has landed
+         *  or the reader moves the page ([readerMoved]), so a redraw starting in between still knows where
+         *  the chapter was headed. */
+        var landing: Landing? = null
+
+        /** Before the text is set there is nothing to be a percentage of. */
+        var rendered = false
+
+        /** The last [NovelPaging.cut] and the geometry it came from, since one page turn asks for the pages
+         *  several times between layouts. A text [android.text.Layout] never changes its lines once built,
+         *  so the chunks' layout instances and offsets stand in for every line. */
+        var cut: Pair<List<Any?>, List<NovelPaging.Page>>? = null
+
+        /** A line landing the list stopped short of for want of room below ([holdShort]). Landed again when a
+         *  chapter joins below, while the reader is still on the line it stopped at; it never holds a report. */
+        var shortLanding: ShortLanding? = null
+
+        /** A share landing held on the pictures waits [CHAPTER_IMAGE_WAIT_MS] for them, as the page does, and
+         *  then lands without them. [imageWait] is that timer while it runs. */
+        var imageWaitOver = false
+        var imageWait: Runnable? = null
+
+        /** Read once the text is set, which nothing changes afterwards: a restyle keeps the characters. */
+        val paragraphs: List<ChunkParagraph> by lazy { readAloudParagraphs(block.chunkViews.map { it.text }) }
+
+        /** Each chunk's [shownCharPrefix], read once for the same reason: a line reaching the top on every
+         *  scroll frame is looked up rather than counted again from the chunk's start. */
+        val shownPrefixes: List<IntArray> by lazy { block.chunkViews.map { shownCharPrefix(it.text) } }
+
+        /** Each chunk's whole count, the last entry of its prefix. */
+        fun shownCount(chunk: Int): Int = shownPrefixes.getOrNull(chunk)?.last() ?: 0
+    }
+
+    /** The paragraph being read aloud, kept while highlighting is off so it is still followed. */
+    private var spokenParagraph: ReadAloudPosition? = null
+
+    /** The part of [spokenParagraph] being spoken, in its read-aloud text; null for all of it. */
+    private var spokenRange: IntRange? = null
+
+    /** [landing], and the line at the top of the screen where it stopped short, null for the chapter's start. */
+    private class ShortLanding(val landing: Landing, val stoppedAt: Pair<TextView, Int>?)
+
+    /** Where a chapter is put once its text has a height. */
+    private sealed interface Landing {
+        /** A share of the chapter, which a stored percent and the rail name, or the paged slider's page. */
+        data class Share(val progress: ChapterProgress) : Landing
+
+        /**
+         * The line holding character [offset] of chunk [chunk], put back at [y] in the recycler, which a
+         * redraw carries: a share counts every position past the chapter's last line reaching the bottom
+         * of the screen as all of it. A redraw keeps the chunking, which depends on the text alone.
+         */
+        data class Line(val chunk: Int, val offset: Int, val y: Int) : Landing
+
+        /**
+         * The line holding counted character [line] of the chapter (`shownCharPrefix`), put at the top: what a
+         * rebuilt renderer is handed, where the chunking and the width may both have changed. A line the
+         * text does not reach lands on the saved [progress] instead, as the page falls back to it.
+         */
+        data class Text(val line: Int, val progress: ChapterProgress.Percent) : Landing
+    }
+
+    /**
+     * The window a settings redraw is rebuilding, held until it finishes. A redraw that supersedes it
+     * rebuilds this rather than the half-built list left behind, and the host's verbs edit it rather
+     * than the list, so the two cannot interleave. The reading position is kept for a redraw that
+     * starts before the rebuilt window has one of its own to read.
+     */
+    private var redraw: Redraw? = null
+    private var redrawJob: Job? = null
+
+    private class Redraw(
+        val chapters: MutableList<NovelReaderViewModel.LoadedChapter>,
+        val readingId: Long?,
+        val landing: Landing?,
+    )
+
+    /** Every pixel scrolled, so a correction can tell the reader's own movement from the layout's. */
+    private var scrolled = 0L
+
+    /** A correction posted and not yet run. It measured the last real layout, so it takes back whatever
+     *  else moves its anchor before it runs, and a second one would scroll those pixels twice. */
+    private var correctionPending = false
+
+    /** The last chapter announced, so a scroll that stays inside one says nothing. */
+    private var reportedVisibleId: Long? = null
+
+    /** What the window ran out of text on at each end, drawn on the edge items. */
+    private var failedPrevious: NovelReaderViewModel.BoundaryFailure? = null
+    private var failedNext: NovelReaderViewModel.BoundaryFailure? = null
+
+    private val autoScroller = FrameScroller(context.resources.displayMetrics.density) { px ->
+        scrollColumnBy(px)
+        true
+    }
+
+    private val adapter = BlockAdapter()
+
+    /** Declared above the recycler that registers it, or it is null when that runs. */
+    private val focusableWhileAttached = SelectableWhileAttached()
+
+    /** The cutout inset in pixels, added to each column's top margin. Read on every open and again
+     *  whenever insets arrive, since an open during an Activity recreation runs before the window
+     *  has any and reads zero. */
+    private var topInsetPx = 0
+
+    /** What the chrome covers from each edge ([setObscured]), which only read-aloud's choices read. */
+    private var obscuredTopPx = 0
+    private var obscuredBottomPx = 0
+
+    /** Where the touch went down, in viewport coordinates: a click carries no position of its own, and
+     *  a swipe is measured from here. */
+    private var touchDownX = 0f
+    private var touchDownY = 0f
+
+    /** Whether the touch on screen has left where it went down ([hasTravelled]). */
+    private var dragging = false
+
+    /** Whether the touch on screen has had a second finger down ([chapterSwipeStep]). */
+    private var multiTouch = false
+
+    /** Whether the touch on screen went down under the page mask, which keeps it from the text there. */
+    private var maskedTouch = false
+
+    private val touchSlop = ViewConfiguration.get(context).scaledTouchSlop
+
+    /**
+     * Ends a child's press once its touch is a drag. A view keeps its click and its long press for as
+     * long as the finger stays inside it, and a chapter's text is as wide as the screen: a sideways
+     * drag ended as a tap, and one slower than a long press selected the text under it, which stops
+     * the list seeing the finger lift and so stepped no chapter. Set on every child given a press. The
+     * lift reaches unselectable text as a cancel, since [LinkOnlyMovementMethod] acts on any lift and
+     * never sees the drag. Selectable text keeps its lift, which ends a selection drag.
+     */
+    private val dragEndsPress = View.OnTouchListener { child, event ->
+        if (!dragging) return@OnTouchListener false
+        child.cancelLongPress()
+        child.isPressed = false
+        if (textSelectable || event.actionMasked != MotionEvent.ACTION_UP) return@OnTouchListener false
+        val cancel = MotionEvent.obtain(event).apply { action = MotionEvent.ACTION_CANCEL }
+        child.onTouchEvent(cancel)
+        cancel.recycle()
+        true
+    }
+
+    /** Only consulted for selectable text, where the Editor takes the touch and no click follows. */
+    private val selectableTaps = GestureDetector(
+        context,
+        object : GestureDetector.SimpleOnGestureListener() {
+            override fun onSingleTapUp(e: MotionEvent): Boolean {
+                if (!tapReaderControl(e.x, e.y)) onReaderTap(e.x, e.y)
+                return false
+            }
+        },
+    )
+
+    /**
+     * Taps are watched above the children rather than taken from them. A selectable TextView hands
+     * its touches to the Editor and fires no click at all, so turning text selection on left the
+     * chrome unreachable; and a click carries no coordinate for the tap zones to read.
+     * Never consumes, so selection dragging and link taps still reach the text underneath.
+     * Declared above the recycler that registers it, or it is null when that runs.
+     */
+    private val tapWatcher = object : RecyclerView.OnItemTouchListener {
+        override fun onInterceptTouchEvent(rv: RecyclerView, e: MotionEvent): Boolean {
+            // Taken whole, so it neither scrolls nor taps; the recycler then keeps the gesture here until it ends,
+            // and its lift never comes back through here to open the paged gate.
+            if (resumeVeil.isUp) {
+                pagedLayoutManager?.fingerDown = false
+                return true
+            }
+            when (e.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    touchDownX = e.x
+                    touchDownY = e.y
+                    dragging = false
+                    multiTouch = false
+                    pagedLayoutManager?.fingerDown = true
+                    // Under the mask the column holds the pages either side, and a link there must not take a
+                    // tap meant for the page: the gesture is kept here and read as the page's ([onTouchEvent]).
+                    maskedTouch = underPageMask(e.y)
+                    if (maskedTouch) return true
+                }
+                MotionEvent.ACTION_CANCEL -> pagedLayoutManager?.fingerDown = false
+                // Before the child under the finger is handed the same move, so its press ends on it.
+                MotionEvent.ACTION_MOVE ->
+                    if (hasTravelled(e.x - touchDownX, e.y - touchDownY, touchSlop)) dragging = true
+                // Ends the child's press as a drag does, so no click follows when the last finger lifts.
+                // selectableTaps needs nothing: GestureDetector drops a tap once a second finger lands.
+                MotionEvent.ACTION_POINTER_DOWN -> {
+                    multiTouch = true
+                    dragging = true
+                }
+                MotionEvent.ACTION_UP -> {
+                    pagedLayoutManager?.fingerDown = false
+                    onPointerUp(e.x, e.y)
+                    // Below the last chapter there is no view to take the click, as on a short last page, so
+                    // the tap is read here, as the page reads one anywhere. Selectable text's taps all are already.
+                    if (!textSelectable && !dragging && !multiTouch && rv.findChildViewUnder(e.x, e.y) == null) {
+                        onTap(e.x, e.y)
+                    }
+                }
+            }
+            if (textSelectable) selectableTaps.onTouchEvent(e)
+            return false
+        }
+
+        override fun onTouchEvent(rv: RecyclerView, e: MotionEvent) {
+            if (!maskedTouch) return
+            when (e.actionMasked) {
+                MotionEvent.ACTION_MOVE ->
+                    if (hasTravelled(e.x - touchDownX, e.y - touchDownY, touchSlop)) dragging = true
+                MotionEvent.ACTION_POINTER_DOWN -> multiTouch = true
+                MotionEvent.ACTION_UP -> {
+                    maskedTouch = false
+                    pagedLayoutManager?.fingerDown = false
+                    onPointerUp(e.x, e.y)
+                    if (!dragging && !multiTouch) onTap(e.x, e.y)
+                }
+                MotionEvent.ACTION_CANCEL -> {
+                    maskedTouch = false
+                    pagedLayoutManager?.fingerDown = false
+                }
+            }
+        }
+
+        // A selection drag takes the gesture, and the list sees no lift for it, which left paged scrolling refused.
+        override fun onRequestDisallowInterceptTouchEvent(disallow: Boolean) {
+            if (disallow) pagedLayoutManager?.fingerDown = false
+        }
+    }
+
+    /** The spoken paragraph's box for the styles that draw one. Declared above the recycler that registers it. */
+    private val readAloudBox = ReadAloudBoxDecoration {
+        val current = settings ?: return@ReadAloudBoxDecoration null
+        val style = when (current.ttsHighlightStyle) {
+            TtsHighlightStyle.BACKGROUND -> Paint.Style.FILL
+            TtsHighlightStyle.OUTLINE -> Paint.Style.STROKE
+            TtsHighlightStyle.UNDERLINE -> return@ReadAloudBoxDecoration null
+        }
+        val (view, start, end) = markedText() ?: return@ReadAloudBoxDecoration null
+        ReadAloudBoxDecoration.Box(view, start, end, current.ttsHighlightColor, style)
+    }
+
+    /** Paged reading's finger gate, null while scrolling. */
+    private val pagedLayoutManager = if (paged) PagedLayoutManager(context) else null
+
+    private val maskPaint = Paint()
+
+    /** Covers the margin above a page and everything below its last whole line, so the lines of the pages
+     *  either side, which the column still holds there, never show. Drawn over the read-aloud box too. */
+    private val pageMask = object : RecyclerView.ItemDecoration() {
+        override fun onDrawOver(c: Canvas, parent: RecyclerView, state: RecyclerView.State) {
+            val height = shownPageHeight ?: return
+            val current = settings ?: return
+            maskPaint.color = readerBackgroundColorInt(current.backgroundColor)
+            val top = readingTop().toFloat()
+            val width = parent.width.toFloat()
+            c.drawRect(0f, 0f, width, top, maskPaint)
+            c.drawRect(0f, top + height, width, parent.height.toFloat(), maskPaint)
+        }
+    }
+
+    private val recycler = RecyclerView(context).apply {
+        layoutManager = pagedLayoutManager ?: LinearLayoutManager(context)
+        addItemDecoration(readAloudBox)
+        if (paged) {
+            addItemDecoration(pageMask)
+            // The finger never scrolls a page, so the lift that ends a tap must not fling one either.
+            onFlingListener = object : RecyclerView.OnFlingListener() {
+                override fun onFling(velocityX: Int, velocityY: Int) = true
+            }
+            // A screen of room after the last chapter, so its last page can reach the top like any other. The
+            // list lays its items out into the padding only while it does not clip to it.
+            clipToPadding = false
+            addOnLayoutChangeListener { _, _, top, _, bottom, _, _, _, _ ->
+                // The margin above the column too, so a first page that starts at the item's very top (a failure
+                // above the first chapter) can still land below it.
+                if (paddingBottom != bottom - top || paddingTop != readingTop()) {
+                    setPadding(paddingLeft, readingTop(), paddingRight, bottom - top)
+                    requestSnap()
+                }
+            }
+        }
+        adapter = this@NovelTextViewport.adapter
+        // A chapter is one item; recycling it would throw away the laid-out text we just built.
+        setItemViewCacheSize(WINDOW_SIZE)
+        // An insert animation moves the reading position while it runs, which is the whole thing a
+        // seamless window must not do. The webtoon viewer drops it for the same reason.
+        itemAnimator = null
+        // A page has no place in a scroll to show.
+        isVerticalScrollBarEnabled = !paged
+        addOnScrollListener(object : RecyclerView.OnScrollListener() {
+            override fun onScrolled(view: RecyclerView, dx: Int, dy: Int) {
+                scrolled += dy
+                requestSnap()
+                if (view.scrollState == RecyclerView.SCROLL_STATE_DRAGGING) callbacks.onReaderScrolled(dy)
+                showTallPictures()
+                reportVisibleChapter()
+                report(callbacks.onProgressChanged)
+                reportEnds()
+            }
+
+            override fun onScrollStateChanged(view: RecyclerView, state: Int) {
+                // Only a finger drags: the viewport's own scrolls settle without it.
+                if (state == RecyclerView.SCROLL_STATE_DRAGGING) readerMoved()
+                if (state == RecyclerView.SCROLL_STATE_IDLE) report(callbacks.onProgressSettled)
+            }
+        })
+        addOnItemTouchListener(tapWatcher)
+        // A mouse wheel scrolls without a drag state; returning false leaves the scroll to the recycler.
+        setOnGenericMotionListener { _, event ->
+            if (event.actionMasked != MotionEvent.ACTION_SCROLL) return@setOnGenericMotionListener false
+            if (!resumeVeil.isUp) readerMoved()
+            resumeVeil.isUp
+        }
+        if (textSelectable) addOnAttachStateChangeListener(focusableWhileAttached)
+        // Passed on untouched: the recycler draws nothing from them, it only needs to know they came.
+        ViewCompat.setOnApplyWindowInsetsListener(this) { _, insets ->
+            refreshTopInset()
+            insets
+        }
+    }
+
+    override val view: View get() = recycler
+
+    private val slide = PageSlide(recycler)
+
+    override val isRtl: Boolean get() = pageLayout.isRtl
+
+    override suspend fun load(chapter: NovelReaderViewModel.LoadedChapter, settings: NovelReaderSettings) {
+        // Before the suspension below, so a change that lands during it is not overwritten with this.
+        this.settings = settings
+        warmFont()
+        // Folded into the column's own top margin, since a seek measures from the viewport's edge and
+        // would scroll a padding above the list straight off screen, even to 0%.
+        topInsetPx = (callbacks.cutoutTopDp() * context.resources.displayMetrics.density).toInt()
+        // An explicit open replaces the window rather than growing it: the chapters around the one
+        // being left are not the ones around the one being opened, so a redraw of those stops too.
+        redrawJob?.cancel()
+        redraw = null
+        spokenParagraph = null
+        spokenRange = null
+        evictAll()
+        // A new window reports afresh, as the web page does, since the model may have dropped the last.
+        reportedFits.clear()
+        reportedEnds.clear()
+        reportedTopLine = null
+        val landing = chapter.topLine?.let { Landing.Text(it, chapter.progress) } ?: Landing.Share(chapter.progress)
+        add(chapter, atEnd = true, landing = landing)
+    }
+
+    override val window: ChapterWindow get() = this
+
+    /** Every answer waits out a redraw, which empties the window while it rebuilds the same chapters. */
+    override val readAloud: ReadAloudSurface = object : ReadAloudSurface {
+        override suspend fun paragraphs(chapterId: Long): List<String>? = withContext(Dispatchers.Main.immediate) {
+            awaitRedraws()
+            renderedSlot(chapterId)?.paragraphs?.map { it.text }
+        }
+
+        override suspend fun firstVisibleParagraph(): ReadAloudPosition? = withContext(Dispatchers.Main.immediate) {
+            awaitRedraws()
+            firstParagraphOnScreen()
+        }
+
+        override fun highlight(position: ReadAloudPosition?, range: IntRange?) {
+            spokenParagraph = position
+            spokenRange = range
+            drawSpokenParagraph()
+            position?.let(::followSpokenParagraph)
+        }
+    }
+
+    override fun setObscured(top: Int, bottom: Int) {
+        obscuredTopPx = top
+        obscuredBottomPx = bottom
+    }
+
+    /** Whether [y] is in the margin above the page shown or below its last whole line, where [pageMask] draws. */
+    private fun underPageMask(y: Float): Boolean {
+        val height = shownPageHeight ?: return false
+        val top = readingTop()
+        return y < top || y > top + height
+    }
+
+    /** Where the text read aloud can be seen from: below the cutout and below whatever chrome covers it, and in
+     *  paged reading inside the page. */
+    private fun uncoveredTop() = maxOf(topInsetPx, obscuredTopPx, readingTop())
+
+    private fun uncoveredBottom(): Int {
+        val bottom = recycler.height - obscuredBottomPx
+        val page = shownPageHeight ?: return bottom
+        return minOf(bottom, readingTop() + page.toInt())
+    }
+
+    /**
+     * Until the window's redraw plan is done, across every redraw that takes it over. Cancelling the one
+     * joined here resumes this inline, before its successor is assigned, so a finished job with the plan
+     * still open is looked at again once the main thread has moved on. A second look finding the same is
+     * a redraw that died, and waiting longer would never end.
+     */
+    private suspend fun awaitRedraws() {
+        var lookedAgain = false
+        while (redraw != null) {
+            val job = redrawJob
+            if (job != null && !job.isCompleted) {
+                job.join()
+                lookedAgain = false
+            } else if (lookedAgain) {
+                return
+            } else {
+                withUIContext {}
+                lookedAgain = true
+            }
+        }
+    }
+
+    private fun renderedSlot(chapterId: Long) = slots.firstOrNull { it.rendered && it.chapter.chapterId == chapterId }
+
+    private fun firstParagraphOnScreen(): ReadAloudPosition? {
+        val visibleTop = uncoveredTop()
+        val visibleBottom = uncoveredBottom()
+        joined().forEach { slot ->
+            val (top, height) = boundsOf(slot) ?: return@forEach
+            if (top + height <= visibleTop || top >= visibleBottom) return@forEach
+            slot.paragraphs.forEachIndexed { index, paragraph ->
+                val (paragraphTop, paragraphBottom) = boundsOf(slot, paragraph) ?: return@forEachIndexed
+                if (paragraphBottom > visibleTop && paragraphTop < visibleBottom) {
+                    return ReadAloudPosition(slot.chapter.chapterId, index)
+                }
+            }
+        }
+        return null
+    }
+
+    /** Where [paragraph] starts and ends in the recycler's coordinates, null while it is out of layout. */
+    private fun boundsOf(slot: ChapterSlot, paragraph: ChunkParagraph): Pair<Int, Int>? {
+        val view = slot.block.chunkViews.getOrNull(paragraph.chunk) ?: return null
+        return boundsOf(view, paragraph.start, paragraph.end)
+    }
+
+    /** Where [start] until [end] of [view]'s text starts and ends in the recycler's coordinates. */
+    private fun boundsOf(view: TextView, start: Int, end: Int): Pair<Int, Int>? {
+        val top = lineTopOf(view, start) ?: return null
+        val layout = view.layout ?: return null
+        val bottom = top - layout.getLineTop(layout.getLineForOffset(start)) +
+            layout.getLineBottom(layout.getLineForOffset(end - 1))
+        return top to bottom
+    }
+
+    /**
+     * Takes every mark off and draws the one [spokenParagraph] names. Found by type rather than kept,
+     * since a restyle or an image landing copies the text with whatever marks it held at the time. The
+     * box behind the text is [readAloudBox]'s, redrawn here since a chunk's layout changing redraws only
+     * the chunk; every caller is a mark, its settings, or a chapter's text or images changing.
+     */
+    private fun drawSpokenParagraph() {
+        slots.forEach { slot ->
+            slot.block.chunkViews.forEach { view ->
+                val text = view.text as? Spannable ?: return@forEach
+                val marks = text.getSpans(0, text.length, ReadAloudMark::class.java)
+                if (marks.isEmpty()) return@forEach
+                marks.forEach(text::removeSpan)
+                view.invalidate()
+            }
+        }
+        recycler.invalidate()
+        val (view, start, end) = markedText() ?: return
+        val text = view.text as? Spannable ?: return
+        val current = checkNotNull(settings)
+        val marks = when (current.ttsHighlightStyle) {
+            TtsHighlightStyle.BACKGROUND -> listOf(MarkForegroundSpan(current.ttsHighlightTextColor))
+            TtsHighlightStyle.UNDERLINE -> listOf(MarkUnderlineSpan())
+            TtsHighlightStyle.OUTLINE -> return
+        }
+        marks.forEach { text.setSpan(it, start, end, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE) }
+        view.invalidate()
+    }
+
+    /** The chunk view holding the spoken text, and where that text starts and ends in it. */
+    private data class SpokenText(val view: TextView, val start: Int, val end: Int)
+
+    /** [spokenText] while highlighting is on, which is when a mark is drawn. */
+    private fun markedText(): SpokenText? = if (settings?.ttsHighlight == true) spokenText() else null
+
+    /** The spoken sentence, or the whole paragraph when none is named or the sentence is not in its chunk. */
+    private fun spokenText(): SpokenText? {
+        val position = spokenParagraph ?: return null
+        val slot = renderedSlot(position.chapterId) ?: return null
+        val paragraph = slot.paragraphs.getOrNull(position.paragraph) ?: return null
+        val view = slot.block.chunkViews.getOrNull(paragraph.chunk) ?: return null
+        val (start, end) = spokenRange?.let { sentenceRange(paragraph, view.text, it) }
+            ?: (paragraph.start to paragraph.end)
+        return SpokenText(view, start, end)
+    }
+
+    /** The last sentence resolved, which the box decoration asks for on every frame of a scroll. Keyed on
+     *  the chunk's text object, which a restyle or a picture landing replaces with a copy. */
+    private var sentence: SentenceRange? = null
+
+    private class SentenceRange(
+        val paragraph: ChunkParagraph,
+        val range: IntRange,
+        val text: CharSequence,
+        val bounds: Pair<Int, Int>?,
+    )
+
+    private fun sentenceRange(paragraph: ChunkParagraph, text: CharSequence, range: IntRange): Pair<Int, Int>? {
+        sentence?.takeIf { it.paragraph === paragraph && it.range == range && it.text === text }
+            ?.let { return it.bounds }
+        return paragraph.chunkRange(text, range).also { sentence = SentenceRange(paragraph, range, text, it) }
+    }
+
+    /**
+     * Brings the spoken sentence or paragraph fully into the uncovered part of the screen when it is not,
+     * top at its top edge or centred in it as the setting says. A chapter out of the recycler's layout has no line
+     * to measure, so it is jumped to first and measured once laid out.
+     */
+    private fun followSpokenParagraph(position: ReadAloudPosition, retry: Boolean = true) {
+        val current = settings?.takeIf { it.ttsKeepInView } ?: return
+        val slot = renderedSlot(position.chapterId) ?: return
+        val spoken = spokenText() ?: return
+        val bounds = boundsOf(spoken.view, spoken.start, spoken.end)
+        if (bounds == null) {
+            val item = adapter.positionOf(slot).takeIf { it >= 0 && retry } ?: return
+            (recycler.layoutManager as LinearLayoutManager).scrollToPositionWithOffset(item, 0)
+            recycler.post { if (spokenParagraph == position) followSpokenParagraph(position, retry = false) }
+            return
+        }
+        val (top, bottom) = bounds
+        val visibleTop = uncoveredTop()
+        val visibleBottom = uncoveredBottom()
+        if (paged) {
+            // By page: text starting on this one stays, since the snap would only show it again. Otherwise it goes to the
+            // reading line, where the snap that follows shows the page holding it.
+            if (top >= visibleTop && top < visibleBottom) return
+            scrollColumnBy(top - readingTop())
+            return
+        }
+        if (top >= visibleTop && bottom <= visibleBottom) return
+        val available = visibleBottom - visibleTop
+        val target = if (current.ttsScrollToTop || bottom - top >= available) {
+            visibleTop
+        } else {
+            visibleTop + (available - (bottom - top)) / 2
+        }
+        recycler.stopScroll()
+        recycler.smoothScrollBy(0, top - target)
+    }
+
+    override suspend fun append(chapter: NovelReaderViewModel.LoadedChapter) {
+        grow(chapter, atEnd = true)
+    }
+
+    /**
+     * Nothing compensates for the insert. Measured in `RecyclerPrependPositionTest`: a chapter added
+     * above the reading position moves it by zero pixels, because the layout manager anchors on a
+     * child it already has and never lays out an item entirely above the viewport. That holds while the
+     * screen is full, which the host keeps true by adding below first ([NovelWindowDiff]); with nothing
+     * below a short chapter, the chapter joins at its final height ([add]) and the reader ends at the bottom.
+     */
+    override suspend fun prepend(chapter: NovelReaderViewModel.LoadedChapter) {
+        grow(chapter, atEnd = false)
+    }
+
+    /**
+     * Adds a chapter the host asked for, unless the window holds it already. While a redraw is
+     * rebuilding the window it goes into that instead, which adds it in the order the host asked for.
+     * Nothing suspends between the checks and the add, so a redraw cannot start in between.
+     */
+    private suspend fun grow(chapter: NovelReaderViewModel.LoadedChapter, atEnd: Boolean) {
+        warmFont()
+        if (slots.any { it.chapter.chapterId == chapter.chapterId }) return
+        redraw?.let { pending ->
+            if (pending.chapters.none { it.chapterId == chapter.chapterId }) {
+                pending.chapters.add(if (atEnd) pending.chapters.size else 0, chapter)
+            }
+            return
+        }
+        add(chapter, atEnd, landing = null)
+    }
+
+    /** Resolving a user font copies it out of the user's storage folder on first use. Done where
+     *  this is a coroutine, so the chunk views find it cached rather than each doing that lookup on
+     *  the main thread as it is built. */
+    private suspend fun warmFont() {
+        fontManager.warm(checkNotNull(settings).fontFamily)
+    }
+
+    override fun evict(chapterId: Long) {
+        redraw?.chapters?.removeAll { it.chapterId == chapterId }
+        if (spokenParagraph?.chapterId == chapterId) spokenParagraph = null
+        val index = slots.indexOfFirst { it.chapter.chapterId == chapterId }
+        if (index < 0) return
+        val slot = slots.removeAt(index)
+        slot.block.discarded = true
+        slot.block.releasePictures()
+        cancelImageWait(slot)
+        adapter.show(joined())
+    }
+
+    override fun setBoundaryFailures(
+        previous: NovelReaderViewModel.BoundaryFailure?,
+        next: NovelReaderViewModel.BoundaryFailure?,
+    ) {
+        if (previous == failedPrevious && next == failedNext) return
+        failedPrevious = previous
+        failedNext = next
+        // Through a markers-only change notice, never a rebind: a rebind detaches and re-adds the
+        // chapter's text container, re-measuring every chunk of the chapter the reader is inside,
+        // which is the one thing this container must never do while it is showing.
+        adapter.refreshMarkers()
+    }
+
+    /** Everything a view is drawn from. The rest of the object (auto-scroll, the rail, volume keys,
+     *  read-aloud) changes nothing on the page, and restyling for one of those copied the whole
+     *  chapter's text and re-measured every chunk on the main thread. */
+    private fun NovelReaderSettings.renderShape() = listOf(
+        fontSize, fontFamily, lineHeight, textAlign, textColor, backgroundColor, margins,
+        paragraphIndent, paragraphSpacing, bionicReading,
+    )
+
+    /** What the read-aloud mark is drawn from, which changes the spans on one paragraph and nothing else. */
+    private fun NovelReaderSettings.markShape() =
+        listOf(ttsHighlight, ttsHighlightStyle, ttsHighlightColor, ttsHighlightTextColor)
+
+    /** What the markers and failure views draw in: they sit on the reader's background, not the app's. */
+    private fun readerTextColor() = readerTextColorInt(checkNotNull(settings).textColor)
+
+    override fun applySettings(settings: NovelReaderSettings) {
+        val previous = this.settings
+        this.settings = settings
+        // The markers are views of their own, so showing, hiding or recolouring them re-measures no text.
+        val recoloured = previous != null && previous.textColor != settings.textColor
+        val seamsToggled =
+            previous != null && previous.alwaysShowChapterTransition != settings.alwaysShowChapterTransition
+        if (recoloured || seamsToggled) adapter.refreshMarkers()
+        if (previous?.markShape() != settings.markShape()) drawSpokenParagraph()
+        if (previous != null && previous.renderShape() == settings.renderShape()) return
+        // A chapter still rendering built its pictures at the old size and joins with a restyle.
+        val holdsPictures = slots.any { !it.rendered || it.block.holdsPictures() }
+        if (previous != null && previous.paragraphShape().needsRedrawFor(settings.paragraphShape(), holdsPictures)) {
+            startRedraw()
+            return
+        }
+        scope.launch {
+            // A font just chosen may not be resolved yet, and resolving one touches storage.
+            warmFont()
+            // The latest rather than this call's, since another may have landed while the font resolved.
+            val current = checkNotNull(this@NovelTextViewport.settings)
+            recycler.setBackgroundColor(readerBackgroundColorInt(current.backgroundColor))
+            // A chapter still rendering has no views to restyle yet; it is caught as it joins.
+            holdingReader { slots.filter { it.rendered }.forEach { restyle(it, current) } }
+        }
+    }
+
+    /**
+     * Rebuilds the window, since indent and spacing are spans measured when the text is built. Only
+     * the chapter being read keeps its place; a neighbour is redrawn from its top, since the window
+     * rebuilds around wherever the reader ends up. Rebuilt outward from it, below before above, for
+     * the reason the host grows a window that way. A text-size drag redraws on every step, so a
+     * redraw still running is cancelled and its window taken over, reading position included.
+     */
+    private fun startRedraw() {
+        redrawJob?.cancel()
+        // A chapter on its way to a position is where the reader is headed; failing that, the layout.
+        val seeking = slots.firstOrNull { it.landing != null }
+        val short = slots.firstOrNull { it.stillShort() != null }
+        val visible = visibleSlot()
+        val pending = redraw
+        val plan = Redraw(
+            chapters = pending?.chapters ?: slots.mapTo(mutableListOf()) { it.chapter },
+            readingId = (seeking ?: short ?: visible)?.chapter?.chapterId ?: pending?.readingId,
+            landing = seeking?.landing ?: short?.stillShort() ?: visible?.let(::landingOf) ?: pending?.landing,
+        )
+        redraw = plan
+        redrawJob = scope.launch {
+            warmFont()
+            evictAll()
+            while (true) {
+                val (chapter, atEnd) = plan.next() ?: break
+                add(chapter, atEnd, landing = plan.landing.takeIf { chapter.chapterId == plan.readingId })
+            }
+            redraw = null
+            // Posted behind the last join's own landing. Every chapter the redraw adds has joined, so a line still
+            // short of room is kept for a chapter joining below rather than held, which would stop the reports.
+            // A share still waiting on its images or its layout is not short of room, so it waits on.
+            val rebuilt = joined()
+            recycler.post {
+                rebuilt.forEach { slot ->
+                    land(slot)
+                    (slot.landing as? Landing.Line)?.let { holdShort(slot, it) }
+                }
+            }
+        }
+    }
+
+    /** Where the reader is in [slot], the chapter being read: the line at the top of the screen, or a
+     *  share while the chapter's text starts on screen. */
+    private fun landingOf(slot: ChapterSlot): Landing {
+        val line = lineAtTop() ?: return Landing.Share(progressOf(slot))
+        return Landing.Line(slot.block.chunkViews.indexOf(line.view), line.offset, line.y)
+    }
+
+    /**
+     * The next chapter [Redraw] adds and whether below: the one being read, then those after it in
+     * order, then those before it nearest first. Read afresh each time, since the host edits it. With
+     * no chapter being read, the first one rebuilt stands in, so one prepended since still goes above.
+     */
+    private fun Redraw.next(): Pair<NovelReaderViewModel.LoadedChapter, Boolean>? {
+        val held = { chapter: NovelReaderViewModel.LoadedChapter ->
+            slots.any { it.chapter.chapterId == chapter.chapterId }
+        }
+        val reading = chapters.indexOfFirst { it.chapterId == readingId }.takeIf { it >= 0 }
+            ?: chapters.indexOfFirst(held).coerceAtLeast(0)
+        chapters.drop(reading).firstOrNull { !held(it) }?.let { return it to true }
+        return chapters.take(reading).lastOrNull { !held(it) }?.let { it to false }
+    }
+
+    /** Restyles a chapter's built views in place, keeping its spans. */
+    private fun restyle(slot: ChapterSlot, settings: NovelReaderSettings) {
+        if (slot.styledWith.renderShape() == settings.renderShape()) return
+        // A precomputed layout is measured against the paint's size and face, and the framework's own
+        // long-press drag path re-sets it without checking, which throws once either moved. Colour, line
+        // spacing and alignment are not measured, so they keep it rather than re-measuring every chunk.
+        val remeasured = slot.styledWith.fontSize != settings.fontSize ||
+            slot.styledWith.fontFamily != settings.fontFamily
+        slot.styledWith = settings
+        NovelTextStyle.applyMargins(slot.block.container, settings, context, topInsetPx)
+        slot.block.chunkViews.forEach { view ->
+            // Copying rather than flattening keeps the chapter's emphasis, links, images and paragraph spans.
+            if (remeasured) view.text = SpannableStringBuilder(view.text)
+            NovelTextStyle.apply(view, settings, context, fontManager)
+        }
+    }
+
+    /**
+     * Runs [change], which re-measures text already laid out, then puts the line at the top of the
+     * screen back where it was, the way the WebView page's `place` holds it. The layout
+     * manager holds only an item's top, so growth above that line inside its chapter would carry the
+     * reader off it. What the reader scrolled meanwhile is theirs and stays, as in [BlockAdapter.show].
+     */
+    private inline fun holdingReader(change: () -> Unit) {
+        val anchor = if (canMeasureForCorrection()) lineAtTop() else null
+        val scrolledBefore = scrolled
+        change()
+        if (anchor == null) return
+        postCorrection {
+            val after = lineTopOf(anchor.view, anchor.offset) ?: return@postCorrection 0
+            after - anchor.y + (scrolled - scrolledBefore).toInt()
+        }
+    }
+
+    /** Not while a correction is pending, see [correctionPending], nor while the list holds changes its
+     *  layout has not caught up with, since a position then still names the item it used to. */
+    private fun canMeasureForCorrection() = !correctionPending && !recycler.hasPendingAdapterUpdates()
+
+    /** Scrolls by what [shift] measures once the change has laid out, before that layout is drawn. */
+    private fun postCorrection(shift: () -> Int) {
+        correctionPending = true
+        beforeNextDraw {
+            correctionPending = false
+            val by = shift()
+            if (by != 0) scrollColumnBy(by)
+        }
+    }
+
+    /**
+     * Runs [action] after the next layout and before it is drawn, as the page's `place` corrects from a resize
+     * observer. Posted, a move ran after the frame, which drew the reader somewhere else for as long as that
+     * frame took. A detached list draws nothing to move before, and would never reach a draw to run in.
+     */
+    private fun beforeNextDraw(action: () -> Unit) {
+        if (!recycler.isAttachedToWindow) {
+            recycler.post(action)
+            return
+        }
+        recycler.viewTreeObserver.addOnPreDrawListener(
+            object : ViewTreeObserver.OnPreDrawListener {
+                override fun onPreDraw(): Boolean {
+                    recycler.viewTreeObserver.removeOnPreDrawListener(this)
+                    action()
+                    return true
+                }
+            },
+        )
+        recycler.invalidate()
+    }
+
+    private class LineAnchor(val view: TextView, val offset: Int, val y: Int)
+
+    /** The line at the top of the screen ([readingTop]), or the last one above it when that falls below the
+     *  text. Null when the chapter's text starts below it, where the item's own anchor already holds it. */
+    private fun lineAtTop(): LineAnchor? {
+        val slot = visibleSlot() ?: return null
+        val probe = readingTop()
+        val view = slot.block.chunkViews.lastOrNull { (topInRecycler(it) ?: (probe + 1)) <= probe } ?: return null
+        val layout = view.layout ?: return null
+        val top = (topInRecycler(view) ?: return null) + view.totalPaddingTop
+        val offset = layout.getLineStart(layout.getLineForVertical(probe - top))
+        val y = lineTopOf(view, offset) ?: return null
+        return LineAnchor(view, offset, y)
+    }
+
+    /** Puts the line holding anchor [index] of [widget]'s chapter at the top, as the page jumps to a fragment. */
+    private fun jumpToAnchor(widget: TextView, index: Int) {
+        val block = slots.firstOrNull { widget in it.block.chunkViews }?.block ?: return
+        for (view in block.chunkViews) {
+            val text = view.text as? Spanned ?: continue
+            val anchor = text.getSpans(0, text.length, AnchorSpan::class.java).firstOrNull { it.index == index }
+                ?: continue
+            // The reader chose where to go, so a landing still waiting on images must not pull them back.
+            readerMoved()
+            lineTopOf(view, text.getSpanStart(anchor))?.let { scrollColumnBy(it - readingTop()) }
+            return
+        }
+    }
+
+    /** Where the line holding [offset] starts, in the recycler's coordinates. */
+    private fun lineTopOf(view: TextView, offset: Int): Int? {
+        val layout = view.layout ?: return null
+        val top = topInRecycler(view) ?: return null
+        return top + view.totalPaddingTop + layout.getLineTop(layout.getLineForOffset(offset))
+    }
+
+    /**
+     * Tells each tall picture in the window which of its rows are on screen, so it holds the slices it is
+     * drawing and no more. A picture cannot tell on its own: a chunk is drawn once into a display list and
+     * a scroll moves that list rather than drawing it again, so its clip is the chunk, not the screen.
+     */
+    private fun showTallPictures() {
+        slots.forEach { slot ->
+            slot.block.tiledPictures.forEach { anchor ->
+                // A chapter scrolled out of the recycler draws nothing, so its pictures let their slices go.
+                val top = lineTopOf(anchor.view, anchor.offset)?.plus(anchor.topPx)
+                if (top ==
+                    null
+                ) {
+                    anchor.picture.onVisible(0, 0)
+                } else {
+                    anchor.picture.onVisible(-top, recycler.height - top)
+                }
+            }
+        }
+    }
+
+    /** Null once [view] is not in the recycler's layout, which a chapter scrolled out of it is not. */
+    private fun topInRecycler(view: View): Int? {
+        var top = 0
+        var current = view
+        while (current !== recycler) {
+            top += current.top
+            current = current.parent as? View ?: return null
+        }
+        return top
+    }
+
+    /** Re-reads the cutout inset and moves every column's top margin by the change. */
+    private fun refreshTopInset() {
+        val inset = (callbacks.cutoutTopDp() * context.resources.displayMetrics.density).toInt()
+        if (inset == topInsetPx) return
+        topInsetPx = inset
+        val current = settings ?: return
+        holdingReader {
+            slots.forEach { NovelTextStyle.applyMargins(it.block.container, current, context, topInsetPx) }
+        }
+    }
+
+    /** The text column: what is left of the reader once the page's side margins are taken off. The
+     *  recycler answers for its own width once laid out, and the display stands in before that. */
+    private fun columnWidthPx(settings: NovelReaderSettings): Int {
+        val density = context.resources.displayMetrics.density
+        val sides = ((settings.margins.left + settings.margins.right) * density).toInt()
+        val available = recycler.width.takeIf { it > 0 } ?: context.resources.displayMetrics.widthPixels
+        return (available - sides).coerceAtLeast(1)
+    }
+
+    /**
+     * Adds [chapter] to the window and renders it, putting the reader at [landing] once the text has a
+     * height. Indent and spacing are spans measured in pixels when the text is built, so a change to
+     * those re-adds instead. A null [landing] leaves the reader where they are; a share of zero is the
+     * chapter's first line. Returns once the chapter has joined the list, which it does only with its
+     * text set ([join]): laid out earlier, a chapter above the reader grows after layout and carries
+     * the reader with it. Returning then makes the host's order the join order.
+     */
+    private suspend fun add(
+        chapter: NovelReaderViewModel.LoadedChapter,
+        atEnd: Boolean,
+        landing: Landing?,
+    ) {
+        val settings = checkNotNull(this.settings)
+        recycler.setBackgroundColor(readerBackgroundColorInt(settings.backgroundColor))
+        val block = ChapterTextBlock(context) { createChunkView(settings) }
+        NovelTextStyle.applyMargins(block.container, settings, context, topInsetPx)
+        val slot = ChapterSlot(chapter, block, styledWith = settings)
+        slot.landing = landing
+        // A chapter changes height without a scroll when its text is set and when its images land, and
+        // a short one is never scrolled, so a new height is the only point its fit and end get checked.
+        // Posted, since the list places the item only after the column has laid out.
+        block.container.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ ->
+            recycler.post {
+                // A share landing waits for the chapter's images and for a layout to measure it in, and
+                // each arrives as a layout of the column, so this is where a held one is applied.
+                if (slot.landing is Landing.Share || slot.landing is Landing.Text) land(slot)
+                // The chapter's text was just set, which a redraw does afresh without the mark, or an image
+                // re-set it from a copy that can carry a mark the reader has since moved past.
+                drawSpokenParagraph()
+                reportFits(slot)
+                reportEnds()
+                // A chapter changing height moves the pages after the reading line, and may move that line.
+                requestSnap()
+            }
+        }
+        slots.add(if (atEnd) slots.size else 0, slot)
+        renderer.render(
+            block = block,
+            html = chapter.html,
+            fontSize = settings.fontSize,
+            paragraphSpacing = settings.paragraphSpacing,
+            paragraphIndent = settings.paragraphIndent,
+            selectable = textSelectable,
+            bionic = settings.bionicReading,
+            contentWidth = columnWidthPx(settings),
+            baseUrl = chapter.baseUrl,
+            sourceId = chapter.sourceId,
+            // A landing still waiting on the pictures is re-applied once they land, and a correction for the
+            // line on top of it would overshoot.
+            holdAcross = { change ->
+                if (slots.none { it.landing != null }) holdingReader(change) else change()
+                // Once the change has laid out, so each picture is told where it now sits.
+                beforeNextDraw { showTallPictures() }
+            },
+            onTextSet = {
+                join(slot)
+                // Once it has laid out, which is when a picture already in the text can be told where it sits.
+                beforeNextDraw { showTallPictures() }
+            },
+        ).join()
+    }
+
+    /** The chapters the list shows: every one in the window whose text is set. */
+    private fun joined(): List<ChapterSlot> = slots.filter { it.rendered }
+
+    /** Empties the window. Each block's views leave with it, and a pooled holder lets go of its
+     *  chapter as it is recycled, so nothing holds a chapter's text once it is out. */
+    private fun evictAll() {
+        slots.forEach {
+            it.block.discarded = true
+            it.block.releasePictures()
+            cancelImageWait(it)
+        }
+        slots.clear()
+        sentence = null
+        reportedVisibleId = null
+        adapter.show(joined())
+    }
+
+    override fun seekTo(progress: ChapterProgress) {
+        // A page index is not a scroll position, and reading one as a fraction would seek to a third
+        // of the chapter for page 3 of 10. Paged, it is the slider's own unit, and a percent lands on the
+        // page holding that share of the scroll, as a reopen does. The twin reads both alike.
+        if (progress is ChapterProgress.Pages && !paged) return
+        // A seek names a place of its own, which a short line landing again would take the reader from.
+        slots.forEach { it.shortLanding = null }
+        val slot = visibleSlot() ?: slots.firstOrNull() ?: return
+        // Held for the chapter's own landing to apply when it has one still to come, which is also where
+        // one waits that has not rendered yet. Nothing reads it on a chapter already settled.
+        if (slot.rendered &&
+            slot.landing == null
+        ) {
+            scrollWithin(slot, progress)
+        } else {
+            slot.landing = Landing.Share(progress)
+        }
+    }
+
+    /** A step reopens through [load], which replaces the window, so there is nothing to carry over. */
+    override fun onChapterStepped() = Unit
+
+    override val autoScroll: ViewportAutoScroll = if (paged) {
+        ViewportAutoScroll.Stepped(autoScrollInterval, shownPage) { turnPage(forward = true) }
+    } else {
+        ViewportAutoScroll.Continuous(autoScrollSpeed, autoScroller::run)
+    }
+
+    override fun destroy() {
+        // Its copy sits in the host's container, which outlives this viewport.
+        slide.finish()
+        autoScroller.run(0f)
+        scope.cancel()
+        evictAll()
+    }
+
+    /** The same contract [NovelWebViewport] answers, so a volume press behaves the same in either. */
+    override fun handleKeyEvent(event: KeyEvent): Boolean {
+        if (!NovelVolumeKeys.isVolumeKey(event.keyCode) || !callbacks.volumeKeysActive()) return false
+        val current = settings ?: return false
+        if (event.action == KeyEvent.ACTION_DOWN && !resumeVeil.isUp) {
+            readerMoved()
+            val fraction = NovelVolumeKeys.scrollFraction(
+                event.keyCode,
+                current.volumeButtonsInverted,
+                current.volumeButtonsFraction,
+            )
+            if (paged) {
+                turnPage(forward = fraction > 0)
+            } else {
+                val step = (recycler.height * abs(fraction)).roundToInt()
+                recycler.smoothScrollBy(0, if (fraction > 0) step else -step)
+            }
+        }
+        // Consume the key-up too, so the system volume UI never shows during a press.
+        return true
+    }
+
+    override fun handleGenericMotionEvent(event: MotionEvent): Boolean = false
+
+    /**
+     * A tap read through the session's tap zones, which the WebView renderer asks too, with a
+     * three-quarter-screen step. Read from the live settings, so a layout change takes effect at once.
+     */
+    private fun onTap(x: Float, y: Float) {
+        val width = recycler.width
+        val height = recycler.height
+        val zones = settings?.tapZones
+        if (zones == null || width <= 0 || height <= 0) {
+            callbacks.onToggleMenu()
+            return
+        }
+        val step = (height * NovelTapZones.SCROLL_FRACTION).roundToInt()
+        when (zones.actionAt(x / width, y / height, pageLayout.isRtl)) {
+            NovelTapAction.MENU -> callbacks.onToggleMenu()
+            NovelTapAction.BACK -> {
+                readerMoved()
+                if (paged) turnPage(forward = false) else recycler.smoothScrollBy(0, -step)
+            }
+            NovelTapAction.FORWARD -> {
+                readerMoved()
+                if (paged) turnPage(forward = true) else recycler.smoothScrollBy(0, step)
+            }
+            NovelTapAction.NONE -> Unit
+        }
+    }
+
+    /**
+     * A tap on a boundary failure is that box's, as the WebView page treats it. The watcher sees a
+     * tap on its Retry as well as the button does, so without this one tap retried and also scrolled
+     * or toggled the chrome; a tap beside the button falls through to the item's click the same way.
+     */
+    private fun onReaderTap(x: Float, y: Float) {
+        val item = recycler.findChildViewUnder(x, y) as? ViewGroup
+        val onFailure = item?.children?.any {
+            it is NovelBoundaryFailureView && it.isVisible &&
+                x - item.left in it.left.toFloat()..it.right.toFloat() &&
+                y - item.top in it.top.toFloat()..it.bottom.toFloat()
+        } == true
+        if (!onFailure) onTap(x, y)
+    }
+
+    /**
+     * Runs the reader's own control under a tap on selectable text, where the Editor takes the touch and
+     * no movement method dispatches a span. Only a [ReaderControlSpan]: the chapter's links stay dead
+     * with selection on, as its setting's summary says. Returns whether one took the tap.
+     */
+    private fun tapReaderControl(x: Float, y: Float): Boolean {
+        val (chunk, bounds) = slots.asSequence()
+            .flatMap { it.block.chunkViews }
+            .filter { topInRecycler(it) != null }
+            .map { view ->
+                val bounds = Rect(0, 0, view.width, view.height)
+                recycler.offsetDescendantRectToMyCoords(view, bounds)
+                view to bounds
+            }
+            .firstOrNull { (_, bounds) -> bounds.contains(x.toInt(), y.toInt()) }
+            ?: return false
+        val text = chunk.text as? Spanned ?: return false
+        val control = chunk.linksAt(text, x - bounds.left, y - bounds.top).firstOrNull { it is ReaderControlSpan }
+            ?: return false
+        control.onClick(chunk)
+        return true
+    }
+
+    /** A swipe: paged it turns a page, else it steps chapters, by the rules both renderers take from `ChapterSwipe.kt`. */
+    private fun onPointerUp(x: Float, y: Float) {
+        if (multiTouch) return
+        val density = context.resources.displayMetrics.density
+        if (paged) {
+            // Always on, as a pager's swipe is: the setting is for stepping chapters while scrolling.
+            pageSwipeStep(x - touchDownX, y - touchDownY, PAGE_SWIPE_MIN_DP * density)
+                ?.let { forward -> turnPage(forward = forward != pageLayout.isRtl) }
+            return
+        }
+        if (settings?.swipeGestures != true) return
+        chapterSwipeStep(
+            dx = x - touchDownX,
+            dy = y - touchDownY,
+            startX = touchDownX,
+            width = recycler.width.toFloat(),
+            minimum = CHAPTER_SWIPE_MIN_DP * density,
+        )?.let { callbacks.onStepChapter(it) }
+    }
+
+    /**
+     * Hands [sink] the chapter being read and how far through it the reader is, unless that chapter is still
+     * headed for a landing: until then the screen shows where the list put it, its start, and the model
+     * saves whatever it is told over the position being landed. Another chapter on screen is where the
+     * reader really is. The chapter named is right either way, so [reportVisibleChapter] is not held; nor
+     * is a fit, which is height alone, or [reportEnds], since a chapter's start shows no end its landing hides.
+     */
+    private fun report(sink: (Long, ChapterProgress.Percent) -> Unit) {
+        val slot = visibleSlot() ?: return
+        if (slot.landing == null) {
+            sink(slot.chapter.chapterId, progressOf(slot))
+            reportTopLine(slot)
+        }
+        reportFits(slot)
+    }
+
+    /** The last top line announced, as its chapter, chunk and offset, so a scroll inside one line says nothing. */
+    private var reportedTopLine: Triple<Long, Int, Int>? = null
+
+    private fun reportTopLine(slot: ChapterSlot) {
+        val anchor = lineAtTop()
+        val chunk = anchor?.let { slot.block.chunkViews.indexOf(it.view) } ?: -1
+        val key = Triple(slot.chapter.chapterId, chunk, anchor?.offset ?: -1)
+        if (key == reportedTopLine) return
+        reportedTopLine = key
+        val line = anchor?.takeIf { chunk >= 0 }?.let {
+            val prefix = slot.shownPrefixes[chunk]
+            (0 until chunk).sumOf(slot::shownCount) + prefix[it.offset.coerceIn(0, prefix.lastIndex)]
+        }
+        callbacks.onTopLine(slot.chapter.chapterId, line)
+    }
+
+    /** The chunk view and offset of counted character [line] of [slot]'s chapter, or null past its text. */
+    private fun textLineOf(slot: ChapterSlot, line: Int): Pair<TextView, Int>? {
+        var left = line
+        slot.block.chunkViews.forEachIndexed { index, view ->
+            val count = slot.shownCount(index)
+            if (left < count) return shownCharOffset(view.text, left)?.let { view to it }
+            left -= count
+        }
+        return null
+    }
+
+    /**
+     * The reader moved the page themselves, which ends every landing still to come: applied later, it would
+     * take them back from what they scrolled to, and until it was gone nothing they read was reported. Only
+     * what they ask for counts. Auto-scroll, a read-aloud follow and a seek move the page on the reader's
+     * behalf, and a seek names a landing of its own.
+     */
+    private fun readerMoved() {
+        slots.forEach {
+            it.landing = null
+            it.shortLanding = null
+            cancelImageWait(it)
+        }
+    }
+
+    /** Lands [slot]'s share without its pictures once [CHAPTER_IMAGE_WAIT_MS] has passed. A main-looper
+     *  handler rather than the recycler's, whose posts never run while it is detached. */
+    private fun waitOutImages(slot: ChapterSlot) {
+        if (slot.imageWait != null) return
+        val wait = Runnable {
+            slot.imageWait = null
+            slot.imageWaitOver = true
+            if (slot.landing is Landing.Share) land(slot)
+            // After the landing, in the same pass, so no frame shows the chapter's top between the two.
+            syncResumeVeil()
+        }
+        slot.imageWait = wait
+        mainHandler.postDelayed(wait, CHAPTER_IMAGE_WAIT_MS)
+        syncResumeVeil()
+    }
+
+    private fun cancelImageWait(slot: ChapterSlot) {
+        slot.imageWait?.let(mainHandler::removeCallbacks)
+        slot.imageWait = null
+        syncResumeVeil()
+    }
+
+    /** A wait running is exactly a percent landing held on its pictures. */
+    private fun syncResumeVeil() = resumeVeil.set(slots.any { it.imageWait != null })
+
+    /** The last fit answer sent per chapter, so a scroll that changes nothing says nothing. */
+    private val reportedFits = mutableMapOf<Long, Boolean>()
+
+    /** The same test [ChapterScrollProgress] makes when it reports such a chapter at 0. Held while its
+     *  images load, as [reportEnds] is: a step forward reads a chapter that fits, and until they land
+     *  a long illustrated one measures short. Their landing lays the column out, which reports it. */
+    private fun reportFits(slot: ChapterSlot) {
+        if (!slot.rendered || slot.block.imagesLoading) return
+        val (_, height) = boundsOf(slot) ?: return
+        val fits = height <= recycler.height
+        val id = slot.chapter.chapterId
+        if (reportedFits.put(id, fits) != fits) callbacks.onChapterFits(id, fits)
+    }
+
+    /** Chapters whose last line has been on screen, each told once. */
+    private val reportedEnds = mutableSetOf<Long>()
+
+    /** The WebView page's `reportEnds`: held while a chapter's images load, since until they land it
+     *  measures short and would be read the moment it opened. */
+    private fun reportEnds() {
+        slots.forEach { slot ->
+            val id = slot.chapter.chapterId
+            if (!slot.rendered || slot.block.imagesLoading || id in reportedEnds) return@forEach
+            val (top, height) = boundsOf(slot) ?: return@forEach
+            if (top + height > recycler.height) return@forEach
+            reportedEnds += id
+            callbacks.onChapterEndSeen(id)
+        }
+    }
+
+    /**
+     * Zero rather than a whole while the chapter has no measured height. Reporting completion there
+     * would mark the chapter read and retire its download before it had been seen.
+     */
+    private fun progressOf(slot: ChapterSlot): ChapterProgress.Percent {
+        val none = ChapterProgress.Percent(0)
+        if (!slot.rendered) return none
+        if (paged) {
+            val (pages, itemTop) = pagesOf(slot) ?: return none
+            val index = NovelPaging.pageAt(pages, (readingTop() - itemTop).toFloat())
+            return NovelPaging.progressOf(pages, index, slot.block.container.top.toFloat(), scrollableOf(slot))
+        }
+        val (top, height) = boundsOf(slot) ?: return none
+        return ChapterProgress.Percent.of(ChapterScrollProgress.fractionOf(top, height, recycler.height).toDouble())
+    }
+
+    /** [slot]'s scroll range, which a paged position is a share of so it reopens the same either way. */
+    private fun scrollableOf(slot: ChapterSlot): Float = (slot.block.container.height - recycler.height).toFloat()
+
+    /** Only a change is announced, because the scroll listener runs on every frame. */
+    private fun reportVisibleChapter() {
+        val id = visibleSlot()?.chapter?.chapterId ?: return
+        if (id == reportedVisibleId) return
+        reportedVisibleId = id
+        callbacks.onVisibleChapter(id)
+    }
+
+    /** The chapter being read: the first the viewport has any of on screen, which is how the webtoon
+     *  viewer resolves the same question. Null before the recycler has laid anything out. */
+    private fun visibleSlot(): ChapterSlot? {
+        val manager = recycler.layoutManager as? LinearLayoutManager ?: return null
+        // Paged, the margin above the page is masked, and the list counts nothing as visible inside the screen
+        // of padding it holds below, so the chapter is the one holding the page's top.
+        if (paged) {
+            val probe = readingTop()
+            val item = recycler.children.firstOrNull { it.top <= probe && it.bottom > probe } ?: return null
+            return adapter.slotAt(recycler.getChildAdapterPosition(item))
+        }
+        val position = manager.findFirstVisibleItemPosition()
+        return adapter.slotAt(position)
+    }
+
+    /**
+     * Where this chapter's text sits in the viewport, and how tall it is. The item view is not the
+     * answer: it also holds the seam marker above the text, and counting that would have the reader
+     * a few percent into a chapter before its first line. The end marker below the last chapter is
+     * left out for the same reason, or its end would count as seen only once the marker was.
+     *
+     * Null until the recycler has laid this chapter out, and again once it scrolls out of the window.
+     */
+    private fun boundsOf(slot: ChapterSlot): Pair<Int, Int>? {
+        val position = adapter.positionOf(slot).takeIf { it >= 0 } ?: return null
+        val item = recycler.layoutManager?.findViewByPosition(position) ?: return null
+        val text = slot.block.container
+        return (item.top + text.top) to text.height
+    }
+
+    /**
+     * Puts the reader [fraction] of the way through [slot]. A chapter shorter than the viewport has no
+     * room to seek inside itself, so any fraction lands on its start, as the WebView page's seek does.
+     * That start is its first line rather than its item: the marker above means the two differ.
+     */
+    private fun scrollWithin(slot: ChapterSlot, progress: ChapterProgress) {
+        if (paged) {
+            showPage(slot) { pages ->
+                when (progress) {
+                    is ChapterProgress.Pages -> NovelPaging.indexFor(progress.fraction, pages.size)
+                    is ChapterProgress.Percent ->
+                        NovelPaging.landingIndex(
+                            pages,
+                            progress,
+                            slot.block.container.top.toFloat(),
+                            scrollableOf(slot),
+                        )
+                }
+            }
+            return
+        }
+        val (top, height) = boundsOf(slot) ?: return
+        scrollColumnBy(ChapterScrollProgress.offsetFor(progress.fraction, height, recycler.height) + top)
+    }
+
+    /** Where reading starts down the screen: in paged reading the top of a page, which keeps a chapter's own top
+     *  margin clear above it, and while scrolling the screen's edge. */
+    private fun readingTop(): Int = if (paged) pageMargins().first else 0
+
+    private fun pageMargins(): Pair<Int, Int> =
+        settings?.let { NovelTextStyle.verticalMarginsPx(it, context, topInsetPx) } ?: (0 to 0)
+
+    /** How much of the column a page shows: the screen less the margins a chapter keeps above and below. */
+    private fun pageContentHeight(): Float = pageMargins().let { (top, bottom) ->
+        (recycler.height - top - bottom).toFloat()
+    }
+
+    /**
+     * [slot]'s pages in its item's own pixels, cut by [NovelPaging] from its laid-out lines and the markers and
+     * failures above and below them, and where the item's top sits; null while the list has not laid it out.
+     */
+    private fun pagesOf(slot: ChapterSlot): Pair<List<NovelPaging.Page>, Int>? {
+        val position = adapter.positionOf(slot).takeIf { it >= 0 } ?: return null
+        val item = recycler.layoutManager?.findViewByPosition(position) as? ViewGroup ?: return null
+        val holder = recycler.getChildViewHolder(item) as? BlockAdapter.Holder ?: return null
+        val container = slot.block.container
+        val others = item.children.filter { it !== container && it.isVisible && it.height > 0 }.toList()
+        val height = pageContentHeight()
+        val geometry = buildList {
+            add(height)
+            add(container.top)
+            others.forEach {
+                add(it)
+                add(it.top)
+                add(it.bottom)
+            }
+            slot.block.chunkViews.forEach {
+                add(it.layout)
+                add(it.top + it.totalPaddingTop)
+            }
+        }
+        slot.cut?.takeIf { it.first == geometry }?.let { return it.second to item.top }
+        val bands = mutableListOf<NovelPaging.Band>()
+        others.forEach { bands += NovelPaging.Band(it.top.toFloat(), it.bottom.toFloat(), alone = it === holder.seam) }
+        slot.block.chunkViews.forEach { chunk ->
+            val layout = chunk.layout ?: return@forEach
+            val base = container.top + chunk.top + chunk.totalPaddingTop
+            for (line in 0..<layout.lineCount) {
+                bands += NovelPaging.Band(
+                    (base + layout.getLineTop(line)).toFloat(),
+                    (base + layout.getLineBottom(line)).toFloat(),
+                )
+            }
+        }
+        val pages = NovelPaging.cut(bands, height).also { slot.cut = geometry to it }
+        return pages to item.top
+    }
+
+    /** The chapter at the reading line, its pages, and which of them holds that line. */
+    private class PageAt(val slot: ChapterSlot, val pages: List<NovelPaging.Page>, val index: Int, val itemTop: Int)
+
+    private fun pageAt(): PageAt? {
+        val slot = visibleSlot() ?: return null
+        val (pages, itemTop) = pagesOf(slot) ?: return null
+        if (pages.isEmpty()) return null
+        return PageAt(slot, pages, NovelPaging.pageAt(pages, (readingTop() - itemTop).toFloat()), itemTop)
+    }
+
+    /** Turns a page by [NovelPaging.turn], into the chapter beside this one at either end, and past the window by
+     *  stepping chapters, as a scroll's swipe does. */
+    private fun turnPage(forward: Boolean) {
+        if (resumeVeil.isUp || redraw != null) return
+        if (settings?.pageTransitions == true) {
+            slide.turn(leftward = forward != pageLayout.isRtl) { turnPageNow(forward) }
+        } else {
+            turnPageNow(forward)
+        }
+    }
+
+    private fun turnPageNow(forward: Boolean) {
+        readerMoved()
+        val at = pageAt() ?: return slide.finish()
+        val window = joined().map { it.chapter.chapterId }
+        when (val turn = NovelPaging.turn(window, at.slot.chapter.chapterId, at.index, at.pages.size, forward)) {
+            is NovelPaging.Turn.Within -> showPage(at.slot, turned = true) { turn.index }
+            is NovelPaging.Turn.FirstOf -> slotOf(turn.chapterId)?.let { showPage(it, turned = true) { 0 } }
+            is NovelPaging.Turn.LastOf -> slotOf(turn.chapterId)?.let { slot ->
+                showPage(slot, turned = true) { it.lastIndex }
+            }
+            is NovelPaging.Turn.Beyond -> {
+                slide.finish()
+                callbacks.onStepChapter(turn.forward)
+            }
+        }
+    }
+
+    private fun slotOf(chapterId: Long) = joined().firstOrNull { it.chapter.chapterId == chapterId }
+
+    /**
+     * Shows the page [pick] chooses from [slot]'s pages, its first line at [readingTop]. A chapter the list has
+     * not laid out has nothing to measure, so it is brought in first and the page picked once it has laid out,
+     * with that layout's frame skipped so its first page never shows on the way to its last.
+     */
+    private fun showPage(slot: ChapterSlot, turned: Boolean = false, pick: (List<NovelPaging.Page>) -> Int) {
+        val manager = recycler.layoutManager as LinearLayoutManager
+        val position = adapter.positionOf(slot).takeIf { it >= 0 } ?: return
+        val measured = pagesOf(slot)
+        if (measured != null) {
+            placePage(slot, position, measured.first, turned, pick)
+            return
+        }
+        manager.scrollToPositionWithOffset(position, 0)
+        recycler.viewTreeObserver.addOnPreDrawListener(
+            object : ViewTreeObserver.OnPreDrawListener {
+                override fun onPreDraw(): Boolean {
+                    recycler.viewTreeObserver.removeOnPreDrawListener(this)
+                    val pages = pagesOf(slot)?.first ?: return true
+                    placePage(slot, position, pages, turned, pick)
+                    return false
+                }
+            },
+        )
+    }
+
+    private fun placePage(
+        slot: ChapterSlot,
+        position: Int,
+        pages: List<NovelPaging.Page>,
+        turned: Boolean,
+        pick: (List<NovelPaging.Page>) -> Int,
+    ) {
+        if (pages.isEmpty()) return
+        val page = pages[pick(pages).coerceIn(pages.indices)]
+        recycler.stopScroll()
+        pageJumpPending = true
+        shownPageHeight = page.height
+        // The offset counts from the list's top padding.
+        (recycler.layoutManager as LinearLayoutManager)
+            .scrollToPositionWithOffset(position, readingTop() - recycler.paddingTop - page.top.roundToInt())
+        recycler.invalidate()
+        beforeNextDraw { pageShown(slot, turned) }
+    }
+
+    /** Says where the reader now is: a jump to a position lays the list out without the scroll that reports. */
+    private fun pageShown(slot: ChapterSlot, turned: Boolean) {
+        pageJumpPending = false
+        reportVisibleChapter()
+        report(callbacks.onProgressChanged)
+        report(callbacks.onProgressSettled)
+        reportEnds()
+        showTallPictures()
+        markShownPage()
+        if (turned && visibleSlot() === slot) {
+            // The new page is placed, so it slides in from beside the copy; it draws on the slide's first frame.
+            slide.pageDrawn()
+            callbacks.onPageTurned()
+        }
+    }
+
+    private fun markShownPage() {
+        val at = pageAt() ?: return
+        shownPage.value = ShownPage(at.slot.chapter.chapterId to at.index, ready = !at.slot.block.imagesLoading)
+        callbacks.onPageShown(at.index, at.pages.size)
+    }
+
+    /**
+     * Puts the page holding the reading line back on screen whole once the list has next laid out, since whatever
+     * moved the column (a landing, a restyle, a picture arriving, a read-aloud follow) can leave it between pages.
+     */
+    private fun requestSnap() {
+        if (!paged || snapPending) return
+        snapPending = true
+        beforeNextDraw {
+            snapPending = false
+            snap()
+        }
+    }
+
+    private fun snap() {
+        // A landing or a redraw still to come moves the column again, and the scroll it lands with asks again.
+        // A page jump not yet laid out would be measured where the column still is and undone, and the scroll its
+        // layout reports asks again.
+        if (pageJumpPending || redraw != null || slots.any { it.landing != null }) return
+        // A correction runs in this same pass, and may not scroll at all.
+        if (correctionPending) {
+            recycler.post(::requestSnap)
+            return
+        }
+        val at = pageAt() ?: return
+        val page = at.pages[at.index]
+        if (abs(at.itemTop + page.top - readingTop()) >= 1f) {
+            // The same jump from the same place did not land last time, and would not this time either.
+            val attempt = Triple(at.slot.chapter.chapterId, at.index, at.itemTop)
+            if (attempt == failedSnap) return
+            failedSnap = attempt
+            showPage(at.slot) { at.index }
+            return
+        }
+        failedSnap = null
+        if (shownPageHeight != page.height) {
+            shownPageHeight = page.height
+            recycler.invalidate()
+        }
+        markShownPage()
+    }
+
+    /** The chapter's text is set, so it joins the list, restyled first if the settings moved on while
+     *  it rendered, since a restyle then had no views of it to reach. */
+    private fun join(slot: ChapterSlot) {
+        settings?.let { restyle(slot, it) }
+        slot.rendered = true
+        adapter.show(joined())
+        // A chapter joining above one headed for a landing that the list has never laid out would take the
+        // screen: with no child of it to anchor on, the list lays out from the top, and the landing waits
+        // for a layout of a chapter that is now off screen. So the list starts on the headed chapter.
+        slots.firstOrNull { it.landing != null && it.rendered && boundsOf(it) == null }?.let { headed ->
+            (recycler.layoutManager as LinearLayoutManager).scrollToPositionWithOffset(adapter.positionOf(headed), 0)
+        }
+        // Room below a line that landed short, which lands again unless the reader has moved off it.
+        val shortAbove = slots.take(slots.indexOf(slot)).filter { it.shortLanding != null }
+        if (shortAbove.isNotEmpty()) beforeNextDraw { shortAbove.forEach(::reLand) }
+        // With no chapter headed anywhere this is the window growing around the reader, which must not
+        // move them. Every chapter is landed, not only this one: a line near a chapter's end waits for
+        // the chapter below it to join.
+        if (slots.none { it.landing != null }) return
+        // Once the freshly set text is measured, since before that the chapter has no height, and before that
+        // layout is drawn, which showed the chapter's start for a frame. Read then rather than now, so a seek
+        // that lands in between is the one applied.
+        beforeNextDraw { joined().forEach(::land) }
+    }
+
+    /**
+     * Puts the reader where [slot]'s landing names and clears it, and only then: one that cannot be applied
+     * yet stays for the column's next layout. A line near the chapter's end can need the chapter below it
+     * for room: a redraw's line waits for the redraw to add it, and a rebuilt renderer's lands as far as it
+     * can and is kept for that chapter ([holdShort]).
+     * A share of zero is a real position: the first line, below the item's marker.
+     */
+    private fun land(slot: ChapterSlot) {
+        // A layout still to come moves the text, so what it measures now is where the chapter was.
+        if (slot.block.container.isLayoutRequested) return
+        when (val landing = slot.landing ?: return) {
+            is Landing.Share -> {
+                // The share is of the chapter's height with its images in it, and they land after the
+                // text, so seeking now would measure the chapter short and put the reader past text
+                // they have not read. Held until they arrive, which lays the column out again, or until
+                // the wait for them runs out. A chapter the list has not laid out has nowhere to scroll,
+                // and laying it out comes back here.
+                if (boundsOf(slot) == null) return
+                val share = landing.progress.fraction
+                if (ResumeVeil.waitsForPictures(share, slot.block.imagesLoading, slot.imageWaitOver)) {
+                    waitOutImages(slot)
+                    return
+                }
+                cancelImageWait(slot)
+                // Before the scroll, so the report the scroll sends is the landed position's.
+                slot.landing = null
+                val before = scrolled
+                scrollWithin(slot, landing.progress)
+                // A chapter with no room to move sends no scroll, and a scroll is all that reports, so the
+                // held position is said here: without it the model kept the saved one, as the page did.
+                // Paged, the jump lays out later and pageShown reports the landed page; a report now would
+                // be the column's old place, which the model reads as the reader moving.
+                if (!paged && scrolled == before) report(callbacks.onProgressChanged)
+            }
+            is Landing.Text -> {
+                // Held for a layout but not for the images: once landed, one arriving above the line is
+                // growth the line is held across, where waiting left the chapter's start on screen meanwhile.
+                if (boundsOf(slot) == null) return
+                val (view, offset) = textLineOf(slot, landing.line) ?: run {
+                    // Past the text, as a count taken from other text can be. Landing at its end read the
+                    // chapter; the saved share is where the reader was, and it waits for the pictures.
+                    slot.landing = Landing.Share(landing.progress)
+                    land(slot)
+                    return
+                }
+                val top = lineTopOf(view, offset) ?: return
+                slot.landing = null
+                val before = scrolled
+                scrollColumnBy(top - readingTop())
+                if (lineTopOf(view, offset) != readingTop()) holdShort(slot, landing)
+                if (scrolled == before) report(callbacks.onProgressChanged)
+            }
+            is Landing.Line -> {
+                val view = slot.block.chunkViews.getOrNull(landing.chunk) ?: return
+                val top = lineTopOf(view, landing.offset) ?: return
+                scrollColumnBy(top - landing.y)
+                if (lineTopOf(view, landing.offset) == landing.y) slot.landing = null
+            }
+        }
+    }
+
+    /** Keeps [landing], which the list stopped short of, for a chapter joining below to make room. */
+    private fun holdShort(slot: ChapterSlot, landing: Landing) {
+        slot.landing = null
+        slot.shortLanding = ShortLanding(landing, topLineAnchor())
+    }
+
+    private fun topLineAnchor(): Pair<TextView, Int>? = lineAtTop()?.let { it.view to it.offset }
+
+    /** The landing [holdShort] kept, while the reader is still on the line it stopped at. */
+    private fun ChapterSlot.stillShort(): Landing? = shortLanding?.takeIf { it.stoppedAt == topLineAnchor() }?.landing
+
+    /** Lands a short line again once a chapter below gives it room. Short again, or not yet measurable, it
+     *  is kept once more rather than left pending, which would hold every report. */
+    private fun reLand(slot: ChapterSlot) {
+        val landing = slot.stillShort()
+        slot.shortLanding = null
+        slot.landing = landing ?: return
+        land(slot)
+        slot.landing?.let { holdShort(slot, it) }
+    }
+
+    @SuppressLint("ClickableViewAccessibility")
+    private fun createChunkView(settings: NovelReaderSettings): TextView =
+        TextView(context).apply {
+            layoutParams = ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+            )
+            NovelTextStyle.apply(this, settings, context, fontManager)
+            setTextIsSelectable(textSelectable)
+            // Selectable text has one tap owner, the watcher, so a click listener here would double
+            // every tap: the Editor swallows a click on the text but not one past its last line.
+            // Without selection the click is the owner instead, because LinkOnlyMovementMethod
+            // cancels the click a tap on a link queued and lets every other tap through to here.
+            if (!textSelectable) setOnClickListener { onTap(touchDownX, touchDownY) }
+            setOnTouchListener(dragEndsPress)
+            // Off on both branches: the click is dispatched by the movement method below, so leaving
+            // it on would let the framework fire its own unchecked intent for the same tap.
+            linksClickable = false
+            movementMethod = if (textSelectable) {
+                ArrowKeyMovementMethod.getInstance()
+            } else {
+                LinkOnlyMovementMethod
+            }
+        }
+
+    /** The viewport's own scroll, which a paged list takes even while a finger is down: a picture landing or a
+     *  chapter arriving mid-tap must still hold the reading line in place. */
+    private fun scrollColumnBy(dy: Int) {
+        val paged = pagedLayoutManager
+        paged?.scrollingItself = true
+        try {
+            recycler.scrollBy(0, dy)
+        } finally {
+            paged?.scrollingItself = false
+        }
+    }
+
+    /** Refuses a finger's scroll, so paged reading moves only a page at a time. The viewport's own scrolls go
+     *  through [scrollColumnBy], and its jumps by position are never refused. */
+    private class PagedLayoutManager(context: Context) : LinearLayoutManager(context) {
+        var fingerDown = false
+        var scrollingItself = false
+
+        override fun canScrollVertically() = !fingerDown || scrollingItself
+
+        // A tapped chunk takes focus, and the list scrolls a focused child into what it counts as visible, which the
+        // screen of padding below the last chapter leaves empty: every tap slid the page off itself.
+        override fun requestChildRectangleOnScreen(
+            parent: RecyclerView,
+            child: View,
+            rect: Rect,
+            immediate: Boolean,
+            focusedChildVisible: Boolean,
+        ) = false
+    }
+
+    /** One item per chapter in the window. */
+    private inner class BlockAdapter : RecyclerView.Adapter<BlockAdapter.Holder>() {
+
+        private var shown: List<ChapterSlot> = emptyList()
+
+        fun slotAt(position: Int): ChapterSlot? = shown.getOrNull(position)
+
+        fun positionOf(slot: ChapterSlot): Int = shown.indexOf(slot)
+
+        /**
+         * Dispatches the difference rather than invalidating everything, because a full invalidation
+         * throws the reading position away: the layout manager keeps its anchor across an insert or
+         * a removal it is told about, and cannot across a dataset change it is not.
+         */
+        fun show(next: List<ChapterSlot>) = keepingReaderStill {
+            val previous = shown
+            shown = next.toList()
+            DiffUtil.calculateDiff(SlotDiff(previous, shown)).dispatchUpdatesTo(this)
+        }
+
+        /** Runs [change] and then [keepReaderStill], measured against the layout still showing so the
+         *  change can be taken back out of it. */
+        private inline fun keepingReaderStill(change: () -> Unit) {
+            val anchor = visibleSlot()?.takeIf { canMeasureForCorrection() }
+            val before = anchor?.let { boundsOf(it)?.first }
+            val scrolledBefore = scrolled
+            change()
+            if (anchor != null && before != null) keepReaderStill(anchor, before, scrolledBefore)
+        }
+
+        /**
+         * A seam or an edge's failure turning up or going away is growth above the reading chapter's
+         * text but inside its item, which the layout manager anchors by the item's top, so the chapter
+         * being read is put back once the change has laid out. Measured in `RecyclerPrependPositionTest`.
+         * A window changes as the reader crosses a seam, usually mid-fling, so what they scrolled in
+         * between is theirs and stays: only what the layout moved is taken back.
+         */
+        private fun keepReaderStill(anchor: ChapterSlot, before: Int, scrolledBefore: Long) = postCorrection {
+            val after = boundsOf(anchor)?.first ?: return@postCorrection 0
+            after - before + (scrolled - scrolledBefore).toInt()
+        }
+
+        /**
+         * Identity is the chapter, and a chapter's own view never needs rebinding: its text is set into
+         * the block, not into the holder. Its seam does, since the seam names the chapter above, so that
+         * is its content: the rebind lands in the same layout pass as the neighbour arriving, rather than
+         * growing the item in a pass of its own after the list has already settled around it.
+         */
+        private inner class SlotDiff(
+            private val before: List<ChapterSlot>,
+            private val after: List<ChapterSlot>,
+        ) : DiffUtil.Callback() {
+
+            override fun getOldListSize() = before.size
+
+            override fun getNewListSize() = after.size
+
+            override fun areItemsTheSame(oldItemPosition: Int, newItemPosition: Int) =
+                before[oldItemPosition].chapter.chapterId == after[newItemPosition].chapter.chapterId
+
+            override fun areContentsTheSame(oldItemPosition: Int, newItemPosition: Int) =
+                before.getOrNull(oldItemPosition - 1)?.chapter?.chapterId ==
+                    after.getOrNull(newItemPosition - 1)?.chapter?.chapterId
+
+            override fun getChangePayload(oldItemPosition: Int, newItemPosition: Int): Any = MARKERS_CHANGED
+        }
+
+        /** The seam marker sits above the chapter rather than between two items, so a position still
+         *  names a chapter and the geometry stays a chapter's own bounds. The end marker and the two
+         *  failure views are fixed children for the same reason: a window edge is a place in the text,
+         *  not an item. */
+        inner class Holder(
+            val root: LinearLayout,
+            var head: NovelBoundaryFailureView,
+            var seam: NovelChapterSeamView,
+            var end: NovelChapterSeamView,
+            var tail: NovelBoundaryFailureView,
+        ) : RecyclerView.ViewHolder(root) {
+            /** What [head] and [tail] draw, null while each is hidden. */
+            var headFailure: NovelReaderViewModel.BoundaryFailure? = null
+            var tailFailure: NovelReaderViewModel.BoundaryFailure? = null
+        }
+
+        override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): Holder {
+            val color = readerTextColor()
+            val head = NovelBoundaryFailureView(parent.context, color).apply { isVisible = false }
+            val seam = NovelChapterSeamView(parent.context, seam = null, color)
+            val end = NovelChapterSeamView(parent.context, seam = null, color)
+            val tail = NovelBoundaryFailureView(parent.context, color).apply { isVisible = false }
+            val root = LinearLayout(parent.context).apply {
+                orientation = LinearLayout.VERTICAL
+                layoutParams = RecyclerView.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                )
+                addView(head)
+                addView(seam)
+                addView(end)
+                addView(tail)
+            }
+            return Holder(root, head, seam, end, tail)
+        }
+
+        /** A marker-only change rebinds just the markers and failure boxes: a full bind re-adds the chapter's text container,
+         *  re-measuring every chunk of what may be the chapter on screen. */
+        override fun onBindViewHolder(holder: Holder, position: Int, payloads: MutableList<Any>) {
+            if (payloads.isNotEmpty() && payloads.all { it === MARKERS_CHANGED }) {
+                bindSeam(holder, position)
+                bindEnd(holder, position)
+                bindBoundaries(holder, position)
+            } else {
+                onBindViewHolder(holder, position)
+            }
+        }
+
+        override fun onBindViewHolder(holder: Holder, position: Int) {
+            holder.root.findChapterContainer()?.let(holder.root::removeView)
+            val container = shown.getOrNull(position)?.block?.container ?: return
+            (container.parent as? ViewGroup)?.removeView(container)
+            // Between the seam above the chapter and the end marker or failure below it, which is the
+            // order the reader scrolls through them in.
+            holder.root.addView(container, CHAPTER_CHILD_INDEX)
+            bindSeam(holder, position)
+            bindEnd(holder, position)
+            bindBoundaries(holder, position)
+            if (!textSelectable) {
+                holder.root.setOnClickListener { onReaderTap(touchDownX, touchDownY) }
+                holder.root.setOnTouchListener(dragEndsPress)
+            }
+        }
+
+        /** Lets go of the chapter, since a holder can sit in the pool long after its chapter left the
+         *  window, and would keep that chapter's text and decoded images alive until it is reused. */
+        override fun onViewRecycled(holder: Holder) {
+            holder.root.findChapterContainer()?.let(holder.root::removeView)
+        }
+
+        /** The chapter's own container, which is whatever child is not one of the four fixtures. */
+        private fun LinearLayout.findChapterContainer(): View? = (0 until childCount)
+            .map(::getChildAt)
+            .firstOrNull { it !is NovelBoundaryFailureView && it !is NovelChapterSeamView }
+
+        /**
+         * The marker above a chapter, which names the one that finished as well as this one. It
+         * therefore depends on the chapter's neighbour rather than on the chapter, so it has to be
+         * re-decided whenever the window changes and not only when a holder is first bound: a
+         * chapter opened on its own has nothing above it, and a later prepend gives it one.
+         */
+        private fun bindSeam(holder: Holder, position: Int) {
+            val finished = shown.getOrNull(position - 1)?.chapter
+            val seam = finished?.let { NovelSeam.between(it, shown[position].chapter) }
+                ?.drawn(settings?.alwaysShowChapterTransition)
+            val color = readerTextColor()
+            if (seam == holder.seam.seam && color == holder.seam.textColor) return
+            holder.seam = holder.root.replace(holder.seam, NovelChapterSeamView(holder.root.context, seam, color))
+        }
+
+        /** The marker below the novel's last chapter, which depends on that chapter and the text colour
+         *  alone, so a full bind and a colour change are the only points it can change. */
+        private fun bindEnd(holder: Holder, position: Int) {
+            val end = NovelSeam.end(shown[position].chapter)?.drawn(settings?.alwaysShowChapterTransition)
+            val color = readerTextColor()
+            if (end == holder.end.seam && color == holder.end.textColor) return
+            holder.end = holder.root.replace(holder.end, NovelChapterSeamView(holder.root.context, end, color))
+        }
+
+        /**
+         * Only the two ends of the window can have run out of text, so only they draw a failure.
+         * A single-chapter window is both ends at once, which is the shape a first load leaves.
+         */
+        private fun bindBoundaries(holder: Holder, position: Int) {
+            val color = readerTextColor()
+            val above = failedPrevious.takeIf { position == 0 }
+            if (above != holder.headFailure || color != holder.head.textColor) {
+                holder.headFailure = above
+                holder.head = holder.root.replace(holder.head, failureView(above, forward = false, color))
+            }
+            val below = failedNext.takeIf { position == shown.lastIndex }
+            if (below != holder.tailFailure || color != holder.tail.textColor) {
+                holder.tailFailure = below
+                holder.tail = holder.root.replace(holder.tail, failureView(below, forward = true, color))
+            }
+        }
+
+        private fun failureView(failure: NovelReaderViewModel.BoundaryFailure?, forward: Boolean, color: Int) =
+            NovelBoundaryFailureView(context, color).apply {
+                failure?.let { bind(it.message) { callbacks.onRetryBoundary(forward) } }
+                isVisible = failure != null
+            }
+
+        /**
+         * Swaps [old] for [fresh] in its place. A fresh view rather than new state on the old one: a new
+         * composition is measured in the layout pass that adds it, where a recomposition lands a frame
+         * later and grows the item after the list has settled around it, which carried a short last
+         * chapter off screen and put a correction for the growth a frame too early to see it.
+         */
+        private fun <T : View> LinearLayout.replace(old: View, fresh: T): T {
+            val index = indexOfChild(old)
+            removeViewAt(index)
+            addView(fresh, index)
+            return fresh
+        }
+
+        /** Re-decides every marker and failure box once a failure, the setting that hides seams or the text
+         *  colour has changed. A change notice rather than the bound holders alone, since a holder cached off
+         *  screen would come back with its old one. One above the text the reader is in moves that text, so
+         *  that is taken back. */
+        fun refreshMarkers() = keepingReaderStill { notifyItemRangeChanged(0, shown.size, MARKERS_CHANGED) }
+
+        override fun getItemCount(): Int = shown.size
+    }
+
+    private companion object {
+        /** Chapters the window holds at most: the previous one, the one being read, and as many past
+         *  it as [NovelWindowReach] reaches over chapters that fit on one screen. */
+        const val WINDOW_SIZE = 2 + NovelWindowReach.MAX_FORWARD
+
+        /** Where the chapter's text sits among an item's fixed children: after the failure view for
+         *  the edge above it and the seam marker, before the end marker and the failure view below. */
+        const val CHAPTER_CHILD_INDEX = 2
+
+        /** The one partial change an item takes: what its markers draw, since the chapter above it moved,
+         *  the setting that hides seams changed or the text colour did. */
+        val MARKERS_CHANGED = Any()
+    }
+}
+
+private fun NovelReaderSettings.paragraphShape() =
+    ParagraphShape(paragraphIndent, paragraphSpacing, fontSize, bionicReading, margins.left + margins.right)

@@ -1,0 +1,62 @@
+package raito.novel.registry
+
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.Json
+import raito.domain.novel.LnInstalledPluginMetadata
+import raito.novel.install.canonicalizePluginUrl
+
+/**
+ * One entry from an lnreader plugin registry's `plugins.min.json` (or `plugins.json`). The user pastes
+ * a repo URL at runtime; nothing is bundled in the APK. Reference shape:
+ * `https://raw.githubusercontent.com/LNReader/lnreader-plugins/plugins/v3.0.0/.dist/plugins.min.json`.
+ * The required fields ([id], [name], [version], [site], [lang], [url]) are present on every plugin in
+ * the upstream registry; the optional ones only on a subset.
+ */
+@Serializable
+data class LnRegistryEntry(
+    /** Stable plugin identifier; matches `plugin.id` at runtime (e.g. `novelbin`). */
+    val id: String,
+    val name: String,
+    val version: String,
+    val site: String,
+    val lang: String,
+    /** Compiled `.js` URL for the plugin source. */
+    val url: String,
+    val iconUrl: String? = null,
+    /** Optional URL to a stylesheet the plugin ships for its chapter markup, which the WebView rendering
+     *  mode applies, as LNReader's reader does. */
+    val customCSS: String? = null,
+)
+
+/** The entry whose script is [canonicalUrl], compared canonical to canonical, as every plugin lookup compares them. */
+fun List<LnRegistryEntry>.byPluginUrl(canonicalUrl: String): LnRegistryEntry? =
+    firstOrNull { canonicalizePluginUrl(it.url) == canonicalUrl }
+
+/** The record an install from this entry stores, so a later load knows its icon, language and stylesheet. */
+fun LnRegistryEntry.toMetadata() = LnInstalledPluginMetadata(
+    pluginId = id,
+    iconUrl = iconUrl,
+    version = version,
+    lang = lang,
+    customCssUrl = customCSS,
+)
+
+/**
+ * Pure deserialization of an lnreader registry JSON blob. The network fetch lives in
+ * [raito.novel.install.LnPluginInstaller.fetchRepo]; keeping the parser separate makes it
+ * unit-testable without any Android / OkHttp dependency.
+ */
+object LnRegistry {
+
+    private val json = Json {
+        ignoreUnknownKeys = true
+        isLenient = true
+    }
+
+    /**
+     * @throws kotlinx.serialization.SerializationException on malformed JSON, missing required
+     * fields, or wrong types. Callers should catch and surface a user-readable error.
+     */
+    fun parse(jsonText: String): List<LnRegistryEntry> =
+        json.decodeFromString(jsonText)
+}

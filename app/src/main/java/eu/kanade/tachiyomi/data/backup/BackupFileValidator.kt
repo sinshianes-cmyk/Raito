@@ -1,0 +1,159 @@
+package eu.kanade.tachiyomi.data.backup
+
+import android.content.Context
+import android.net.Uri
+import dev.zacsweers.metro.Inject
+import eu.kanade.tachiyomi.data.backup.models.BackupExtension
+import eu.kanade.tachiyomi.data.backup.models.BackupExtensionStore
+import eu.kanade.tachiyomi.data.backup.models.BackupFields
+import eu.kanade.tachiyomi.data.backup.models.BackupNovelSource
+import eu.kanade.tachiyomi.data.backup.models.BackupPreference
+import eu.kanade.tachiyomi.data.backup.models.BackupSource
+import eu.kanade.tachiyomi.data.backup.models.PreferenceValue
+import eu.kanade.tachiyomi.data.backup.models.novelSourceName
+import eu.kanade.tachiyomi.data.track.TrackerManager
+import kotlinx.coroutines.CancellationException
+import kotlinx.serialization.protobuf.ProtoBuf
+import raito.data.backup.RestoreInstallPlan
+import raito.data.backup.RestoreInstallSources
+import raito.data.backup.mangaTrackScores
+import raito.data.backup.novelSourceAndTrackerIds
+import raito.novel.source.NovelSourceManager
+import tachiyomi.domain.source.service.SourceManager
+
+@Inject
+class BackupFileValidator(
+    // RK: kept, unlike upstream: the streaming reader needs it where upstream decodes the whole file.
+    private val context: Context,
+    private val sourceManager: SourceManager,
+    private val trackerManager: TrackerManager,
+    // RK: novels validate against their own source registry + the shared tracker manager.
+    private val novelSourceManager: NovelSourceManager,
+    private val parser: ProtoBuf,
+    private val restoreInstalls: RestoreInstallSources, // RK: what the backup lacks here, and where it is listed
+) {
+
+    /**
+     * Checks for critical backup file data.
+     *
+     * RK: streams the backup field by field (via [BackupProtoReader]) and decodes only the manga,
+     * source, and novel entries it needs, instead of re-inflating the whole file, which OOMs on a
+     * large backup (unseensnick/Raito#53).
+     *
+     * @return List of missing sources or missing trackers. RK: and the extensions to install.
+     */
+    suspend fun validate(uri: Uri): Results {
+        // RK --> the novel registry is empty until something loads the plugins, and a cold open straight to
+        // restore is one, so without this every installed novel source reports as missing.
+        novelSourceManager.ensureLoaded()
+
+        val scanned = scan(uri)
+        val (backupSources, trackerIds, novelSources, novelSourceNames) = scanned
+        // RK <--
+
+        val sources = backupSources.associate { it.sourceId to it.name } // RK: streamed
+        val missingSources = sources
+            .filterKeys { sourceManager.get(it) == null }
+            .map { (id, name) ->
+                // Some backups store the id as the name, and sources without a stub were backed up with no name
+                if (name.isBlank() || name.toLongOrNull() != null) {
+                    sourceManager.getOrStub(id).toString()
+                } else {
+                    name
+                }
+            }
+            .distinct()
+            .sorted()
+
+        val missingTrackers = trackerIds // RK: streamed, manga and novel ids in one set
+            .mapNotNull { trackerManager.get(it) }
+            .filter { !it.isLoggedIn }
+            .map { it.name }
+            .sorted()
+
+        // RK --> fold in novel sources the restore can't satisfy, so the pre-restore warning covers
+        // novels too. A missing novel source shows by the name the backup recorded, or by its id in a
+        // backup older than that list.
+        val missingNovelSources = novelSources
+            .filter { novelSourceManager.get(it) == null }
+            .map(novelSourceNames::novelSourceName)
+
+        return Results(
+            (missingSources + missingNovelSources).distinct().sorted(),
+            missingTrackers,
+            restoreInstalls.plan(
+                restoreInstalls.missing(scanned.backupExtensions, scanned.pluginPreferences),
+                scanned.backupExtensionStores,
+                scanned.pluginPreferences,
+            ),
+        )
+        // RK <--
+    }
+
+    // RK -->
+
+    /**
+     * Throws [IllegalStateException] when the file at [uri] does not decode, and resolves nothing: the
+     * check a freshly written backup needs. Resolving novel sources loads every installed plugin and can
+     * fetch over the network, which [validate] does only because the restore screen shows its answer.
+     */
+    suspend fun checkReadable(uri: Uri) {
+        scan(uri)
+    }
+
+    // Streams the backup field by field and decodes only what validation reads.
+    private suspend fun scan(uri: Uri): Scanned {
+        val scanned = Scanned()
+        val pluginKeys = restoreInstalls.pluginPreferenceKeys
+        try {
+            BackupProtoReader(context).read(uri) { fieldNumber, data ->
+                when (fieldNumber) {
+                    BackupFields.MANGA -> parser.mangaTrackScores(data).forEach { scanned.trackerIds.add(it.first) }
+                    BackupFields.SOURCES ->
+                        scanned.backupSources.add(parser.decodeFromByteArray(BackupSource.serializer(), data))
+                    BackupFields.NOVELS -> parser.novelSourceAndTrackerIds(data).let { (source, trackerIds) ->
+                        scanned.novelSources.add(source)
+                        scanned.trackerIds.addAll(trackerIds)
+                    }
+                    BackupFields.NOVEL_SOURCES -> parser.decodeFromByteArray(BackupNovelSource.serializer(), data).let {
+                        scanned.novelSourceNames[it.sourceId] = it.name
+                    }
+                    BackupFields.EXTENSION_STORES -> scanned.backupExtensionStores.add(
+                        parser.decodeFromByteArray(BackupExtensionStore.serializer(), data),
+                    )
+                    BackupFields.EXTENSIONS ->
+                        scanned.backupExtensions.add(parser.decodeFromByteArray(BackupExtension.serializer(), data))
+                    BackupFields.PREFERENCES ->
+                        parser.decodeFromByteArray(BackupPreference.serializer(), data).let { (key, value) ->
+                            if (key in pluginKeys) scanned.pluginPreferences[key] = value
+                        }
+                }
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            throw IllegalStateException(e)
+        }
+        return scanned
+    }
+
+    private data class Scanned(
+        val backupSources: MutableList<BackupSource> = mutableListOf(),
+        // Both content types share one tracker registry, so one id set covers both.
+        val trackerIds: MutableSet<Long> = mutableSetOf(),
+        val novelSources: MutableSet<String> = mutableSetOf(),
+        // Field 717, absent from a backup made before it existed.
+        val novelSourceNames: MutableMap<String, String> = mutableMapOf(),
+        val backupExtensions: MutableList<BackupExtension> = mutableListOf(),
+        val backupExtensionStores: MutableList<BackupExtensionStore> = mutableListOf(),
+        // The App settings entries that record the installed plugins and plugin repos, by key.
+        val pluginPreferences: MutableMap<String, PreferenceValue> = mutableMapOf(),
+    )
+    // RK <--
+
+    data class Results(
+        val missingSources: List<String>,
+        val missingTrackers: List<String>,
+        val installs: RestoreInstallPlan, // RK: the backup's extension apps and plugins this device lacks
+    )
+}

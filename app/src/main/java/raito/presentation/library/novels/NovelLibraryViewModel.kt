@@ -1,0 +1,505 @@
+package raito.presentation.library.novels
+
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import dev.zacsweers.metro.AppScope
+import dev.zacsweers.metro.ContributesIntoMap
+import dev.zacsweers.metro.Inject
+import dev.zacsweers.metro.binding
+import dev.zacsweers.metrox.viewmodel.ViewModelKey
+import eu.kanade.domain.base.BasePreferences
+import eu.kanade.presentation.manga.DownloadAction
+import eu.kanade.tachiyomi.data.track.TrackerManager
+import eu.kanade.tachiyomi.ui.library.LibraryItem
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.debounce
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.plus
+import mihon.core.metro.AppCoroutineScope
+import mihon.domain.library.model.search.QueryNode
+import raito.domain.category.GetNovelCategories
+import raito.domain.chapter.DownloadCandidates
+import raito.domain.library.ContentType
+import raito.domain.library.RaitoLibraryPreferences
+import raito.domain.manga.AdultContentChecker
+import raito.domain.merge.DownloadTargets
+import raito.domain.merge.MergeGroupRepository
+import raito.domain.merge.MergeScope
+import raito.domain.merge.ReconcileMergedChapters
+import raito.domain.merge.stitchInputChanges
+import raito.domain.novel.NovelChapterRepository
+import raito.domain.novel.NovelGroupCategories
+import raito.domain.novel.NovelMergeManager
+import raito.domain.novel.NovelPreferences
+import raito.domain.novel.NovelRepository
+import raito.domain.novel.downloadedChapterIds
+import raito.domain.novel.interactor.GetCustomNovelInfo
+import raito.domain.novel.interactor.GetNextNovelChapter
+import raito.domain.novel.interactor.GetNovelTracks
+import raito.domain.novel.interactor.NovelGroupChapters
+import raito.domain.novel.interactor.RemoveNovelsFromLibrary
+import raito.domain.novel.interactor.SetNovelCategories
+import raito.domain.novel.interactor.SetNovelReadStatus
+import raito.domain.novel.model.CustomNovelInfo
+import raito.domain.novel.model.LibraryNovel
+import raito.domain.novel.model.NovelChapter
+import raito.domain.novel.model.NovelTrack
+import raito.domain.novel.ownersOf
+import raito.domain.novel.track.toUiTrack
+import raito.domain.source.isInstalled
+import raito.novel.download.NovelDownloadCache
+import raito.novel.download.NovelDownloadManager
+import raito.novel.install.LnPluginInstaller
+import raito.novel.source.NovelSourceManager
+import raito.presentation.library.LibraryBadgePrefs
+import raito.presentation.library.LibrarySearchInputs
+import raito.presentation.library.MergeCollapseInputs
+import raito.presentation.library.adultLookupKeys
+import raito.presentation.library.anyMerged
+import raito.presentation.library.chapterSearchTerms
+import raito.presentation.library.libraryBadgePrefsFlow
+import raito.presentation.library.libraryFilterMatches
+import raito.presentation.library.libraryFilterSettingsFlow
+import raito.presentation.library.libraryItemFilterFields
+import raito.presentation.library.libraryItemQueryFields
+import raito.presentation.library.libraryQueryMatches
+import raito.presentation.library.libraryTrackerMeans
+import raito.presentation.library.libraryTracksFlow
+import raito.presentation.library.memberIdsOf
+import raito.presentation.library.mergedGroupTracks
+import raito.presentation.library.sortedByCategoryPref
+import raito.presentation.library.toQueryOverlay
+import raito.presentation.library.withCustomInfo
+import raito.util.runCatchingCancellable
+import tachiyomi.core.common.preference.TriState
+import tachiyomi.core.common.util.lang.SubscriberGate
+import tachiyomi.core.common.util.lang.launchIO
+import tachiyomi.domain.category.model.Category
+import tachiyomi.domain.library.service.LibraryPreferences
+import tachiyomi.domain.track.model.Track
+import kotlin.time.Duration.Companion.seconds
+
+/**
+ * Drives the novel half of the Library tab: reads favorited novels reactively, shapes
+ * each into the shared [LibraryItem], filters them (LibraryEngine buckets and sorts), and exposes the same
+ * accessor surface the manga model does so `LibraryTab` can feed either. Mihon's library core is
+ * untouched. Selection lives in the shared LibraryEngine, which hands this model the novel ids to act
+ * on; display settings are shared with manga, and tracker filter/sort/group reuse the shared tracker
+ * machinery via [getNovelTracks].
+ */
+@Inject
+@ViewModelKey
+@ContributesIntoMap(AppScope::class, binding = binding<ViewModel>())
+class NovelLibraryViewModel(
+    @AppCoroutineScope private val appScope: CoroutineScope,
+    private val novelRepository: NovelRepository,
+    private val removeNovelsFromLibrary: RemoveNovelsFromLibrary,
+    private val setNovelReadStatus: SetNovelReadStatus,
+    private val novelChapterRepository: NovelChapterRepository,
+    // Deferred on purpose: building the manager restores the persisted queue and resumes the drain,
+    // so taking it directly would start novel downloads merely because the library was opened.
+    private val novelDownloadManager: () -> NovelDownloadManager,
+    private val novelDownloadCache: NovelDownloadCache,
+    private val getNovelCategories: GetNovelCategories,
+    // Per-entry custom title/cover overrides, overlaid on the displayed rows (display-only).
+    private val getCustomNovelInfo: GetCustomNovelInfo,
+    private val setNovelCategories: SetNovelCategories,
+    private val libraryPreferences: LibraryPreferences,
+    private val basePreferences: BasePreferences,
+    private val raitoLibraryPreferences: RaitoLibraryPreferences,
+    private val sourceManager: NovelSourceManager,
+    private val mergeManager: NovelMergeManager,
+    private val mergeGroupRepository: MergeGroupRepository,
+    private val reconcileMergedChapters: ReconcileMergedChapters,
+    private val installer: LnPluginInstaller,
+    private val trackerManager: TrackerManager,
+    private val getNovelTracks: GetNovelTracks,
+    private val getNextNovelChapter: GetNextNovelChapter,
+    private val novelPreferences: NovelPreferences,
+    private val adultContentChecker: AdultContentChecker,
+    private val novelLibraryRows: NovelLibraryRows,
+) : ViewModel() {
+
+    private val subscriberGate = SubscriberGate()
+
+    private val searchQuery = MutableStateFlow<String?>(null)
+
+    private val groupCategories = NovelGroupCategories(getNovelCategories, setNovelCategories)
+
+    // The novel update restrictions gate the custom-interval axis, as the manga ones do for manga.
+    private val filterSettings = libraryFilterSettingsFlow(
+        libraryPreferences,
+        raitoLibraryPreferences,
+        basePreferences,
+        trackerManager,
+        updateRestrictions = novelPreferences.novelUpdateRestrictions().changes(),
+    )
+
+    /** Null until the first build answers, which the derived state reads as still loading. */
+    private val built: StateFlow<State?> =
+        combine(
+            // No category-table input: grouping, its only reader, is LibraryEngine's, which reads the
+            // table itself. Membership still reaches the filter through each row's own categories.
+            // The custom-info overlay rides with the library so a title/cover edit re-emits too.
+            combine(
+                novelLibraryRows.library(),
+                getCustomNovelInfo.subscribeAll(),
+                ::Pair,
+            ),
+            // Debounced so a burst of keystrokes rebuilds the list once, matching the manga library.
+            // No distinctUntilChanged: a StateFlow already conflates equal values. The resolved
+            // `chapter:` id sets ride the slot so the chapter-table scan runs once per query
+            // change, not on every library, download-cache or track tick, as the manga side does.
+            // No pin: manga's 0.25 s is upstream's own literal, kept verbatim for sync, and the
+            // once-per-query scan is a cost choice that changes nothing a user sees. Whole-library novel
+            // tracks (novelId -> tracks) ride the query, read only while a filter, sort, group or the
+            // search uses them, so a search waits for the tracks it reads.
+            libraryTracksFlow(
+                filterSettings,
+                getNovelCategories.subscribe(),
+                libraryPreferences,
+                raitoLibraryPreferences,
+                searchQuery.debounce(0.25.seconds).map { query -> query to resolveChapterMatches(query) },
+                { it.first },
+                getNovelTracks::subscribeAll,
+            ),
+            // No collapse input: collapse only feeds grouping, which LibraryEngine owns, and as an
+            // input here every collapse tap would rebuild the whole filtered novel list for nothing.
+            settingsFlow(),
+        ) { (library, customInfo), searchInputs, settings ->
+            buildState(library, customInfo, searchInputs, settings)
+        }
+            .flowOn(Dispatchers.Default)
+            .stateIn(viewModelScope + subscriberGate, SharingStarted.Eagerly, null)
+
+    val state: StateFlow<State> = combine(
+        built,
+        searchQuery,
+        filterSettings.map { it.isActive }.distinctUntilChanged(),
+    ) { built, searchQuery, hasActiveFilters ->
+        // The query comes from its own holder, never from [built]: that lags the user by a debounce plus
+        // a query, so taking its copy resets the search field to a stale value mid-input and scrambles
+        // fast keystrokes. The selection is not here at all; the engine owns it. The filter icon reads
+        // the preferences directly, as the manga one does, rather than waiting on the tracks [built] waits on.
+        (built ?: State()).copy(searchQuery = searchQuery, hasActiveFilters = hasActiveFilters)
+    }
+        .stateIn(viewModelScope + subscriberGate, subscriberGate.whileSubscribed(5.seconds), State())
+
+    init {
+        // Load the plugin host so the library can resolve each novel's source (lang + source-icon
+        // badges); NovelLibraryRows.library() re-emits the build once the sources register.
+        viewModelScope.launchIO { runCatchingCancellable { installer.ensureLoaded() } }
+        // A newly grouped entry's chapters have no cross-source identities yet, so the deduplicated
+        // unread count would be wrong until something wrote them. Reconciling off the membership flow
+        // covers every merge and unmerge from one place. The membership query re-runs on every write to
+        // the novels table, at the cost of one pass over the grouped novels, and a reconcile runs only
+        // when the answer changed. Stays always-on: a restore can regroup entries while the library
+        // renders nothing. The preferred-source list rides along, since it picks each group's trunk.
+        viewModelScope.launchIO {
+            stitchInputChanges(
+                ContentType.NOVELS,
+                mergeGroupRepository,
+                raitoLibraryPreferences.preferredNovelSources.changes(),
+            )
+                .collectLatest { reconcileMergedChapters.await() }
+        }
+    }
+
+    /** Folds the badge prefs into one flow so the main combine stays at its 5-arg max. Sorting is
+     *  LibraryEngine's, so no sort input rides here: it would rebuild this list for nothing. The filters
+     *  ride the tracks gate instead, so a tracker filter waits for the tracks it reads. */
+    private fun settingsFlow(): Flow<LibrarySettings> {
+        val mergeFlow = novelLibraryRows.mergeInputs()
+        // No group-by input: grouping is LibraryEngine's, and re-running this whole pipeline on a
+        // group-mode change would rebuild the filtered list for a decision it does not make.
+        return combine(
+            libraryBadgePrefsFlow(libraryPreferences, raitoLibraryPreferences),
+            libraryPreferences.showContinueReadingButton.changes(),
+            mergeFlow,
+        ) { badges, showContinue, merge -> LibrarySettings(badges, showContinue, merge) }
+    }
+
+    /** One chapter-table LIKE scan per distinct `chapter:` term, resolved once per query change. */
+    private suspend fun resolveChapterMatches(query: String?): Map<String, Set<Long>> {
+        val node = query?.takeUnless { it.isBlank() }?.let(QueryNode::from) ?: return emptyMap()
+        return node.chapterSearchTerms().associateWith { novelChapterRepository.getNovelIdsWithChapterNameLike(it) }
+    }
+
+    private suspend fun buildState(
+        library: List<LibraryNovel>,
+        customInfo: List<CustomNovelInfo>,
+        searchInputs: LibrarySearchInputs<Pair<String?, Map<String, Set<Long>>>, NovelTrack>,
+        settings: LibrarySettings,
+    ): State {
+        val (search, filter, categoryMatches, tracks) = searchInputs
+        val (query, chapterMatches) = search
+        // The rows the library and Statistics share, before any filter or search, plus the collapsed
+        // groups the tracks and the per-novel metadata below are keyed by.
+        val (groups, allItems) = novelLibraryRows.build(library, settings.badges, settings.merge).let {
+            it.groups to it.items
+        }
+        // Each merge group's tracks keyed by the rep's real novel id, so the filter's tracker axis and the
+        // grouping read a track bound on ANY grouped source. Synchronous: reads the in-memory group members,
+        // never the suspend awaitGroup. Converted once to the shared Track, which the track kernels take.
+        val loggedInTrackerIds = filter.trackers.keys
+        val uiTracks = tracks.mapValues { (_, novelTracks) -> novelTracks.map { it.toUiTrack() } }
+        val membersByRep = groups.associate { it.representative.novel.id to it.memberIds }
+        val tracksByRep = membersByRep.mapValues { (_, memberIds) -> mergedGroupTracks(memberIds, uiTracks) }
+        val scoringTrackers = trackerManager.getAll(loggedInTrackerIds).associateBy { it.id }
+        val trackerMeanScores = libraryTrackerMeans(
+            membersByRow = membersByRep,
+            tracksById = uiTracks,
+            trackers = scoringTrackers,
+        )
+        // The one shared library filter (tracker axis folded in), so a filter change reaches manga and
+        // novels at once. The per-type seams live in the accessors: novels have no local-source concept.
+        val filterPrefs = filter.resolve()
+        // Keyed by the representative's novel id (== the LibraryItem id). The dynamic grouping resolves
+        // per-novel metadata (genre / author / source / status) the row cannot carry, and the search
+        // needs the source name and slug, since a novel row has no Mihon Source to read either off.
+        val novelById = groups.associate { it.representative.novel.id to it.representative }
+        // Display-only custom-info overlay, keyed by the real novel id. Carried into the state and applied
+        // at the display read (State.withOverlay, via LibraryProvider.overlaid), never here, so collapse,
+        // filter, sort, grouping and search all keep reading the source values. Mirrors the manga library,
+        // pinned by LibraryProvider.overlaid and withCustomInfo.
+        val overlay = customInfo.associateBy { it.novelId }
+        // The one filter binding both libraries use; the adult rule's source-name list is manga sites.
+        val sourceKey = { item: LibraryItem -> novelById[item.id]?.novel?.source.orEmpty() }
+        val adultSources = if (filterPrefs.lewd != TriState.DISABLED) {
+            adultContentChecker.libraryAdultNovelSources(adultLookupKeys(allItems, sourceKey))
+        } else {
+            emptySet()
+        }
+        val filterFields = libraryItemFilterFields(
+            sourceKey = sourceKey,
+            adultSource = { it in adultSources },
+            lewdSourceName = { null },
+            trackerIds = { item -> tracksByRep[item.id].orEmpty().map { it.trackerId } },
+        )
+        // The search twin of the filter binding above, pinned by libraryItemQueryFields, the kernel the manga
+        // library runs too, so one typed query means one thing on every row of the All list. The seam: a
+        // novel's source key is its plugin slug (manga supply a numeric id).
+        val queryNode = query?.takeUnless { it.isBlank() }?.let(QueryNode::from)
+        val queryFields = libraryItemQueryFields(
+            sourceKey = sourceKey,
+            chapterMatches = chapterMatches,
+            // Search matches what the card shows, so a renamed novel is findable by the name you gave it.
+            // The rows stay override-free: filter, sort and grouping deliberately read the source values.
+            overlay = overlay.mapValues { (_, custom) -> custom.toQueryOverlay() },
+            categoryMatches = categoryMatches,
+            tracksById = uiTracks,
+            trackers = scoringTrackers,
+        )
+        val items = allItems.filter { item ->
+            val matchesSearch = queryNode == null || libraryQueryMatches(queryNode, item, queryFields)
+            matchesSearch && libraryFilterMatches(item, filterPrefs, filterFields)
+        }
+        val byId = items.associateBy { it.id }
+        // Bucketing, category order and sorting all moved to LibraryEngine's shared assembly, which sees
+        // both content types. This model stops at the filtered rows, its split point.
+
+        // Item id -> (source, url) so LibraryTab can open the (representative) novel. Over the displayed
+        // rows, so the hopper's random actions pick from what is actually on screen.
+        val routes = items.mapNotNull { item ->
+            val novel = novelById[item.id]?.novel ?: return@mapNotNull null
+            item.id to NovelRoute(novel.source, novel.url)
+        }.toMap()
+
+        return State(
+            isLoading = false,
+            searchQuery = query,
+            favorites = items,
+            trackerMeans = trackerMeanScores,
+            novelById = novelById,
+            tracksByRep = tracksByRep,
+            favoritesById = byId,
+            customInfo = overlay,
+            novelRoutes = routes,
+            showContinueButton = settings.showContinue,
+        )
+    }
+
+    // --- search ---
+
+    fun search(query: String?) {
+        searchQuery.value = query
+    }
+
+    // --- multi-select actions ---
+
+    /** Manually merge the selected novels into one group (covers both library views). */
+    fun mergeSelection(ids: List<Long>) {
+        if (ids.size < 2) return
+        viewModelScope.launchIO {
+            // each selected card's whole group is absorbed by the merge, so one call coalesces every source
+            mergeManager.merge(ids)
+        }
+    }
+
+    /** Split the selected novels out of their merge groups (no-op for non-merged selections).
+     *  The manager hands each member its own tracker copy on the way out. */
+    fun unmergeSelection(ids: List<Long>) {
+        if (ids.isEmpty()) return
+        viewModelScope.launchIO { mergeManager.unmerge(ids) }
+    }
+
+    fun markReadSelection(ids: List<Long>, read: Boolean) {
+        // Mark every source of a merge group, so a merged series doesn't stay part-read on the
+        // sources that aren't the representative.
+        val novelIds = state.value.memberIdsFor(ids)
+        // On the app scope like the manga twins: a bulk write must not half-apply because the
+        // screen was left mid-loop.
+        appScope.launch {
+            // The interactor groups by novel for delete-after-read, so pass every selected novel's chapters.
+            val chapters = novelIds.flatMap { novelChapterRepository.getByNovelId(it) }
+            setNovelReadStatus.await(read, chapters)
+        }
+    }
+
+    fun performDownloadAction(ids: List<Long>, action: DownloadAction) {
+        // NOT expanded over the group's members: they carry the same chapters, so downloading every
+        // member would fetch each chapter once per source and waste the storage on near-duplicates.
+        // The target is the group's deduplicated list, the one the details "All" view shows, with each
+        // chapter fetched from the source that carries it.
+        appScope.launch {
+            ids.forEach { id ->
+                val group = getNextNovelChapter.groupChapters(id)
+                val downloadManager = novelDownloadManager()
+                // Probed over every member's chapters: a chapter downloaded on any of them is on disk,
+                // whichever copy the stitch shows.
+                val novelsById = novelRepository.ownersOf(group.pooledChapters)
+                val flags = group.groupFlags { novelDownloadCache.downloadedChapterIds(it, novelsById) }
+                val queuedIds = downloadManager.queueState.value.mapTo(HashSet()) { it.chapterId }
+                // A pick shown from a plugin that is gone fetches an installed one's copy, or nothing.
+                val copies = if (group.stitch.isEmpty()) {
+                    DownloadTargets.OWN
+                } else {
+                    val installed = novelsById.filterValues { sourceManager.isInstalled(it.source) }.keys
+                    DownloadTargets.of(MergeScope.Group, group.pooledChapters, group.chapters, group.stitch, {
+                        it.id
+                    }) { it.novelId in installed }
+                }
+                // The interactor already hands them over in reading order.
+                val targets = DownloadCandidates.forGroup(
+                    group.chapters,
+                    action,
+                    flags,
+                    copies,
+                    group.pooledChapters,
+                    { it.id },
+                    getNextNovelChapter.hiddenAmong(group.pooledChapters),
+                ) { it in queuedIds }
+                if (targets.isNotEmpty()) downloadManager.downloadChapters(targets)
+            }
+        }
+    }
+
+    /** Changes each of [novelIds]' categories together with the rest of its merge group. */
+    fun setNovelCategories(novelIds: List<Long>, addCategories: List<Long>, removeCategories: List<Long>) {
+        appScope.launch {
+            novelIds.forEach { groupCategories.change(it, addCategories, removeCategories, mergeManager) }
+        }
+    }
+
+    fun removeNovels(
+        novelIds: List<Long>,
+        deleteFromLibrary: Boolean,
+        deleteDownloads: Boolean,
+        // Expand merged covers to every grouped source, so the whole series leaves the library.
+        removeGroupedSources: Boolean = false,
+    ) {
+        appScope.launch {
+            val targets = if (removeGroupedSources) state.value.memberIdsFor(novelIds) else novelIds
+            if (deleteFromLibrary) removeNovelsFromLibrary.await(targets)
+            targets.forEach { novelId ->
+                // The whole entry's downloads, as manga's library removal deletes: the chapter delete
+                // would keep bookmarked chapters behind a series the user asked to clear out.
+                if (deleteDownloads) {
+                    novelRepository.getById(novelId)?.let { novelDownloadManager().awaitDeleteNovel(it) }
+                }
+            }
+        }
+    }
+
+    /** The next-unread chapter to resume. For a merged novel this pools the whole group (the unified
+     *  cross-source list the details "All" view shows) to find the first unread, narrowed by the novel's
+     *  own chapter filters; the reader resolves the group order for prev/next, so only the chapter is returned. */
+    suspend fun getResume(repNovelId: Long): NovelChapter? = novelLibraryRows.resumeChapter(repNovelId)
+
+    // --- settings sheet: LibraryEngine builds the library-wide part, this model only lists categories ---
+
+    /** Every category the novel library can file into (the system Default, universal and novel-only rows) in
+     *  the category sort order, for the settings sheet's category filter and per-category sort. Empty
+     *  categories stay in, since a filter or a sort can be set on one before anything is filed there. */
+    val filterPickerCategories: StateFlow<List<Category>> = getNovelCategories.subscribe()
+        .sortedByCategoryPref(raitoLibraryPreferences)
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(), emptyList())
+
+    private data class LibrarySettings(
+        val badges: LibraryBadgePrefs,
+        val showContinue: Boolean,
+        val merge: MergeCollapseInputs<String>,
+    )
+
+    data class State(
+        val isLoading: Boolean = true,
+        val searchQuery: String? = null,
+        val hasActiveFilters: Boolean = false,
+        val showContinueButton: Boolean = false,
+        /** The filtered, merge-collapsed rows before bucketing and sort, in pipeline order; the novel
+         *  split point the provider's row flow reads (the twin of manga's LibraryData.favorites, pinned by
+         *  LibraryProvider.rows). The custom-info overlay is NOT applied here, matching the manga contract. */
+        val favorites: List<LibraryItem> = emptyList(),
+        /** Per-rep mean tracker score (0-10, unscored reps absent), for the sort and the provider seam
+         *  (LibraryProvider.trackerMeans). */
+        val trackerMeans: Map<Long, Double> = emptyMap(),
+        /** Rep id -> its LibraryNovel and unioned merge-group tracks, carried for the dynamic-grouping
+         *  feed seam (LibraryProvider.dynamicGroupingFeed), which resolves metadata the row cannot carry. */
+        val novelById: Map<Long, LibraryNovel> = emptyMap(),
+        val tracksByRep: Map<Long, List<Track>> = emptyMap(),
+        private val favoritesById: Map<Long, LibraryItem> = emptyMap(),
+        /** Display-only overrides, keyed by real novel id; applied at the display read only. */
+        private val customInfo: Map<Long, CustomNovelInfo> = emptyMap(),
+        private val novelRoutes: Map<Long, NovelRoute> = emptyMap(),
+    ) {
+        /** Identity of [customInfo], so a display-overlay edit is not conflated away downstream. */
+        val overlayKey: Any get() = customInfo
+
+        val isLibraryEmpty = favoritesById.isEmpty()
+
+        // These resolve an explicit id set rather than reading the selection, so a bulk action is driven
+        // by the ids its caller passes. That is what lets the shared engine own a selection spanning both
+        // content types and hand each provider only its own ids. Mirrors the manga library, pinned by
+        // LibraryBehavior's EntryId-set verbs and the anyMerged / memberIdsOf kernels below.
+
+        /** Any of [ids] is a merge group (drives the bulk Unmerge action). */
+        fun containsMerged(ids: Collection<Long>): Boolean = favoritesById.anyMerged(ids)
+
+        /** Every grouped source-novel behind [ids]. */
+        fun memberIdsFor(ids: Collection<Long>): List<Long> = favoritesById.memberIdsOf(ids)
+
+        /**
+         * The one place the overlay is applied, reached through the provider seam
+         * (LibraryProvider.overlaid) at the shared assembly's display read, so the overrides never reach
+         * the raw rows that filter, sort and search read. Mirrors the manga library, pinned by
+         * [withCustomInfo].
+         */
+        fun withOverlay(item: LibraryItem): LibraryItem = item.withCustomInfo(customInfo[item.id])
+
+        /** (source, url) for the item id, to open the novel details screen. */
+        fun routeFor(itemId: Long): NovelRoute? = novelRoutes[itemId]
+    }
+
+    data class NovelRoute(val source: String, val url: String)
+}

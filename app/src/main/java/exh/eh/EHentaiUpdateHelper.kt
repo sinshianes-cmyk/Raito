@@ -1,0 +1,322 @@
+package exh.eh
+
+import android.content.Context
+import dev.zacsweers.metro.AppScope
+import dev.zacsweers.metro.Inject
+import dev.zacsweers.metro.SingleIn
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
+import kotlinx.serialization.json.JsonObject
+import mihon.core.common.extensions.EMPTY
+import raito.domain.library.ContentType
+import raito.domain.manga.MangaGroupCategories
+import raito.domain.manga.MangaMergeManager
+import raito.domain.manga.RemoveMangaFromLibrary
+import raito.domain.readinglog.ReadingLogRepository
+import raito.presentation.browse.MangaLibraryAdder
+import tachiyomi.domain.category.interactor.GetCategories
+import tachiyomi.domain.category.interactor.SetMangaCategories
+import tachiyomi.domain.chapter.interactor.GetChapterByUrl
+import tachiyomi.domain.chapter.interactor.GetChaptersByMangaId
+import tachiyomi.domain.chapter.model.Chapter
+import tachiyomi.domain.chapter.model.ChapterRemoteUpdate
+import tachiyomi.domain.chapter.model.ChapterUpdate
+import tachiyomi.domain.chapter.repository.ChapterRepository
+import tachiyomi.domain.history.interactor.GetHistory
+import tachiyomi.domain.history.interactor.RemoveHistory
+import tachiyomi.domain.history.interactor.UpsertHistory
+import tachiyomi.domain.history.model.History
+import tachiyomi.domain.history.model.HistoryUpdate
+import tachiyomi.domain.manga.interactor.GetManga
+import tachiyomi.domain.manga.model.Manga
+import java.io.File
+
+data class ChapterChain(val manga: Manga, val chapters: List<Chapter>, val history: List<History>)
+
+@Inject
+@SingleIn(AppScope::class)
+class EHentaiUpdateHelper(
+    context: Context,
+    private val getChapterByUrl: GetChapterByUrl,
+    private val getChaptersByMangaId: GetChaptersByMangaId,
+    private val getManga: GetManga,
+    private val libraryAdder: MangaLibraryAdder,
+    private val removeMangaFromLibrary: RemoveMangaFromLibrary,
+    setMangaCategories: SetMangaCategories,
+    private val getCategories: GetCategories,
+    private val chapterRepository: ChapterRepository,
+    private val upsertHistory: UpsertHistory,
+    private val removeHistory: RemoveHistory,
+    private val getHistory: GetHistory,
+    private val mangaMergeManager: MangaMergeManager,
+    private val readingLog: ReadingLogRepository,
+) {
+    private val groupCategories = MangaGroupCategories(getCategories, setMangaCategories)
+
+    val parentLookupTable =
+        MemAutoFlushingLookupTable(
+            File(context.filesDir, "exh-plt.maftable"),
+            GalleryEntry.Serializer(),
+        )
+
+    /**
+     * @param chapters Cannot be an empty list!
+     *
+     * @return Triple<Accepted, Discarded, NewChapters>, NewChapters being the chapters inserted into the
+     *  accepted gallery, or null when no persisted same-source chain resolves from [chapters] (nothing
+     *  to reconcile).
+     */
+    suspend fun findAcceptedRootAndDiscardOthers(
+        sourceId: Long,
+        chapters: List<Chapter>,
+    ): Triple<ChapterChain, List<ChapterChain>, List<Chapter>>? {
+        // Find other chains
+        val chains = chapters
+            .flatMap { chapter ->
+                getChapterByUrl.await(chapter.url).map { it.mangaId }
+            }
+            .distinct()
+            .mapNotNull { mangaId ->
+                coroutineScope {
+                    val manga = async(Dispatchers.IO) {
+                        getManga.await(mangaId)
+                    }
+                    val chapterList = async(Dispatchers.IO) {
+                        getChaptersByMangaId.await(mangaId)
+                    }
+                    val history = async(Dispatchers.IO) {
+                        getHistory.await(mangaId)
+                    }
+                    ChapterChain(
+                        manga.await() ?: return@coroutineScope null,
+                        chapterList.await(),
+                        history.await(),
+                    )
+                }
+            }
+            .filter { it.manga.source == sourceId }
+
+        // Accept oldest chain. Empty only when no chapter resolves to a persisted same-source manga
+        // (nothing to reconcile); bail rather than throw on the empty min.
+        val accepted = chains.minByOrNull { it.manga.id } ?: return null
+
+        val toDiscard = chains.filter { it.manga.favorite && it.manga.id != accepted.manga.id }
+
+        val chainsAsChapters = chains.flatMap { it.chapters }
+        val chainsAsHistory = chains.flatMap { it.history }
+
+        return if (toDiscard.isNotEmpty()) {
+            // Copy chain chapters to curChapters
+            val (chapterUpdates, chapterRenames, newChapters) = getChapterList(accepted, toDiscard, chainsAsChapters)
+
+            // Through the library's own add and removal, so the source's account hears of both. The add
+            // goes first: if it fails the discarded versions stay, and nothing else is changed. The
+            // removal keeps covers, since a custom cover on a discarded version is not carried over.
+            libraryAdder.favoriteForAdd(accepted.manga.id) ?: return Triple(accepted, emptyList(), emptyList())
+            removeMangaFromLibrary.takeOut(toDiscard.map { it.manga.id })
+
+            chapterRepository.updateAll(chapterUpdates)
+            // The stored rows, not newChapters (still id -1), go back to the caller: the update
+            // notification opens, marks read and downloads them by id.
+            val inserted = chapterRepository.updateFromRemote(
+                removedIds = emptyList(),
+                added = newChapters,
+                updated = chapterRenames,
+            )
+            // Re-read, since the add above changed the row and callers redirect only to a favorite.
+            val newAccepted = ChapterChain(getManga.await(accepted.manga.id) ?: accepted.manga, inserted, emptyList())
+            val rootsToMutate = toDiscard + newAccepted
+
+            val acceptedChapters = getChaptersByMangaId.await(accepted.manga.id)
+            val (newHistory, deleteHistory) = getHistory(acceptedChapters, chainsAsChapters, chainsAsHistory)
+            // Each discarded version's chapter hands its reading time to the accepted chapter its history goes to.
+            val acceptedByUrl = acceptedChapters.associateBy { it.url }
+            readingLog.move(
+                ContentType.MANGA,
+                chainsAsChapters.mapNotNull { chapter ->
+                    acceptedByUrl[chapter.url]?.takeIf { it.id != chapter.id }?.let { chapter.id to it.id }
+                }.toMap(),
+            )
+
+            // Delete the duplicate history first
+            // by-id batch reset (Komikku's removeHistory(List)); see RemoveHistory.await(List).
+            removeHistory.await(deleteHistory)
+
+            // Insert new history
+            newHistory.forEach {
+                upsertHistory.await(it)
+            }
+
+            // Komikku also upserts a FavoriteEntryAlternative here for its favorites two-way
+            //     sync. Omitted for now; reconciliation works without it.
+
+            // Copy categories from all chains to accepted manga
+
+            val newCategories = rootsToMutate.flatMap { chapterChain ->
+                getCategories.await(chapterChain.manga.id).map { it.id }
+            }.distinct()
+            rootsToMutate.forEach {
+                groupCategories.set(it.manga.id, newCategories, mangaMergeManager)
+            }
+
+            Triple(newAccepted, toDiscard, inserted)
+        } else {
+            Triple(accepted, emptyList(), emptyList())
+        }
+    }
+
+    private fun getHistory(
+        currentChapters: List<Chapter>,
+        chainsAsChapters: List<Chapter>,
+        chainsAsHistory: List<History>,
+    ): Pair<List<HistoryUpdate>, List<Long>> {
+        val history = chainsAsHistory.groupBy { history -> chainsAsChapters.find { it.id == history.chapterId }?.url }
+        val newHistory = currentChapters.mapNotNull { chapter ->
+            val newHistory = history[chapter.url]
+                ?.maxWithOrNull(compareBy { it.readAt })
+                ?.takeIf { it.chapterId != chapter.id && it.readAt != null }
+            if (newHistory != null) {
+                HistoryUpdate(chapter.id, newHistory.readAt!!, newHistory.readDuration)
+            } else {
+                null
+            }
+        }
+        val currentChapterIds = currentChapters.map { it.id }
+        val historyToDelete = chainsAsHistory.filterNot { it.chapterId in currentChapterIds }
+            .map { it.id }
+        return newHistory to historyToDelete
+    }
+}
+
+/**
+ * What merging the discarded versions changes on the accepted gallery: its chapters' reading state, the
+ * version names and numbers they are given, which are source fields and written as such, and new rows.
+ */
+internal data class ChapterListChanges(
+    val updates: List<ChapterUpdate>,
+    val renames: List<ChapterRemoteUpdate>,
+    val newChapters: List<Chapter>,
+)
+
+internal fun getChapterList(
+    accepted: ChapterChain,
+    toDiscard: List<ChapterChain>,
+    chainsAsChapters: List<Chapter>,
+): ChapterListChanges {
+    val newLastPageRead = chainsAsChapters.maxOfOrNull { it.lastPageRead }
+    val stored = accepted.chapters.associateBy { it.id }
+    return toDiscard
+        .flatMap { chain ->
+            chain.chapters
+        }
+        .fold(accepted.chapters) { curChapters, chapter ->
+            if (curChapters.any { it.url == chapter.url }) {
+                curChapters.map {
+                    if (it.url == chapter.url) {
+                        val read = it.read || chapter.read
+                        var lastPageRead = it.lastPageRead.coerceAtLeast(chapter.lastPageRead)
+                        if (newLastPageRead != null && lastPageRead <= 0) {
+                            lastPageRead = newLastPageRead
+                        }
+                        val bookmark = it.bookmark || chapter.bookmark
+                        it.copy(
+                            read = read,
+                            lastPageRead = lastPageRead,
+                            bookmark = bookmark,
+                        )
+                    } else {
+                        it
+                    }
+                }
+            } else {
+                curChapters + Chapter(
+                    id = -1,
+                    mangaId = accepted.manga.id,
+                    url = chapter.url,
+                    name = chapter.name,
+                    read = chapter.read,
+                    bookmark = chapter.bookmark,
+                    lastPageRead = if (newLastPageRead != null && chapter.lastPageRead <= 0) {
+                        newLastPageRead
+                    } else {
+                        chapter.lastPageRead
+                    },
+                    dateFetch = chapter.dateFetch,
+                    dateUpload = chapter.dateUpload,
+                    chapterNumber = -1.0,
+                    scanlator = null,
+                    sourceOrder = -1,
+                    memo = JsonObject.EMPTY,
+                    // The same chapter moving to the accepted gallery, so its length comes with it.
+                    pageCount = chapter.pageCount,
+                )
+            }
+        }
+        .sortedBy { it.dateUpload }
+        .let { chapters ->
+            val updates = mutableListOf<ChapterUpdate>()
+            val renames = mutableListOf<ChapterRemoteUpdate>()
+            val newChapters = mutableListOf<Chapter>()
+            chapters.mapIndexed { index, chapter ->
+                val name = "v${index + 1}: " + chapter.name.substringAfter(" ")
+                val chapterNumber = index + 1.0
+                val sourceOrder = chapters.lastIndex - index.toLong()
+                when (chapter.id) {
+                    -1L -> newChapters.add(
+                        chapter.copy(
+                            name = name,
+                            chapterNumber = chapterNumber,
+                            sourceOrder = sourceOrder,
+                        ),
+                    )
+                    // Diffed against the stored row, not the merged copy, or the read state, bookmark
+                    // and progress merged in above never reach the database.
+                    else -> {
+                        val row = stored.getValue(chapter.id)
+                        updates.add(
+                            ChapterUpdate(chapter.id) {
+                                read = chapter.read.takeUnless { row.read == it }
+                                bookmark = chapter.bookmark.takeUnless { row.bookmark == it }
+                                lastPageRead = chapter.lastPageRead.takeUnless { row.lastPageRead == it }
+                            },
+                        )
+                        if (row.name != name || row.chapterNumber != chapterNumber || row.sourceOrder != sourceOrder) {
+                            renames.add(
+                                ChapterRemoteUpdate(
+                                    id = chapter.id,
+                                    name = name,
+                                    scanlator = null,
+                                    chapterNumber = chapterNumber,
+                                    dateUpload = null,
+                                    sourceOrder = sourceOrder,
+                                    memo = row.memo,
+                                ),
+                            )
+                        }
+                    }
+                }
+            }
+            ChapterListChanges(updates.toList(), renames.toList(), newChapters.toList())
+        }
+}
+
+data class GalleryEntry(val gId: String, val gToken: String) {
+    class Serializer : MemAutoFlushingLookupTable.EntrySerializer<GalleryEntry> {
+        /**
+         * Serialize an entry as a String.
+         */
+        override fun write(entry: GalleryEntry) = with(entry) { "$gId:$gToken" }
+
+        /**
+         * Read an entry from a String.
+         */
+        override fun read(string: String): GalleryEntry {
+            val colonIndex = string.indexOf(':')
+            return GalleryEntry(
+                string.substring(0, colonIndex),
+                string.substring(colonIndex + 1, string.length),
+            )
+        }
+    }
+}

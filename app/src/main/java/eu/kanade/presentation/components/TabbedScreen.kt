@@ -1,0 +1,123 @@
+package eu.kanade.presentation.components
+
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.calculateEndPadding
+import androidx.compose.foundation.layout.calculateStartPadding
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.pager.HorizontalPager
+import androidx.compose.foundation.pager.PagerState
+import androidx.compose.foundation.pager.rememberPagerState
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.PrimaryTabRow
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.Tab
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.platform.LocalLayoutDirection
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.zIndex
+import dev.icerock.moko.resources.StringResource
+import kotlinx.coroutines.launch
+import tachiyomi.presentation.core.components.material.Scaffold
+import tachiyomi.presentation.core.components.material.TabText
+import tachiyomi.presentation.core.i18n.stringResource
+
+@Composable
+fun TabbedScreen(
+    titleRes: StringResource,
+    tabs: List<TabContent>,
+    state: PagerState = rememberPagerState { tabs.size },
+    searchQuery: String? = null,
+    onChangeSearchQuery: (String?) -> Unit = {},
+    navigateUp: (() -> Unit)? = null, // RK: back arrow for screens pushed on the stack
+) {
+    val scope = rememberCoroutineScope()
+    val snackbarHostState = remember { SnackbarHostState() }
+
+    Scaffold(
+        topBar = {
+            val tab = tabs[state.currentPage]
+            val searchEnabled = tab.searchEnabled
+
+            // RK --> a tab with its own selection mode supplies the bar for it, and it is read off
+            //        the tab on screen, so a live selection cannot leave its toolbar over a sibling.
+            val actionMode = tab.actionModeToolbar
+            if (actionMode != null) {
+                actionMode()
+            } else {
+                // RK <--
+                SearchToolbar(
+                    titleContent = { AppBarTitle(stringResource(titleRes)) },
+                    navigateUp = navigateUp, // RK
+                    searchEnabled = searchEnabled,
+                    searchQuery = if (searchEnabled) searchQuery else null,
+                    onChangeSearchQuery = onChangeSearchQuery,
+                    actions = { AppBarActions(tab.actions) },
+                )
+                // RK -->
+            }
+            // RK <--
+        },
+        snackbarHost = { SnackbarHost(hostState = snackbarHostState) },
+    ) { contentPadding ->
+        Column(
+            modifier = Modifier.padding(
+                top = contentPadding.calculateTopPadding(),
+                start = contentPadding.calculateStartPadding(LocalLayoutDirection.current),
+                end = contentPadding.calculateEndPadding(LocalLayoutDirection.current),
+            ),
+        ) {
+            // RK --> DropSauce kind rail: tabs sit in a tonal rounded tray, primary-coloured when selected
+            PrimaryTabRow(
+                selectedTabIndex = state.currentPage,
+                modifier = Modifier
+                    .zIndex(1f)
+                    .padding(horizontal = 8.dp, vertical = 8.dp)
+                    .clip(RoundedCornerShape(12.dp)),
+                containerColor = androidx.compose.ui.graphics.Color.Transparent, // RK: no grey tray
+                divider = {},
+            ) {
+                // RK <--
+                tabs.forEachIndexed { index, tab ->
+                    Tab(
+                        selected = state.currentPage == index,
+                        onClick = { scope.launch { state.animateScrollToPage(index) } },
+                        text = { TabText(text = stringResource(tab.titleRes), badgeCount = tab.badgeNumber) },
+                        selectedContentColor = MaterialTheme.colorScheme.primary, // RK
+                        unselectedContentColor = MaterialTheme.colorScheme.onSurfaceVariant, // RK
+                    )
+                }
+            }
+
+            HorizontalPager(
+                modifier = Modifier.fillMaxSize(),
+                state = state,
+                verticalAlignment = Alignment.Top,
+            ) { page ->
+                tabs[page].content(
+                    PaddingValues(bottom = contentPadding.calculateBottomPadding()),
+                    snackbarHostState,
+                )
+            }
+        }
+    }
+}
+
+data class TabContent(
+    val titleRes: StringResource,
+    val badgeNumber: Int? = null,
+    val searchEnabled: Boolean = false,
+    val actions: List<AppBar.AppBarAction> = listOf(),
+    // RK: non-null replaces the shared toolbar while this tab is showing, for a tab that has a
+    //     selection mode of its own. A slot rather than the state, so the host stays generic.
+    val actionModeToolbar: (@Composable () -> Unit)? = null,
+    val content: @Composable (contentPadding: PaddingValues, snackbarHostState: SnackbarHostState) -> Unit,
+)

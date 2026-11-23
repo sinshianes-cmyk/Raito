@@ -1,0 +1,90 @@
+package mihon.core.migration.migrations
+
+import dev.zacsweers.metro.AppScope
+import dev.zacsweers.metro.ContributesIntoSet
+import dev.zacsweers.metro.Inject
+import logcat.LogPriority
+import mihon.core.migration.Migration
+import mihon.core.migration.MigrationContext
+import raito.domain.dedupe.MergedDuplicateRepository
+import raito.domain.dedupe.survivorIds
+import raito.domain.library.ContentType
+import raito.domain.library.RaitoLibraryPreferences
+import raito.domain.merge.MergeGroupReconstruction
+import raito.domain.merge.MergeGroupRepository
+import raito.domain.novel.NovelRepository
+import tachiyomi.core.common.preference.Preference
+import tachiyomi.core.common.util.lang.withIOContext
+import tachiyomi.core.common.util.system.logcat
+import tachiyomi.domain.manga.interactor.GetFavorites
+
+/**
+ * One-time move of the pref-based merge grouping (manual merges plus same-title auto-groups, honoring
+ * deliberate unmerges) into the merge_group tables. Favorites only: a merged source already out of the
+ * library is dropped, since a reused id would otherwise be captured (docs/dev/subsystems/merged-series.md).
+ *
+ * This is the old prefs' only reader; restore rebuilds a 0.3.x backup's groups from the backup through
+ * the same kernel. Best-effort per content type, so one side failing does not block the other.
+ */
+@Inject
+@ContributesIntoSet(AppScope::class)
+class MigrateMergePrefsToGroupsMigration(
+    private val prefs: RaitoLibraryPreferences,
+    private val repo: MergeGroupRepository,
+    private val getFavorites: GetFavorites,
+    private val novelRepo: NovelRepository,
+    private val mergedDuplicates: MergedDuplicateRepository,
+) : Migration {
+    // Fires once when the shipped versionCode crosses 189. Must stay above every shipped release's
+    // versionCode (0.3.1 is 184): a migration runs only for old < version <= new, so a gate at or below
+    // an installed build's code never fires there, and that install keeps no groups at all.
+    override val version: Float = 189f
+
+    override suspend fun invoke(migrationContext: MigrationContext): Boolean = withIOContext {
+        runCatching {
+            val candidates = getFavorites.await().map { MergeGroupReconstruction.Candidate(it.id, it.title, it.author) }
+            val groups = reconstruct(ContentType.MANGA, candidates, prefs.mangaManualMerges, prefs.mangaManualUnmerges)
+            materialize(repo, ContentType.MANGA, groups)
+        }.onFailure { logcat(LogPriority.ERROR, it) { "Merge-group migration failed for manga" } }
+
+        runCatching {
+            val candidates = novelRepo.getFavorites().map {
+                MergeGroupReconstruction.Candidate(it.id, it.title, it.author)
+            }
+            val groups = reconstruct(ContentType.NOVELS, candidates, prefs.novelManualMerges, prefs.novelManualUnmerges)
+            materialize(repo, ContentType.NOVELS, groups)
+        }.onFailure { logcat(LogPriority.ERROR, it) { "Merge-group migration failed for novels" } }
+
+        true
+    }
+
+    private suspend fun reconstruct(
+        contentType: ContentType,
+        candidates: List<MergeGroupReconstruction.Candidate>,
+        merges: Preference<Set<String>>,
+        unmerges: Preference<Set<String>>,
+    ): List<List<Long>> {
+        // The upgrade's dedupe (50.sqm, 51.sqm) runs before this, so the prefs can name a copy it merged away.
+        // The record is emptied only after the migrations, by MergedDuplicateCarryMigration.
+        val survivors = mergedDuplicates.getAll().survivorIds(contentType)
+        return MergeGroupReconstruction.reconstruct(
+            candidates = candidates,
+            manualMerges = MergeGroupReconstruction.parsePrefGroups(merges.get(), survivors),
+            unmerges = MergeGroupReconstruction.parsePrefGroups(unmerges.get(), survivors),
+            switches = MergeGroupReconstruction.titleSwitches(contentType, prefs) { it.get() },
+        )
+    }
+
+    // Idempotent: skip a group whose members are already grouped, so a re-run (or a partial prior run)
+    // does not hit the one-group-per-entry constraint.
+    private suspend fun materialize(
+        repo: MergeGroupRepository,
+        contentType: ContentType,
+        groups: List<List<Long>>,
+    ) {
+        for (group in groups) {
+            val alreadyGrouped = group.any { repo.getGroupId(contentType, it) != null }
+            if (!alreadyGrouped) repo.createGroup(contentType, group)
+        }
+    }
+}

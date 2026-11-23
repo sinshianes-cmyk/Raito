@@ -1,0 +1,251 @@
+package eu.kanade.tachiyomi.data.track.mangaupdates
+
+import eu.kanade.tachiyomi.data.database.models.Track
+import eu.kanade.tachiyomi.data.track.mangaupdates.MangaUpdates.Companion.READING_LIST
+import eu.kanade.tachiyomi.data.track.mangaupdates.MangaUpdates.Companion.WISH_LIST
+import eu.kanade.tachiyomi.data.track.mangaupdates.dto.MUContext
+import eu.kanade.tachiyomi.data.track.mangaupdates.dto.MUCurrentUser
+import eu.kanade.tachiyomi.data.track.mangaupdates.dto.MUListItem
+import eu.kanade.tachiyomi.data.track.mangaupdates.dto.MULoginResponse
+import eu.kanade.tachiyomi.data.track.mangaupdates.dto.MURating
+import eu.kanade.tachiyomi.data.track.mangaupdates.dto.MURecord
+import eu.kanade.tachiyomi.data.track.mangaupdates.dto.MUSearchResult
+import eu.kanade.tachiyomi.network.DELETE
+import eu.kanade.tachiyomi.network.GET
+import eu.kanade.tachiyomi.network.POST
+import eu.kanade.tachiyomi.network.PUT
+import eu.kanade.tachiyomi.network.await
+import eu.kanade.tachiyomi.network.awaitSuccess
+import eu.kanade.tachiyomi.network.parseAs
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.add
+import kotlinx.serialization.json.addJsonObject
+import kotlinx.serialization.json.buildJsonArray
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
+import kotlinx.serialization.json.putJsonObject
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.OkHttpClient
+import okhttp3.RequestBody.Companion.toRequestBody
+import raito.data.track.MANGA_UPDATES_NON_MANGA_TYPES
+import tachiyomi.core.common.util.lang.withIOContext
+import uy.kohesive.injekt.injectLazy
+import tachiyomi.domain.track.model.Track as DomainTrack
+
+class MangaUpdatesApi(
+    private val client: OkHttpClient,
+    interceptor: MangaUpdatesInterceptor,
+) {
+    private val json: Json by injectLazy()
+
+    private val authClient by lazy {
+        client.newBuilder()
+            .addInterceptor(interceptor)
+            .build()
+    }
+
+    suspend fun getSeriesListItem(track: Track): Pair<MUListItem, MURating?> {
+        val listItem = withIOContext {
+            with(json) {
+                authClient.newCall(GET("$BASE_URL/v1/lists/series/${track.remote_id}"))
+                    .awaitSuccess()
+                    .parseAs<MUListItem>()
+            }
+        }
+
+        val rating = getSeriesRating(track)
+
+        return listItem to rating
+    }
+
+    suspend fun addSeriesToList(track: Track, hasReadChapters: Boolean) {
+        val status = if (hasReadChapters) READING_LIST else WISH_LIST
+        val body = buildJsonArray {
+            addJsonObject {
+                putJsonObject("series") {
+                    put("id", track.remote_id)
+                }
+                put("list_id", status)
+            }
+        }
+        authClient.newCall(
+            POST(
+                url = "$BASE_URL/v1/lists/series",
+                body = body.toString().toRequestBody(CONTENT_TYPE),
+            ),
+        )
+            .awaitSuccess()
+            .let {
+                if (it.code == 200) {
+                    track.status = status
+                    track.last_chapter_read = 1.0
+                }
+            }
+    }
+
+    suspend fun updateSeriesListItem(track: Track) {
+        val body = buildJsonArray {
+            addJsonObject {
+                putJsonObject("series") {
+                    put("id", track.remote_id)
+                }
+                put("list_id", track.status)
+                putJsonObject("status") {
+                    put("chapter", track.last_chapter_read.toInt())
+                }
+            }
+        }
+        authClient.newCall(
+            POST(
+                url = "$BASE_URL/v1/lists/series/update",
+                body = body.toString().toRequestBody(CONTENT_TYPE),
+            ),
+        )
+            .awaitSuccess().close()
+
+        updateSeriesRating(track)
+    }
+
+    suspend fun deleteSeriesFromList(track: DomainTrack) {
+        val body = buildJsonArray {
+            add(track.remoteId)
+        }
+        authClient.newCall(
+            POST(
+                url = "$BASE_URL/v1/lists/series/delete",
+                body = body.toString().toRequestBody(CONTENT_TYPE),
+            ),
+        )
+            .awaitSuccess().close()
+    }
+
+    private suspend fun getSeriesRating(track: Track): MURating? {
+        return try {
+            withIOContext {
+                with(json) {
+                    authClient.newCall(GET("$BASE_URL/v1/series/${track.remote_id}/rating"))
+                        .awaitSuccess()
+                        .parseAs<MURating>()
+                }
+            }
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    // RK --> full series record for "Fill from tracker" (unauthenticated; carries authors + genres).
+    suspend fun getSeries(track: DomainTrack): MURecord {
+        return withIOContext {
+            with(json) {
+                client.newCall(GET("$BASE_URL/v1/series/${track.remoteId}"))
+                    .awaitSuccess()
+                    .parseAs<MURecord>()
+            }
+        }
+    }
+    // RK <--
+
+    private suspend fun updateSeriesRating(track: Track) {
+        if (track.score < 0.0) return
+        if (track.score != 0.0) {
+            val body = buildJsonObject {
+                put("rating", track.score)
+            }
+            authClient.newCall(
+                PUT(
+                    url = "$BASE_URL/v1/series/${track.remote_id}/rating",
+                    body = body.toString().toRequestBody(CONTENT_TYPE),
+                ),
+            )
+                .awaitSuccess().close()
+        } else {
+            authClient.newCall(
+                DELETE(url = "$BASE_URL/v1/series/${track.remote_id}/rating"),
+            )
+                .awaitSuccess().close()
+        }
+    }
+
+    suspend fun search(query: String, novel: Boolean = false): List<MURecord> { // RK: novel skips the type filter
+        val body = buildJsonObject {
+            put("search", query)
+            // RK --> manga search filters out novels + drama CDs. Novel search sends no filter_types
+            // (returns every type regardless of include/exclude semantics) and is post-filtered by
+            // record type in the caller, so it is robust without confirming the API's filter meaning.
+            if (!novel) {
+                put("filter_types", buildJsonArray { MANGA_UPDATES_NON_MANGA_TYPES.forEach { add(it) } })
+            }
+            // RK <--
+        }
+
+        return withIOContext {
+            with(json) {
+                client.newCall(
+                    POST(
+                        url = "$BASE_URL/v1/series/search",
+                        body = body.toString().toRequestBody(CONTENT_TYPE),
+                    ),
+                )
+                    .awaitSuccess()
+                    .parseAs<MUSearchResult>()
+                    .results
+                    .map { it.record }
+            }
+        }
+    }
+
+    suspend fun getSeriesDetails(id: Long): MURecord? {
+        return withIOContext {
+            val url = "$BASE_URL/v1/series/$id"
+
+            with(json) {
+                val response = client.newCall(GET(url))
+                    .await()
+
+                if (response.code == 404) {
+                    null
+                } else {
+                    response.parseAs<MURecord>()
+                }
+            }
+        }
+    }
+
+    suspend fun authenticate(username: String, password: String): MUContext {
+        val body = buildJsonObject {
+            put("username", username)
+            put("password", password)
+        }
+        return withIOContext {
+            with(json) {
+                client.newCall(
+                    PUT(
+                        url = "$BASE_URL/v1/account/login",
+                        body = body.toString().toRequestBody(CONTENT_TYPE),
+                    ),
+                )
+                    .awaitSuccess()
+                    .parseAs<MULoginResponse>()
+                    .context
+            }
+        }
+    }
+
+    suspend fun getCurrentUser(): MUCurrentUser {
+        return withIOContext {
+            with(json) {
+                authClient.newCall(GET("$BASE_URL/v1/account/profile"))
+                    .awaitSuccess()
+                    .parseAs<MUCurrentUser>()
+            }
+        }
+    }
+
+    companion object {
+        const val BASE_URL = "https://api.mangaupdates.com" // RK: public, the recommendations share it
+
+        private val CONTENT_TYPE = "application/json".toMediaType()
+    }
+}

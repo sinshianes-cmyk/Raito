@@ -1,0 +1,83 @@
+package raito.novel.source
+
+import kotlinx.serialization.json.JsonPrimitive
+import mihon.domain.extension.model.ContentWarning
+import raito.domain.source.CatalogueEnd
+import raito.novel.host.LnPluginHost
+import raito.novel.host.LnPluginInfo
+import raito.novel.host.NovelItem
+import raito.novel.host.NovelTextSanitizer
+import raito.novel.host.SourceNovel
+
+/**
+ * [NovelSource] backed by an upstream lnreader plugin running inside an [LnPluginHost]. The adapter
+ * does not own the host: construct one for every plugin loaded on the host, and dispose them
+ * together when the host goes away.
+ *
+ * The plugin id stored in [info] is the same string passed to `host.loadPlugin(pluginId, source)`,
+ * so the adapter routes every method call to the right plugin instance inside the engine.
+ */
+class LnPluginSource(
+    private val host: LnPluginHost,
+    private val info: LnPluginInfo,
+    override val chapterStylesheet: NovelChapterStylesheet? = null,
+) : NovelSource {
+
+    override val id: String = info.id
+    override val name: String = info.name
+    override val version: String = info.version.orEmpty()
+    override val site: String = info.site.orEmpty()
+    override val lang: String = info.lang.orEmpty().toLangCode()
+
+    /** The plugin's image headers, keeping only the string values a header can carry. */
+    val imageHeaders: Map<String, String> = info.imageHeaders.orEmpty().mapNotNull { (name, value) ->
+        (value as? JsonPrimitive)?.takeIf { it.isString }?.let { name to it.content }
+    }.toMap()
+    override val iconUrl: String? = info.iconUrl
+    override val filters: NovelFilters? = info.filters?.takeIf { it.isNotEmpty() }?.let(NovelFilters::LnSchema)
+    override val settings: NovelSettings? = info.pluginSettings?.let { schema ->
+        NovelSettings.LnSchema(
+            schema,
+            read = { key -> host.getSetting(info.id, key) },
+            write = { key, value -> host.setSetting(info.id, key, value) },
+        )
+    }
+    override val supportsLatest: Boolean = info.supportsLatest
+
+    /** Whether the in-app browser keeps the site's storage for this plugin, as LNReader's does. */
+    val webStorageUtilized: Boolean = info.webStorageUtilized
+    override val format = NovelExtensionFormat.JS
+    override val extensionName: String = info.name
+    override val contentWarning = ContentWarning.SAFE
+
+    // Latest is a flag in the same options as the filters, and a plugin with no filters still needs it.
+    override suspend fun browse(listing: NovelListing, page: Int, filters: NovelFilterState?): NovelItemsPage {
+        val values = (filters as? NovelFilterState.LnValues)?.values.orEmpty()
+        val options = buildOptions(info.filters, values, showLatest = listing == NovelListing.Latest)
+        return listingOrFailedFetch { host.popularNovels(info.id, page, options).toPage() }
+    }
+
+    // The plugin's search takes only a query, so filters narrow the listings and never reach here.
+    override suspend fun search(query: String, page: Int, filters: NovelFilterState?): NovelItemsPage =
+        listingOrFailedFetch { host.searchNovels(info.id, query, page).toPage() }
+
+    override suspend fun parseNovel(novelPath: String): SourceNovel =
+        novelOrFailedFetch { host.parseNovel(info.id, novelPath) }
+
+    override suspend fun parsePage(novelPath: String, page: String): SourceNovel? =
+        host.parsePage(info.id, novelPath, page)
+
+    // Strip control chars only (never entities): the body is HTML the reader renders, so its markup
+    // and escaped entities must survive intact.
+    override suspend fun parseChapter(chapterPath: String): String =
+        NovelTextSanitizer.stripInvalidChars(chapterOrFailedFetch { host.parseChapter(info.id, chapterPath) })
+
+    override suspend fun resolveUrl(path: String, isNovel: Boolean): String? =
+        host.resolveUrl(info.id, path, isNovel)
+
+    // The format reports no next page, so where a plugin's catalogue ends is inferred.
+    private fun List<NovelItem>.toPage() = NovelItemsPage(
+        map { it.copy(name = NovelTextSanitizer.decodeEntities(it.name)) },
+        end = CatalogueEnd.Inferred,
+    )
+}

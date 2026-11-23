@@ -1,0 +1,231 @@
+import eu.kanade.tachiyomi.source.model.UpdateStrategy;
+import kotlin.Boolean;
+import kotlin.String;
+import kotlin.collections.List;
+import kotlin.time.Instant;
+
+-- Parallel of mangas. Held disjoint from the manga table because the source-id space differs
+-- (lnreader plugin.id is a String; Tachiyomi extension source ids are Long), the reader is
+-- text-based (no `viewer` flags), and there is no excluded-scanlator list. Fields with direct manga
+-- analogues are named identically so view code and tracker hooks port with minimal diff.
+--
+-- `total_pages` supports paged-novel sources (Royal Road volumes, some Japanese sources) where a
+-- single novel's chapter list spans multiple endpoints; the update job re-fetches
+-- `oldTotalPages + 1` through `total_pages` for completely new content.
+CREATE TABLE novels(
+    _id INTEGER NOT NULL PRIMARY KEY,
+    source TEXT NOT NULL,
+    url TEXT NOT NULL,
+    title TEXT NOT NULL,
+    author TEXT,
+    artist TEXT,
+    description TEXT,
+    genre TEXT AS List<String>,
+    status INTEGER NOT NULL,
+    thumbnail_url TEXT,
+    last_update INTEGER AS Instant,
+    initialized INTEGER AS Boolean NOT NULL,
+    chapter_flags INTEGER NOT NULL,
+    update_strategy INTEGER AS UpdateStrategy NOT NULL DEFAULT 0,
+    cover_last_modified INTEGER AS Instant,
+    total_pages INTEGER NOT NULL DEFAULT 1,
+    notes TEXT NOT NULL DEFAULT '',
+    viewer_flags INTEGER NOT NULL DEFAULT 0,
+    next_update INTEGER AS Instant,
+    calculate_interval INTEGER NOT NULL DEFAULT 0,
+    -- When the novel was added to the library, null while it is not in it: the manga table's
+    -- favorite_at, which replaced its favorite flag and date added (mihon 986f46c09).
+    favorite_at INTEGER AS Instant
+);
+
+CREATE INDEX novels_url_index ON novels(url);
+-- A source lists a novel once, as manga's UNIQUE(source_id, remote_url) holds (51.sqm)
+CREATE UNIQUE INDEX novels_source_url_index ON novels(source, url);
+CREATE INDEX novels_library_favorite_at_index ON novels(favorite_at) WHERE favorite_at IS NOT NULL;
+
+findAll:
+SELECT *
+FROM novels;
+
+findByUrlAndSource:
+SELECT *
+FROM novels
+WHERE url = :url AND source = :source
+LIMIT 1;
+
+findById:
+SELECT *
+FROM novels
+WHERE _id = :novelId;
+
+findFavorites:
+SELECT *
+FROM novels
+WHERE favorite_at IS NOT NULL
+ORDER BY title;
+
+findFavoritesBySource:
+SELECT *
+FROM novels
+WHERE favorite_at IS NOT NULL
+AND source = :source;
+
+-- Novel twin of manga.sq getReadMangaNotInLibrary, pinned by NonLibraryEntryConformanceTest
+-- (last_text_progress replaces last_page_read).
+-- Backs the read-entries backup option, so read history survives e.g. a replace-migration that
+-- unfavorited the old novel.
+getReadNovelsNotInLibrary:
+SELECT *
+FROM novels
+WHERE favorite_at IS NULL AND _id IN (
+    SELECT DISTINCT novel_chapters.novel_id
+    FROM novel_chapters
+    WHERE read = 1 OR last_text_progress != 0
+);
+
+-- Novel twin of manga.sq getSourceIdsWithNonLibraryManga, pinned by NonLibraryEntryConformanceTest,
+-- backing the Clear database screen's novel section. Source ids are the lnreader plugin String ids.
+getSourcesWithNonLibraryNovel:
+SELECT source, COUNT(*) AS novel_count
+FROM novels
+WHERE favorite_at IS NULL
+GROUP BY source;
+
+-- Favorited novels per source, for the Browse Migrate list. Reads this table alone, so a chapter,
+-- history or category write does not re-run it as it would the library view.
+getSourcesWithLibraryNovel:
+SELECT source, COUNT(*) AS novel_count
+FROM novels
+WHERE favorite_at IS NOT NULL
+GROUP BY source;
+
+-- Novel twin of manga.sq deleteNonLibraryManga, pinned by NonLibraryEntryConformanceTest. The keep-read
+-- guard matches getReadNovelsNotInLibrary above: a chapter marked read or with a mid-chapter position
+-- counts as progress. Child rows (chapters, category junctions, tracks, custom info, update errors, merge
+-- memberships) go via their ON DELETE CASCADE foreign keys; the app driver enables enforcement.
+deleteNonLibraryNovel:
+DELETE FROM novels
+WHERE favorite_at IS NULL
+AND source IN :sources
+AND (
+    :keepReadNovel = 0
+    OR _id NOT IN (
+        SELECT DISTINCT novel_id
+        FROM novel_chapters
+        WHERE read = 1
+        OR last_text_progress != 0
+    )
+);
+
+-- Novel twin of manga.sq getDuplicateLibraryManga: favorited novels whose title contains :title or
+-- that are tracked to the same remote entry, each with its chapter count. A remote id of 0 is a tracker
+-- that never set one, so it matches nothing. DuplicateTrackMatchConformanceTest pins both halves.
+getDuplicateLibraryNovel:
+WITH
+track_dupes AS (
+    SELECT DISTINCT T2.novel_id
+    FROM novel_tracks T1
+    INNER JOIN novel_tracks T2
+    ON T1.sync_id = T2.sync_id
+    AND T1.remote_id = T2.remote_id
+    AND T1.remote_id != 0
+    AND T1.novel_id != T2.novel_id
+    WHERE T1.novel_id = :id
+),
+duplicates AS (
+    SELECT N.*
+    FROM novels N
+    LEFT JOIN track_dupes D
+    ON D.novel_id = N._id
+    WHERE N.favorite_at IS NOT NULL
+    AND N._id != :id
+    -- A blank title would match every title
+    AND (
+        (trim(:title) != '' AND lower(N.title) LIKE '%' || lower(:title) || '%')
+        OR D.novel_id IS NOT NULL
+    )
+),
+chapter_counts AS (
+    SELECT
+        N._id AS novel_id,
+        count(*) AS chapter_count
+    FROM duplicates N
+    JOIN novel_chapters C
+    ON N._id = C.novel_id
+    GROUP BY N._id
+)
+SELECT
+    N.*,
+    coalesce(CC.chapter_count, 0) AS chapter_count
+FROM duplicates N
+LEFT JOIN chapter_counts CC
+ON N._id = CC.novel_id;
+
+insert:
+INSERT INTO novels (source, url, title, author, artist, description, genre, status, thumbnail_url, favorite_at, last_update, initialized, chapter_flags, update_strategy, cover_last_modified, total_pages, notes, viewer_flags)
+VALUES (:source, :url, :title, :author, :artist, :description, :genre, :status, :thumbnailUrl, :favoriteAt, :lastUpdate, :initialized, :chapterFlags, :updateStrategy, :coverLastModified, :totalPages, :notes, :viewerFlags)
+-- A novel another writer stored first is left as it is and returns no id, so the caller reads it back
+ON CONFLICT(source, url) DO NOTHING
+RETURNING _id;
+
+-- Full-row update for the paths that legitimately write a complete Novel: restore and edit-info
+-- (which set columns back to null, something `coalesce` can't express). Surgical single/few-column
+-- writes go through `partialUpdate` below. Keeping these columns adapter-typed (no coalesce) means the
+-- `genre` / `update_strategy` adapters survive, so the call site passes the typed values directly.
+update:
+UPDATE novels SET
+    source = :source,
+    url = :url,
+    title = :title,
+    author = :author,
+    artist = :artist,
+    description = :description,
+    genre = :genre,
+    status = :status,
+    thumbnail_url = :thumbnailUrl,
+    favorite_at = :favoriteAt,
+    last_update = :lastUpdate,
+    initialized = :initialized,
+    chapter_flags = :chapterFlags,
+    update_strategy = :updateStrategy,
+    cover_last_modified = :coverLastModified,
+    total_pages = :totalPages,
+    notes = :notes,
+    viewer_flags = :viewerFlags
+WHERE _id = :novelId;
+
+-- Partial update (the novel twin of manga.sq's coalesce update): each column `coalesce(:x, x)`s, so a
+-- NovelUpdate patch writes only the fields it sets (null = leave unchanged). Used for surgical edits
+-- (e.g. notes); the full-row `update` above stays for restore / edit-info, which need to write nulls.
+-- The source-owned text columns and favorite_at are the exception: a null set there is written, since a
+-- repair clears a detail the source no longer gives (RepairNovelDetails).
+-- NOTE: `genre` (List<String>) and `update_strategy` (UpdateStrategy) are omitted: SQLDelight does not
+-- preserve those custom column adapters through `coalesce` for this table (it emits raw String/Long).
+-- `genre` is patched through `setGenre` below; `update_strategy` through the full-row `update`.
+partialUpdate:
+UPDATE novels SET
+    source = coalesce(:source, source),
+    url = coalesce(:url, url),
+    title = coalesce(:title, title),
+    author = CASE WHEN :authorSet THEN :author ELSE author END,
+    artist = CASE WHEN :artistSet THEN :artist ELSE artist END,
+    description = CASE WHEN :descriptionSet THEN :description ELSE description END,
+    status = coalesce(:status, status),
+    thumbnail_url = CASE WHEN :thumbnailUrlSet THEN :thumbnailUrl ELSE thumbnail_url END,
+    -- NULL is a real value here (not in the library), which coalesce cannot write
+    favorite_at = CASE WHEN :favoriteAtSet THEN :favoriteAt ELSE favorite_at END,
+    last_update = coalesce(:lastUpdate, last_update),
+    initialized = coalesce(:initialized, initialized),
+    chapter_flags = coalesce(:chapterFlags, chapter_flags),
+    cover_last_modified = coalesce(:coverLastModified, cover_last_modified),
+    total_pages = coalesce(:totalPages, total_pages),
+    notes = coalesce(:notes, notes),
+    viewer_flags = coalesce(:viewerFlags, viewer_flags),
+    next_update = coalesce(:nextUpdate, next_update),
+    calculate_interval = coalesce(:calculateInterval, calculate_interval)
+WHERE _id = :id;
+
+-- The partial update's genre column, written apart because it keeps its adapter only without coalesce.
+setGenre:
+UPDATE novels SET genre = :genre WHERE _id = :id;
+

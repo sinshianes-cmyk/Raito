@@ -1,0 +1,245 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- RK: page count + language/page count for E-Hentai enhanced browse rows (Phase B2) -->
+    <plurals name="num_pages">
+        <item quantity="one">%1$d page</item>
+        <item quantity="other">%1$d pages</item>
+    </plurals>
+
+
+    <plurals name="lock_after_mins">
+        <item quantity="one">After %1$s minute</item>
+        <item quantity="other">After %1$s minutes</item>
+    </plurals>
+
+    <plurals name="relative_time">
+        <item quantity="one">Yesterday</item>
+        <item quantity="other">%1$d days ago</item>
+    </plurals>
+
+    <plurals name="upcoming_relative_time">
+        <item quantity="one">Tomorrow</item>
+        <item quantity="other">In %1$d days</item>
+    </plurals>
+
+    <plurals name="num_categories">
+        <item quantity="one">%d category</item>
+        <item quantity="other">%d categories</item>
+    </plurals>
+
+    <!-- RK: category multi-select bulk delete -->
+    <plurals name="delete_categories_confirmation">
+        <item quantity="one">Delete this category?</item>
+        <item quantity="other">Delete these %d categories?</item>
+    </plurals>
+
+    <plurals name="categories_deleted">
+        <item quantity="one">Deleted %d category</item>
+        <item quantity="other">Deleted %d categories</item>
+    </plurals>
+
+    <plurals name="next_unread_chapters">
+        <item quantity="one">Next unread chapter</item>
+        <item quantity="other">Next %d unread chapters</item>
+    </plurals>
+
+    <plurals name="pref_novel_source_delay_count">
+        <item quantity="one">%d source has its own delay</item>
+        <item quantity="other">%d sources have their own delay</item>
+    </plurals>
+
+    <plurals name="restore_completed_message">
+        <item quantity="one">Done in %1$s with %2$s error</item>
+        <item quantity="other">Done in %1$s with %2$s errors</item>
+    </plurals>
+
+    <plurals name="download_queue_summary">
+        <item quantity="one">%1$s remaining</item>
+        <item quantity="other">%1$s remaining</item>
+    </plurals>
+
+    <plurals name="day">
+        <item quantity="one">1 day</item>
+        <item quantity="other">%d days</item>
+    </plurals>
+
+    <plurals name="pref_pages">
+        <item quantity="one">1 page</item>
+        <item quantity="other">%1$s pages</item>
+    </plurals>
+
+    <!-- Manga info -->
+    <plurals name="missing_chapters">
+        <item quantity="one">Missing %1$s chapter</item>
+        <item quantity="other">Missing %1$s chapters</item>
+    </plurals>
+
+    <plurals name="manga_num_chapters">
+        <item quantity="one">%1$s chapter</item>
+        <item quantity="other">%1$s chapters</item>
+    </plurals>
+
+    <plurals name="download_amount">
+        <item quantity="one">Next chapter</item>
+        <item quantity="other">Next %d chapters</item>
+    </plurals>
+
+    <plurals name="num_trackers">
+        <item quantity="one">%d tracker</item>
+        <item quantity="other">%d trackers</item>
+    </plurals>
+
+    <plurals name="missing_chapters_warning">
+        <item quantity="one">Skipping %d chapter, either the source is missing it or it has been filtered out</item>
+        <item quantity="other">Skipping %d chapters, either the source is missing them or they have been filtered out</item>
+    </plurals>
+
+    <plurals name="notification_new_chapters_summary">
+        <item quantity="one">For %d entry</item>
+        <item quantity="other">For %d entries</item>
+    </plurals>
+    <plurals name="notification_chapters_generic">
+        <item quantity="one">%1$d new chapter</item>
+        <item quantity="other">%1$d new chapters</item>
+    </plurals>
+
+    <plurals name="notification_chapters_multiple_and_more">
+        <item quantity="one">Chapters %1$s and 1 more</item>
+        <item quantity="other">Chapters %1$s and %2$d more</item>
+    </plurals>
+
+    <!--Extension Updates Notifications-->
+    <plurals name="update_check_notification_ext_updates">
+        <item quantity="one">Extension update available</item>
+        <item quantity="other">%d extension updates available</item>
+    </plurals>
+    <!-- RK: the light-novel plugin update notice -->
+    <plurals name="ln_plugin_updates_available">
+        <item quantity="one">Light novel plugin update available</item>
+        <item quantity="other">%d light novel plugin updates available</item>
+    </plurals>
+
+    <plurals name="num_repos">
+        <item quantity="one">%d store</item>
+        <item quantity="other">%d stores</item>
+    </plurals>
+
+    <!--Migration-->
+    <plurals name="migrationListScreen.migrateDialog.migrateTitle">
+        <item quantity="one">Migrate %1$d entry?</item>
+        <item quantity="other">Migrate %1$d entries?</item>
+    </plurals>
+    <plurals name="migrationListScreen.migrateDialog.copyTitle">
+        <item quantity="one">Copy %1$d entry?</item>
+        <item quantity="other">Copy %1$d entries?</item>
+    </plurals>
+    <plurals name="migrationListScreen.migrateDialog.skipText">
+        <item quantity="one">An entry was skipped</item>
+        <item quantity="other">%1$d entries were skipped</item>
+    </plurals>
+    <plurals name="migrationFlow.migratedCount">
+        <item quantity="one">%1$d entry migrated</item>
+        <item quantity="other">%1$d entries migrated</item>
+    </plurals>
+
+    <plurals name="notification_update_error">
+        <item quantity="one">%1$d update failed</item>
+        <item quantity="other">%1$d updates failed</item>
+    </plurals>
+    <!-- RK: badge on a collapsed group card in the add-time duplicate dialog -->
+    <plurals name="num_grouped_sources">
+        <item quantity="one">%1$d source</item>
+        <item quantity="other">%1$d sources</item>
+    </plurals>
+    <!-- RK: opt-in on the library Remove dialog to remove every source in a merged group. The count
+         is the sources behind the merged rows, so it is never one; the singular is here for locales
+         whose plural rules need it. -->
+    <plurals name="action_remove_grouped_sources">
+        <item quantity="one">All grouped sources (%1$d)</item>
+        <item quantity="other">All grouped sources (%1$d)</item>
+    </plurals>
+    <!-- RK: relative-time strings for the E-Hentai updater statistics (Batch D, ported from Komikku) -->
+    <plurals name="humanize_year">
+        <item quantity="one">%1$d year ago</item>
+        <item quantity="other">%1$d years ago</item>
+    </plurals>
+    <plurals name="humanize_month">
+        <item quantity="one">%1$d month ago</item>
+        <item quantity="other">%1$d months ago</item>
+    </plurals>
+    <plurals name="humanize_week">
+        <item quantity="one">%1$d week ago</item>
+        <item quantity="other">%1$d weeks ago</item>
+    </plurals>
+    <plurals name="humanize_day">
+        <item quantity="one">%1$d day ago</item>
+        <item quantity="other">%1$d days ago</item>
+    </plurals>
+    <plurals name="humanize_hour">
+        <item quantity="one">%1$d hour ago</item>
+        <item quantity="other">%1$d hours ago</item>
+    </plurals>
+    <plurals name="humanize_minute">
+        <item quantity="one">%1$d minute ago</item>
+        <item quantity="other">%1$d minutes ago</item>
+    </plurals>
+    <plurals name="humanize_second">
+        <item quantity="one">%1$d second ago</item>
+        <item quantity="other">%1$d seconds ago</item>
+    </plurals>
+    <plurals name="bulk_selected_manga">
+        <item quantity="one">%1$d Manga</item>
+        <item quantity="other">%1$d Manga</item>
+    </plurals>
+    <plurals name="bulk_selected_novels">
+        <item quantity="one">%1$d Novel</item>
+        <item quantity="other">%1$d Novels</item>
+    </plurals>
+    <!-- RK: novel read-aloud sleep timer -->
+    <plurals name="tts_sleep_timer_minutes">
+        <item quantity="one">%1$d minute</item>
+        <item quantity="other">%1$d minutes</item>
+    </plurals>
+    <plurals name="tts_sleep_timer_minutes_left">
+        <item quantity="one">%1$d minute left</item>
+        <item quantity="other">%1$d minutes left</item>
+    </plurals>
+    <!-- RK: the Repos screen's cards and its Settings row -->
+    <plurals name="repo_extensions">
+        <item quantity="one">%d extension</item>
+        <item quantity="other">%d extensions</item>
+    </plurals>
+    <plurals name="repo_plugins">
+        <item quantity="one">%d plugin</item>
+        <item quantity="other">%d plugins</item>
+    </plurals>
+    <plurals name="novel_page_chapters_found">
+        <item quantity="one">%d chapter found on this page</item>
+        <item quantity="other">%d chapters found on this page</item>
+    </plurals>
+
+    <plurals name="repo_count">
+        <item quantity="one">%d repo</item>
+        <item quantity="other">%d repos</item>
+    </plurals>
+
+    <!-- RK: the related-manga grid when your filters hide every suggestion -->
+    <plurals name="recs_all_hidden">
+        <item quantity="one">Your filters hide the one suggestion</item>
+        <item quantity="other">Your filters hide all %d suggestions</item>
+    </plurals>
+
+    <!-- RK: search across a novel's downloaded chapters (from Tsundoku) -->
+    <plurals name="novel_text_search_matches">
+        <item quantity="one">%d match</item>
+        <item quantity="other">%d matches</item>
+    </plurals>
+    <plurals name="novel_text_search_matched_chapters">
+        <item quantity="one">in %d chapter</item>
+        <item quantity="other">in %d chapters</item>
+    </plurals>
+    <plurals name="novel_text_search_failed_chapters">
+        <item quantity="one">%d chapter could not be read</item>
+        <item quantity="other">%d chapters could not be read</item>
+    </plurals>
+</resources>

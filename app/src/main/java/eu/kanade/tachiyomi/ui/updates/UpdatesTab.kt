@@ -1,0 +1,62 @@
+package eu.kanade.tachiyomi.ui.updates
+
+import androidx.compose.animation.graphics.res.rememberAnimatedVectorPainter
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import cafe.adriel.voyager.navigator.Navigator
+import cafe.adriel.voyager.navigator.tab.LocalTabNavigator
+import cafe.adriel.voyager.navigator.tab.TabOptions
+import eu.kanade.presentation.util.Tab
+import eu.kanade.tachiyomi.R
+import eu.kanade.tachiyomi.ui.download.DownloadQueueScreen
+import raito.domain.category.RecentsSurface
+import raito.presentation.components.cachedAnimatedVector
+import raito.presentation.recents.RecentsTabBody
+import raito.presentation.recents.ShowsUpdatesBadge
+import raito.presentation.recents.mangaUpdatesModel
+import raito.presentation.recents.rememberUpdatesEngine
+import tachiyomi.i18n.MR
+import tachiyomi.presentation.core.i18n.stringResource
+
+// RK: the badge marker, since which tab shows Updates is now a setting.
+data object UpdatesTab : Tab, ShowsUpdatesBadge {
+
+    override val options: TabOptions
+        @Composable
+        get() {
+            val isSelected = LocalTabNavigator.current.current.key == key
+            val image = cachedAnimatedVector(R.drawable.animated_updates) // RK
+            return TabOptions(
+                index = 1u,
+                title = stringResource(MR.strings.label_recent_updates),
+                icon = rememberAnimatedVectorPainter(image, isSelected),
+            )
+        }
+
+    override suspend fun onReselect(navigator: Navigator) {
+        navigator.push(DownloadQueueScreen)
+    }
+
+    @Composable
+    override fun Content() {
+        val engine = rememberUpdatesEngine()
+        // RK: held only for the badge reset below. The engine resolves the same instance out of this
+        //     tab's store, so this costs no second model, and asks for it with the same surface.
+        val viewModel = mangaUpdatesModel(RecentsSurface.UPDATES)
+
+        RecentsTabBody(
+            engine = engine,
+            title = stringResource(MR.strings.label_recent_updates),
+        )
+
+        // The badge is the one host behaviour that is this tab's alone: it counts what the updated
+        // lane shows, and no other tab draws that lane.
+        DisposableEffect(Unit) {
+            viewModel.resetNewUpdatesCount()
+
+            onDispose {
+                viewModel.resetNewUpdatesCount()
+            }
+        }
+    }
+}

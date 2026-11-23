@@ -1,0 +1,519 @@
+package eu.kanade.presentation.more.settings.screen
+
+import android.annotation.SuppressLint
+import android.content.ActivityNotFoundException
+import android.content.Intent
+import android.provider.Settings
+import android.webkit.WebStorage
+import android.webkit.WebView
+import eu.kanade.presentation.components.AlertDialog
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.ReadOnlyComposable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalUriHandler
+import androidx.core.net.toUri
+import cafe.adriel.voyager.navigator.LocalNavigator
+import cafe.adriel.voyager.navigator.currentOrThrow
+import eu.kanade.domain.base.BasePreferences
+import eu.kanade.presentation.more.settings.Preference
+import eu.kanade.presentation.more.settings.screen.advanced.ClearDatabaseScreen
+import eu.kanade.presentation.more.settings.screen.debug.DebugInfoScreen
+import eu.kanade.tachiyomi.data.library.MetadataUpdateWorker
+import eu.kanade.tachiyomi.network.NetworkPreferences
+import eu.kanade.tachiyomi.network.PREF_DOH_360
+import eu.kanade.tachiyomi.network.PREF_DOH_ADGUARD
+import eu.kanade.tachiyomi.network.PREF_DOH_ALIDNS
+import eu.kanade.tachiyomi.network.PREF_DOH_CLOUDFLARE
+import eu.kanade.tachiyomi.network.PREF_DOH_CONTROLD
+import eu.kanade.tachiyomi.network.PREF_DOH_DNSPOD
+import eu.kanade.tachiyomi.network.PREF_DOH_GOOGLE
+import eu.kanade.tachiyomi.network.PREF_DOH_MULLVAD
+import eu.kanade.tachiyomi.network.PREF_DOH_NJALLA
+import eu.kanade.tachiyomi.network.PREF_DOH_QUAD101
+import eu.kanade.tachiyomi.network.PREF_DOH_QUAD9
+import eu.kanade.tachiyomi.network.PREF_DOH_SHECAN
+import eu.kanade.tachiyomi.network.PREF_DOH_ZERO_MS // RK
+import eu.kanade.tachiyomi.ui.more.OnboardingScreen
+import eu.kanade.tachiyomi.util.system.isReleaseBuildType
+import eu.kanade.tachiyomi.util.system.isShizukuInstalled
+import eu.kanade.tachiyomi.util.system.powerManager
+import eu.kanade.tachiyomi.util.system.setDefaultSettings
+import eu.kanade.tachiyomi.util.system.toast
+import eu.kanade.tachiyomi.util.system.workManager
+import exh.debug.SettingsDebugScreen
+import kotlinx.coroutines.launch
+import logcat.LogPriority
+import mihon.app.di.appGraph
+import okhttp3.Headers
+import raito.domain.novel.NovelPreferences
+import raito.presentation.settings.bypassPreferenceItems
+import raito.presentation.settings.proxyPreferenceItems
+import tachiyomi.core.common.i18n.stringResource
+import tachiyomi.core.common.util.lang.launchIO
+import tachiyomi.core.common.util.lang.withUIContext
+import tachiyomi.core.common.util.system.logcat
+import tachiyomi.domain.library.service.LibraryPreferences
+import tachiyomi.i18n.MR
+import tachiyomi.presentation.core.i18n.stringResource
+import tachiyomi.presentation.core.util.collectAsState
+import java.io.File
+
+object SettingsAdvancedScreen : SearchableSettings {
+
+    @ReadOnlyComposable
+    @Composable
+    override fun getTitleRes() = MR.strings.pref_category_advanced
+
+    @Composable
+    override fun getPreferences(): List<Preference> {
+        val scope = rememberCoroutineScope()
+        val context = LocalContext.current
+        val navigator = LocalNavigator.currentOrThrow
+
+        val graph = remember { context.appGraph }
+        val basePreferences = remember { graph.basePreferences }
+        val networkPreferences = remember { graph.networkPreferences }
+        val libraryPreferences = remember { graph.libraryPreferences }
+        // RK: listOfNotNull outlived the optional ExHentai login row it was for; no entry is null now
+        return listOfNotNull(
+            // RK --> upstream's loose rows at the top grouped under what they have in common (see
+            // docs/dev/subsystems/architecture.md). The update-error switches live in Settings -> Library,
+            // the adult-sources gate in Browse and sources, and clearing merges in the Library group below.
+            Preference.PreferenceGroup(
+                title = stringResource(MR.strings.label_debugging),
+                preferenceItems = listOf(
+                    Preference.PreferenceItem.TextPreference(
+                        title = stringResource(MR.strings.pref_dump_crash_logs),
+                        subtitle = stringResource(MR.strings.pref_dump_crash_logs_summary),
+                        onClick = {
+                            scope.launch {
+                                context.appGraph.crashLogUtil.dumpLogs()
+                            }
+                        },
+                    ),
+                    Preference.PreferenceItem.SwitchPreference(
+                        preference = networkPreferences.verboseLogging,
+                        title = stringResource(MR.strings.pref_verbose_logging),
+                        subtitle = stringResource(MR.strings.pref_verbose_logging_summary),
+                        onValueChanged = {
+                            context.toast(MR.strings.requires_app_restart)
+                            true
+                        },
+                    ),
+                    Preference.PreferenceItem.SwitchPreference(
+                        preference = networkPreferences.redactSensitiveHeaders,
+                        title = stringResource(MR.strings.pref_redact_sensitive_headers),
+                        subtitle = stringResource(MR.strings.pref_redact_sensitive_headers_summary),
+                        onValueChanged = {
+                            context.toast(MR.strings.requires_app_restart)
+                            true
+                        },
+                    ),
+                    Preference.PreferenceItem.TextPreference(
+                        title = stringResource(MR.strings.pref_debug_info),
+                        onClick = { navigator.push(DebugInfoScreen()) },
+                    ),
+                    Preference.PreferenceItem.TextPreference(
+                        title = stringResource(MR.strings.open_debug_menu),
+                        subtitle = stringResource(MR.strings.open_debug_menu_summary),
+                        onClick = { navigator.push(SettingsDebugScreen()) },
+                    ),
+                ),
+            ),
+            Preference.PreferenceGroup(
+                title = stringResource(MR.strings.label_help),
+                preferenceItems = listOf(
+                    Preference.PreferenceItem.TextPreference(
+                        title = stringResource(MR.strings.pref_onboarding_guide),
+                        onClick = { navigator.push(OnboardingScreen()) },
+                    ),
+                ),
+            ),
+            // RK <--
+            getBackgroundActivityGroup(),
+            getDataGroup(),
+            getNetworkGroup(networkPreferences = networkPreferences),
+            getLibraryGroup(libraryPreferences = libraryPreferences),
+            // RK: the reader group also carries the novel reader's WebView dev-tools switch
+            getReaderGroup(basePreferences = basePreferences, novelPreferences = remember { graph.novelPreferences }),
+            getExtensionsGroup(basePreferences = basePreferences),
+        )
+    }
+
+    @Composable
+    private fun getBackgroundActivityGroup(): Preference.PreferenceGroup {
+        val context = LocalContext.current
+        val uriHandler = LocalUriHandler.current
+
+        return Preference.PreferenceGroup(
+            title = stringResource(MR.strings.label_background_activity),
+            preferenceItems = listOf(
+                Preference.PreferenceItem.TextPreference(
+                    title = stringResource(MR.strings.pref_disable_battery_optimization),
+                    subtitle = stringResource(MR.strings.pref_disable_battery_optimization_summary),
+                    onClick = {
+                        val packageName: String = context.packageName
+                        if (!context.powerManager.isIgnoringBatteryOptimizations(packageName)) {
+                            try {
+                                @SuppressLint("BatteryLife")
+                                val intent = Intent().apply {
+                                    action = Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS
+                                    data = "package:$packageName".toUri()
+                                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                }
+                                context.startActivity(intent)
+                            } catch (e: ActivityNotFoundException) {
+                                context.toast(MR.strings.battery_optimization_setting_activity_not_found)
+                            }
+                        } else {
+                            context.toast(MR.strings.battery_optimization_disabled)
+                        }
+                    },
+                ),
+                Preference.PreferenceItem.TextPreference(
+                    title = "Don't kill my app!",
+                    subtitle = stringResource(MR.strings.about_dont_kill_my_app),
+                    onClick = { uriHandler.openUri("https://dontkillmyapp.com/") },
+                ),
+                // RK --> moved from the top of the screen: like battery optimization, it opens Android's own settings
+                Preference.PreferenceItem.TextPreference(
+                    title = stringResource(MR.strings.pref_manage_notifications),
+                    onClick = {
+                        val intent = Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).apply {
+                            putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName)
+                        }
+                        context.startActivity(intent)
+                    },
+                ),
+                // RK <--
+            ),
+        )
+    }
+
+    @Composable
+    private fun getDataGroup(): Preference.PreferenceGroup {
+        val context = LocalContext.current
+        val navigator = LocalNavigator.currentOrThrow
+
+        return Preference.PreferenceGroup(
+            title = stringResource(MR.strings.label_data),
+            preferenceItems = listOf(
+                Preference.PreferenceItem.TextPreference(
+                    title = stringResource(MR.strings.pref_invalidate_download_cache),
+                    subtitle = stringResource(MR.strings.pref_invalidate_download_cache_summary),
+                    onClick = {
+                        context.appGraph.downloadCache.invalidateCache()
+                        context.appGraph.novelDownloadCache.invalidate() // RK
+                        context.toast(MR.strings.download_cache_invalidated)
+                    },
+                ),
+                Preference.PreferenceItem.TextPreference(
+                    title = stringResource(MR.strings.pref_clear_database),
+                    subtitle = stringResource(MR.strings.pref_clear_database_summary),
+                    onClick = { navigator.push(ClearDatabaseScreen()) },
+                ),
+            ),
+        )
+    }
+
+    @Composable
+    private fun getNetworkGroup(
+        networkPreferences: NetworkPreferences,
+    ): Preference.PreferenceGroup {
+        val context = LocalContext.current
+        val networkHelper = remember { context.appGraph.networkHelper }
+        val scope = rememberCoroutineScope()
+
+        val userAgentPref = networkPreferences.defaultUserAgent
+        val userAgent by userAgentPref.collectAsState()
+
+        return Preference.PreferenceGroup(
+            title = stringResource(MR.strings.label_network),
+            preferenceItems = listOf(
+                Preference.PreferenceItem.TextPreference(
+                    title = stringResource(MR.strings.pref_clear_cookies),
+                    onClick = {
+                        networkHelper.cookieJar.removeAll()
+                        context.toast(MR.strings.cookies_cleared)
+                    },
+                ),
+                Preference.PreferenceItem.TextPreference(
+                    title = stringResource(MR.strings.pref_clear_webview_data),
+                    onClick = {
+                        try {
+                            WebView(context).run {
+                                setDefaultSettings()
+                                clearCache(true)
+                                clearFormData()
+                                clearHistory()
+                                clearSslPreferences()
+                            }
+                            WebStorage.getInstance().deleteAllData()
+                            scope.launchIO {
+                                context.applicationInfo?.dataDir?.let { File("$it/app_webview/").deleteRecursively() }
+                                withUIContext { context.toast(MR.strings.webview_data_deleted) }
+                            }
+                        } catch (e: Throwable) {
+                            logcat(LogPriority.ERROR, e)
+                            context.toast(MR.strings.cache_delete_error)
+                        }
+                    },
+                ),
+                Preference.PreferenceItem.ListPreference(
+                    preference = networkPreferences.dohProvider,
+                    entries = mapOf(
+                        -1 to stringResource(MR.strings.disabled),
+                        PREF_DOH_CLOUDFLARE to "Cloudflare",
+                        PREF_DOH_GOOGLE to "Google",
+                        PREF_DOH_ADGUARD to "AdGuard",
+                        PREF_DOH_QUAD9 to "Quad9",
+                        PREF_DOH_ALIDNS to "AliDNS",
+                        PREF_DOH_DNSPOD to "DNSPod",
+                        PREF_DOH_360 to "360",
+                        PREF_DOH_QUAD101 to "Quad 101",
+                        PREF_DOH_MULLVAD to "Mullvad",
+                        PREF_DOH_CONTROLD to "Control D",
+                        PREF_DOH_NJALLA to "Njalla",
+                        PREF_DOH_SHECAN to "Shecan",
+                        PREF_DOH_ZERO_MS to "0ms", // RK
+                    ),
+                    title = stringResource(MR.strings.pref_dns_over_https),
+                    onValueChanged = {
+                        context.toast(MR.strings.requires_app_restart)
+                        true
+                    },
+                ),
+                Preference.PreferenceItem.EditTextPreference(
+                    preference = userAgentPref,
+                    title = stringResource(MR.strings.pref_user_agent_string),
+                    onValueChanged = {
+                        try {
+                            // OkHttp checks for valid values internally
+                            Headers.Builder().add("User-Agent", it)
+                            context.toast(MR.strings.requires_app_restart)
+                        } catch (_: IllegalArgumentException) {
+                            context.toast(MR.strings.error_user_agent_string_invalid)
+                            return@EditTextPreference false
+                        }
+                        true
+                    },
+                ),
+                Preference.PreferenceItem.TextPreference(
+                    title = stringResource(MR.strings.pref_reset_user_agent_string),
+                    visible = remember(userAgent) { userAgent != userAgentPref.defaultValue() },
+                    onClick = {
+                        userAgentPref.delete()
+                        context.toast(MR.strings.requires_app_restart)
+                    },
+                ),
+            ) + proxyPreferenceItems(networkPreferences) + bypassPreferenceItems(networkPreferences), // RK: proxy rows and the Cloudflare bypass rows
+        )
+    }
+
+    @Composable
+    private fun getLibraryGroup(
+        libraryPreferences: LibraryPreferences,
+    ): Preference.PreferenceGroup {
+        val scope = rememberCoroutineScope()
+        val context = LocalContext.current
+
+        // RK --> library maintenance. These stay in Advanced rather than moving beside the everyday merge switches in Library
+        // settings, because dissolving every merge group is destructive and belongs with the other
+        // destructive actions, not one mis-tap from a toggle.
+        val graph = remember { context.appGraph }
+        val mergeManager = remember { graph.mangaMergeManager }
+        val novelMergeManager = remember { graph.novelMergeManager }
+        val repairNovelDetails = remember { graph.repairNovelDetails }
+        // Their database work runs off the main thread and finishes if the screen is left
+        val appScope = remember { graph.appCoroutineScope }
+        val appContext = context.applicationContext
+        // RK <--
+
+        return Preference.PreferenceGroup(
+            title = stringResource(MR.strings.label_library),
+            preferenceItems = listOf(
+                Preference.PreferenceItem.TextPreference(
+                    title = stringResource(MR.strings.pref_refresh_library_covers),
+                    onClick = { scope.launch { MetadataUpdateWorker.startNow(context.workManager) } },
+                ),
+                Preference.PreferenceItem.TextPreference(
+                    title = stringResource(MR.strings.pref_reset_viewer_flags),
+                    subtitle = stringResource(MR.strings.pref_reset_viewer_flags_summary),
+                    onClick = {
+                        scope.launch {
+                            val success = context.appGraph.resetViewerFlags.await()
+                            val message = if (success) {
+                                MR.strings.pref_reset_viewer_flags_success
+                            } else {
+                                MR.strings.pref_reset_viewer_flags_error
+                            }
+                            context.toast(message)
+                        }
+                    },
+                ),
+                Preference.PreferenceItem.SwitchPreference(
+                    preference = libraryPreferences.updateMangaTitles,
+                    title = stringResource(MR.strings.pref_update_library_manga_titles),
+                    subtitle = stringResource(MR.strings.pref_update_library_manga_titles_summary),
+                ),
+                Preference.PreferenceItem.SwitchPreference(
+                    preference = libraryPreferences.disallowNonAsciiFilenames,
+                    title = stringResource(MR.strings.pref_disallow_non_ascii_filenames),
+                    subtitle = stringResource(MR.strings.pref_disallow_non_ascii_filenames_details),
+                ),
+                Preference.PreferenceItem.SwitchPreference(
+                    preference = libraryPreferences.enableChapterNameHash,
+                    title = stringResource(MR.strings.pref_enable_chapter_name_hash),
+                    subtitle = stringResource(MR.strings.pref_enable_chapter_name_hash_details),
+                ),
+                // RK --> dissolve every merge group. The old "clear manual" vs "separate auto" split
+                // collapsed after the rebuild (both now clear every group), so it is one action per type.
+                Preference.PreferenceItem.TextPreference(
+                    title = contentTypedCategory(MR.strings.pref_clear_merges, MR.strings.content_type_manga),
+                    subtitle = stringResource(MR.strings.pref_clear_merges_summary),
+                    onClick = {
+                        appScope.launch {
+                            mergeManager.clearAllMergesIncludingAuto()
+                            withUIContext { appContext.toast(MR.strings.merges_cleared) }
+                        }
+                    },
+                ),
+                Preference.PreferenceItem.TextPreference(
+                    title = contentTypedCategory(MR.strings.pref_clear_merges, MR.strings.content_type_novels),
+                    subtitle = stringResource(MR.strings.pref_clear_merges_summary),
+                    onClick = {
+                        appScope.launch {
+                            novelMergeManager.clearAllMergesIncludingAuto()
+                            withUIContext { appContext.toast(MR.strings.merges_cleared) }
+                        }
+                    },
+                ),
+                // Repair novels left wearing another novel's details by the plugin-host result mix-up
+                // (fixed, but rows written before the fix stay wrong until something re-fetches them).
+                Preference.PreferenceItem.TextPreference(
+                    title = stringResource(MR.strings.pref_repair_novel_details),
+                    subtitle = stringResource(MR.strings.pref_repair_novel_details_summary),
+                    onClick = {
+                        appScope.launch {
+                            val result = repairNovelDetails.await()
+                            withUIContext {
+                                if (result.suspects == 0) {
+                                    appContext.toast(MR.strings.novel_details_repair_none)
+                                } else {
+                                    appContext.toast(
+                                        appContext.stringResource(
+                                            MR.strings.novel_details_repair_done,
+                                            result.repaired,
+                                            result.suspects,
+                                        ),
+                                    )
+                                }
+                            }
+                        }
+                    },
+                ),
+                // RK <--
+            ),
+        )
+    }
+
+    @Composable
+    private fun getReaderGroup(
+        basePreferences: BasePreferences,
+        // RK
+        novelPreferences: NovelPreferences,
+    ): Preference.PreferenceGroup {
+        return Preference.PreferenceGroup(
+            title = stringResource(MR.strings.pref_category_reader),
+            preferenceItems = listOf(
+                Preference.PreferenceItem.SwitchPreference(
+                    preference = basePreferences.highQualityRenderer,
+                    title = stringResource(MR.strings.pref_high_quality_renderer),
+                ),
+                // RK -->
+                Preference.PreferenceItem.SwitchPreference(
+                    preference = novelPreferences.readerWebViewDevTools(),
+                    title = stringResource(MR.strings.pref_novel_webview_dev_tools),
+                    subtitle = stringResource(MR.strings.pref_novel_webview_dev_tools_summary),
+                ),
+                // RK <--
+            ),
+        )
+    }
+
+    @Composable
+    private fun getExtensionsGroup(
+        basePreferences: BasePreferences,
+    ): Preference.PreferenceGroup {
+        val context = LocalContext.current
+        val uriHandler = LocalUriHandler.current
+        val extensionInstallerPref = basePreferences.extensionInstaller
+        var shizukuMissing by rememberSaveable { mutableStateOf(false) }
+        val trustExtension = remember { context.appGraph.trustExtension }
+
+        if (shizukuMissing) {
+            val dismiss = { shizukuMissing = false }
+            AlertDialog(
+                onDismissRequest = dismiss,
+                title = { Text(text = stringResource(MR.strings.ext_installer_shizuku)) },
+                text = { Text(text = stringResource(MR.strings.ext_installer_shizuku_unavailable_dialog)) },
+                dismissButton = {
+                    TextButton(onClick = dismiss) {
+                        Text(text = stringResource(MR.strings.action_cancel))
+                    }
+                },
+                confirmButton = {
+                    TextButton(
+                        onClick = {
+                            dismiss()
+                            uriHandler.openUri("https://shizuku.rikka.app/download")
+                        },
+                    ) {
+                        Text(text = stringResource(MR.strings.action_ok))
+                    }
+                },
+            )
+        }
+        return Preference.PreferenceGroup(
+            title = stringResource(MR.strings.label_extensions),
+            preferenceItems = listOf(
+                Preference.PreferenceItem.ListPreference(
+                    preference = extensionInstallerPref,
+                    entries = extensionInstallerPref.entries
+                        .filter {
+                            // TODO: allow private option in stable versions once URL handling is more fleshed out
+                            if (isReleaseBuildType) {
+                                it != BasePreferences.ExtensionInstaller.PRIVATE
+                            } else {
+                                true
+                            }
+                        }
+                        .associateWith { stringResource(it.titleRes) },
+                    title = stringResource(MR.strings.ext_installer_pref),
+                    onValueChanged = {
+                        if (it == BasePreferences.ExtensionInstaller.SHIZUKU &&
+                            !context.isShizukuInstalled
+                        ) {
+                            shizukuMissing = true
+                            false
+                        } else {
+                            true
+                        }
+                    },
+                ),
+                Preference.PreferenceItem.TextPreference(
+                    title = stringResource(MR.strings.ext_revoke_trust),
+                    onClick = { trustExtension.revokeAll() },
+                ),
+            ),
+        )
+    }
+}

@@ -1,0 +1,406 @@
+package eu.kanade.tachiyomi.ui.manga
+
+import android.content.Context
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.toArgb
+import androidx.compose.ui.platform.LocalContext
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import cafe.adriel.voyager.navigator.LocalNavigator
+import cafe.adriel.voyager.navigator.Navigator
+import cafe.adriel.voyager.navigator.currentOrThrow
+import dev.zacsweers.metrox.viewmodel.assistedMetroViewModel
+import eu.kanade.domain.manga.model.hasCustomCover
+import eu.kanade.presentation.category.components.ChangeCategoryDialog
+import eu.kanade.presentation.manga.ChapterSettingsDialog
+import eu.kanade.presentation.manga.components.ScanlatorFilterDialog
+import eu.kanade.presentation.theme.TachiyomiTheme
+import raito.presentation.theme.CoverTheme
+import raito.presentation.theme.rememberCoverSeed
+import eu.kanade.presentation.util.AssistContentScreen
+import eu.kanade.presentation.util.Screen
+import eu.kanade.presentation.util.isTabletUi
+import eu.kanade.tachiyomi.source.Source
+import eu.kanade.tachiyomi.source.isLocalOrStub
+import eu.kanade.tachiyomi.source.online.HttpSource
+import eu.kanade.tachiyomi.source.online.MetadataSource
+import eu.kanade.tachiyomi.ui.browse.extension.details.SourcePreferencesScreen
+import eu.kanade.tachiyomi.ui.category.CategoryScreen
+import eu.kanade.tachiyomi.ui.manga.notes.MangaNotesScreen
+import eu.kanade.tachiyomi.ui.reader.ReaderActivity
+import eu.kanade.tachiyomi.ui.setting.SettingsScreen
+import exh.pagepreview.PagePreviewScreen
+import exh.source.configurableSource
+import exh.source.getMainSource
+import exh.ui.metadata.MetadataViewScreen
+import kotlinx.coroutines.launch
+import mihon.app.di.appGraph
+import raito.domain.entry.EntryId
+import raito.domain.entry.withCustomInfo // RK
+import raito.domain.library.ContentType
+import raito.domain.source.SourceKey
+import raito.presentation.browse.catalogue.EntryCatalogueScreen
+import raito.presentation.browse.components.EntryDuplicateDialog
+import raito.presentation.browse.components.toDuplicateCard
+import raito.presentation.browse.globalsearch.EntryGlobalSearchScreen
+import raito.presentation.details.EntryDetailsContent
+import raito.presentation.details.EntryDetailsDialog
+import raito.presentation.details.EntryDetailsDialogHost
+import raito.presentation.details.EntryDetailsNavigation
+import raito.presentation.details.EntryDetailsScreenState
+import raito.presentation.details.EntryDetailsSkeleton
+import raito.presentation.details.EntryEditInfoUi
+import raito.presentation.details.MangaEntryAdapter
+import raito.presentation.details.chapterToOpen
+import raito.presentation.details.openDownloadFolder
+import raito.presentation.details.searchGenreFromDetails
+import raito.presentation.details.searchLibraryFromDetails
+import raito.presentation.manga.EhRemoveFavoriteDialog
+import raito.presentation.migrate.flow.EntryMigrateFor
+import raito.presentation.migrate.flow.EntryMigrationSourcePickScreen
+import raito.presentation.recommendation.browse.RelatedMangasBrowseScreen
+import raito.presentation.recommendation.relatedDestination
+import tachiyomi.domain.chapter.model.Chapter
+import tachiyomi.domain.manga.model.Manga
+import tachiyomi.domain.manga.model.MangaCover
+import tachiyomi.domain.manga.model.MangaWithChapterCount
+
+class MangaScreen(
+    val mangaId: Long, // RK: exposed so the migrate flow can identity-check the screen below it
+    val fromSource: Boolean = false,
+) : Screen(), AssistContentScreen {
+
+    private var assistUrl: String? = null
+
+    override fun onProvideAssistUrl() = assistUrl
+
+    @Composable
+    override fun Content() {
+        val navigator = LocalNavigator.currentOrThrow
+        val context = LocalContext.current
+        val scope = rememberCoroutineScope()
+        // RK: no haptic read; upstream's MangaScreen composable that took it is replaced below
+        val viewModel = assistedMetroViewModel<MangaViewModel, MangaViewModel.Factory> {
+            create(mangaId = mangaId, isFromSource = fromSource)
+        }
+
+        // RK: the E-Hentai root redirect opens the gallery's favorited copy in this screen's place
+        LaunchedEffect(viewModel) {
+            viewModel.exhRootRedirects.collect { navigator.replace(MangaScreen(it)) }
+        }
+
+        val state by viewModel.state.collectAsStateWithLifecycle()
+
+        if (state is MangaViewModel.State.Loading) {
+            EntryDetailsSkeleton() // RK: the details page's shape while it loads, shared with novels
+            return
+        }
+
+        val successState = state as MangaViewModel.State.Success
+        // RK: the assistant link is the shown member's page, which the model resolves (EntryWebPage)
+        LaunchedEffect(successState.webPage) { assistUrl = successState.webPage?.url }
+
+        // RK: load the related-mangas carousel once the screen is open (idempotent per open).
+        LaunchedEffect(successState.manga.id) {
+            viewModel.loadRelatedMangas()
+        }
+
+        // RK: extract the cover's vibrant color to tint the screen.
+        LaunchedEffect(successState.manga.id) {
+            viewModel.updateSeedColor()
+        }
+
+        // RK --> the shared details body renders through the manga adapter over the live model.
+        val coverViewModelFactory = remember { context.appGraph.mangaCoverViewModelFactory }
+        val adapter = remember(viewModel) { MangaEntryAdapter(viewModel, coverViewModelFactory) }
+        val neutralState by adapter.state.collectAsStateWithLifecycle()
+
+        // RK: tint the details screen from the cover color
+        val coverSeed = rememberCoverSeed(
+            id = EntryId.Manga(successState.manga.id),
+            extracted = successState.seedColor,
+            enabled = viewModel.themeCoverBased,
+        )
+        CoverTheme(coverSeed) {
+            (neutralState as? EntryDetailsScreenState.Loaded)?.let { loaded ->
+                EntryDetailsContent(
+                    behavior = adapter,
+                    state = loaded,
+                    snackbarHostState = viewModel.snackbarHostState,
+                    isTabletUi = isTabletUi(),
+                    chapterSwipeStartAction = viewModel.chapterSwipeStartAction,
+                    chapterSwipeEndAction = viewModel.chapterSwipeEndAction,
+                    nav = EntryDetailsNavigation(
+                        navigateUp = navigator::pop,
+                        // A specific source chip opens source scope; the All chip (null) opens group scope.
+                        // Reads the model's state at the tap rather than capturing this emission's, so the
+                        // lambda outlives an emission and the chapter rows can skip recomposing.
+                        onOpenChapter = { chapterId ->
+                            (viewModel.state.value as? MangaViewModel.State.Success)?.let { live ->
+                                val listed = live.chapters.map { it.chapter }
+                                chapterToOpen(chapterId, listed, live.resumeChapter, Chapter::id)?.let {
+                                    openChapter(context, it, live.selectedSourceMangaId != null)
+                                }
+                            }
+                        },
+                        onGlobalSearch = { scope.launch { performSearch(navigator, it, global = true) } },
+                        // The viewed source, since the tags on screen are the selected chip's.
+                        onTagSearch = { genre ->
+                            scope.launch { performGenreSearch(navigator, genre, successState.shownSource) }
+                        },
+                        onOpenTrackingSettings = {
+                            navigator.push(SettingsScreen(SettingsScreen.Destination.Tracking))
+                        },
+                        onEditNotes = { navigator.push(MangaNotesScreen(manga = successState.manga)) },
+                        onOpenFilterSettings = viewModel::showSettingsDialog,
+                        onMigrate = {
+                            // Source picker first, so a merged manga can pick which source to migrate.
+                            navigator.push(
+                                EntryMigrationSourcePickScreen(ContentType.MANGA, listOf(successState.manga.id)),
+                            )
+                        },
+                        onEditInterval = viewModel::showSetFetchIntervalDialog,
+                        onRelatedClick = { candidate ->
+                            scope.launch {
+                                val id = viewModel.resolveRelatedToLocalId(candidate)
+                                    ?: context.appGraph.trackerCandidateResolver.resolve(candidate)
+                                navigator.push(relatedDestination(candidate, id))
+                            }
+                        },
+                        onRelatedSeeAll = {
+                            navigator.push(RelatedMangasBrowseScreen(successState.manga.id, successState.manga.title))
+                        },
+                        // Recommendations moved to the overflow menu (Settings > Library > Recommendations):
+                        // open the same browse grid "See all" uses. Null keeps it off when placed inline.
+                        onRecommendations = {
+                            navigator.push(RelatedMangasBrowseScreen(successState.manga.id, successState.manga.title))
+                        }.takeIf { viewModel.recommendationsInMenu },
+                        onOpenPagePreview = { page ->
+                            openPagePreview(
+                                context,
+                                successState.chapters.minByOrNull { it.chapter.sourceOrder }?.chapter,
+                                page,
+                            )
+                        },
+                        onMorePreviews = { navigator.push(PagePreviewScreen(successState.manga.id)) },
+                        onLibrarySearch = { query ->
+                            scope.launch { performSearch(navigator, query, global = false) }
+                        },
+                        // The viewed source, and null on a stub: there is no catalogue to open for an
+                        // extension that is not installed.
+                        onBrowseSource = successState.shownSource
+                            .takeIf { !it.isLocalOrStub() }
+                            ?.let { source -> { navigator.push(EntryCatalogueScreen(SourceKey.Manga(source.id))) } },
+                        onOpenFolder = { scope.launch { openDownloadFolder(context, viewModel.viewedDownloadDir()) } },
+                        // The viewed source, as the metadata viewer resolves it, so a merged entry
+                        // opens the settings of the source its chip is showing.
+                        onOpenSourceSettings = successState.shownSource
+                            .takeIf { it.configurableSource() != null }
+                            ?.let { source -> { navigator.push(SourcePreferencesScreen(source.id)) } },
+                        // Gallery metadata viewer, only for adult/metadata sources; follows the viewed source
+                        // (the selected chip), so enhanced-MangaDex "More info" shows even when the merge is
+                        // anchored on a non-metadata source.
+                        onMetadataViewer = {
+                            navigator.push(
+                                MetadataViewScreen(
+                                    mangaId = successState.shownManga.id,
+                                    sourceId = successState.shownSource.id,
+                                    seedColor = successState.seedColor?.toArgb(),
+                                ),
+                            )
+                        }.takeIf { successState.shownSource.getMainSource<MetadataSource<*, *>>() != null },
+                    ),
+                )
+            }
+        } // RK: end cover-based theme wrap
+        // RK <--
+
+        var showScanlatorsDialog by remember { mutableStateOf(false) }
+
+        val onDismissRequest = { viewModel.dismissDialog() }
+        // RK: tint every details dialog from the cover (when that theme is on), matching the details
+        // content and the novel side; the content wrap above ends before the dialogs, so re-apply it.
+        TachiyomiTheme(seedColor = coverSeed.color) {
+            EntryDetailsDialogHost(
+                successState.toSharedDetailsDialog(viewModel.isUpdateIntervalEnabled),
+                adapter,
+                onDismissRequest,
+            )
+            when (val dialog = successState.dialog) {
+                // RK --> shared duplicate and migrate dialogs; a category pick can also join a merge group
+                is MangaViewModel.Dialog.ChangeCategory -> {
+                    ChangeCategoryDialog(
+                        initialSelection = dialog.initialSelection,
+                        onDismissRequest = onDismissRequest,
+                        onEditCategories = { navigator.push(CategoryScreen()) },
+                        onConfirm = { include, _ ->
+                            viewModel.moveMangaToCategoriesAndAddToLibrary(dialog.manga, include)
+                        },
+                    )
+                }
+                is MangaViewModel.Dialog.DuplicateManga -> {
+                    EntryDuplicateDialog(
+                        prompt = dialog.prompt,
+                        card = MangaWithChapterCount::toDuplicateCard,
+                        onDismissRequest = onDismissRequest,
+                        onConfirm = { viewModel.toggleFavorite(checkDuplicate = false) },
+                        onOpen = { navigator.push(MangaScreen(it.manga.id)) },
+                        onMigrate = { viewModel.showMigrateDialog(it.manga) },
+                        onAddToGroup = viewModel::addToExistingGroup,
+                    )
+                }
+
+                is MangaViewModel.Dialog.Migrate -> {
+                    EntryMigrateFor(
+                        contentType = ContentType.MANGA,
+                        currentId = dialog.current.id,
+                        targetId = dialog.target.id,
+                        onDismissRequest = onDismissRequest,
+                    )
+                }
+                // RK <--
+                MangaViewModel.Dialog.SettingsSheet -> ChapterSettingsDialog(
+                    onDismissRequest = onDismissRequest,
+                    manga = successState.manga,
+                    onDownloadFilterChanged = viewModel::setDownloadedFilter,
+                    onUnreadFilterChanged = viewModel::setUnreadFilter,
+                    onBookmarkedFilterChanged = viewModel::setBookmarkedFilter,
+                    onSortModeChanged = viewModel::setSorting,
+                    onDisplayModeChanged = viewModel::setDisplayMode,
+                    onSetAsDefault = viewModel::setCurrentSettingsAsDefault,
+                    onResetToDefault = viewModel::resetToDefaultSettings,
+                    scanlatorFilterActive = successState.scanlatorFilterActive,
+                    onScanlatorFilterClicked = { showScanlatorsDialog = true },
+                )
+                // RK -->
+                is MangaViewModel.Dialog.EhRemoveFavorite -> {
+                    EhRemoveFavoriteDialog(
+                        onDismissRequest = onDismissRequest,
+                        onConfirm = { viewModel.confirmEhRemoveFromLibrary(dialog.manga, it) },
+                    )
+                }
+                // RK <--
+                else -> {}
+            }
+
+            if (showScanlatorsDialog) {
+                ScanlatorFilterDialog(
+                    availableScanlators = successState.availableScanlators,
+                    excludedScanlators = successState.excludedScanlators,
+                    onDismissRequest = { showScanlatorsDialog = false },
+                    onConfirm = viewModel::setExcludedScanlators,
+                )
+            }
+        } // RK: end dialogs cover-theme wrap
+    }
+
+    // RK: sourceScoped opens just the active source chip's own list; group scope (the All chip, so
+    // no chip selected) opens the whole merge group.
+    private fun openChapter(context: Context, chapter: Chapter, sourceScoped: Boolean) {
+        context.startActivity(
+            ReaderActivity.newIntent(context, chapter.mangaId, chapter.id, sourceScoped = sourceScoped),
+        )
+    }
+
+    // RK: open the reader at a specific page from a gallery page preview.
+    private fun openPagePreview(context: Context, chapter: Chapter?, page: Int) {
+        chapter ?: return
+        context.startActivity(ReaderActivity.newIntent(context, chapter.mangaId, chapter.id, page))
+    }
+
+    // RK: getMangaUrl, openMangaInWebView and shareManga moved to EntryWebPage, shared with novels
+
+    /**
+     * Perform a search using the provided query.
+     *
+     * @param query the search query to the parent controller
+     */
+    // RK --> Walks the back stack rather than looking one screen back, which is upstream's shape: a
+    //        details screen reached from history, updates, a deep link or a related hop has no library
+    //        directly behind it, so the search silently did nothing. It walks past any catalogue so it
+    //        always lands on the library, and carries this entry's content type, because the library
+    //        searches whichever type chip is open. A catalogue is only a genre's target, see below.
+    private suspend fun performSearch(navigator: Navigator, query: String, global: Boolean) {
+        if (global) {
+            navigator.push(EntryGlobalSearchScreen(query, scopedContentType = ContentType.MANGA))
+            return
+        }
+
+        navigator.searchLibraryFromDetails(query, ContentType.MANGA)
+    }
+    // RK <--
+
+    /**
+     * Performs a genre search using the provided genre name.
+     *
+     * @param genreName the search genre to the parent controller
+     */
+    // RK: the walk novels share, which only returns to this source's own catalogue.
+    private suspend fun performGenreSearch(navigator: Navigator, genreName: String, source: Source) {
+        navigator.searchGenreFromDetails(
+            genreName,
+            SourceKey.Manga(source.id),
+            ContentType.MANGA,
+            filterable = source is HttpSource,
+        )
+    }
+
+    // RK: copyMangaUrl moved to EntryWebPage (rememberEntryWebActions), which cannot throw
+}
+
+// RK: seed the shared edit-info dialog from a manga's effective (overlaid) values.
+internal fun Manga.toEntryEditInfoUi() = EntryEditInfoUi(
+    title = title,
+    author = author.orEmpty(),
+    artist = artist.orEmpty(),
+    description = description.orEmpty(),
+    genre = genre.orEmpty(),
+    status = status,
+    thumbnailUrl = thumbnailUrl.orEmpty(),
+)
+
+// RK: map a manga dialog to the shared union for the dialogs both content types render (EntryDetailsDialogHost);
+// the per-type ones (change-category, duplicate, chapter-settings, migrate, fetch-interval, ...) stay above.
+private fun MangaViewModel.State.Success.toSharedDetailsDialog(isUpdateIntervalEnabled: Boolean): EntryDetailsDialog? =
+    when (val d = dialog) {
+        is MangaViewModel.Dialog.SetFetchInterval -> EntryDetailsDialog.SetFetchInterval(
+            interval = d.manga.fetchInterval,
+            nextUpdate = d.manga.expectedNextUpdate,
+            editable = isUpdateIntervalEnabled,
+        )
+        is MangaViewModel.Dialog.EditMangaInfo -> EntryDetailsDialog.EditInfo(
+            // Seed with the effective (overlaid) values; save diffs each field against the raw source manga.
+            initial = d.manga.withCustomInfo(customInfo).toEntryEditInfoUi(),
+            source = d.manga.toEntryEditInfoUi(),
+            seedColor = seedColor,
+            coverModel = { url ->
+                MangaCover(
+                    mangaId = d.manga.id,
+                    sourceId = d.manga.source,
+                    isMangaFavorite = d.manga.favorite,
+                    url = url.ifBlank { null },
+                    lastModified = d.manga.coverLastModified,
+                )
+            },
+        )
+        MangaViewModel.Dialog.FullCover -> EntryDetailsDialog.Cover
+        is MangaViewModel.Dialog.ManageSources -> EntryDetailsDialog.ManageSources(
+            sources = d.sources,
+            isOverridden = d.isOverridden,
+        )
+        MangaViewModel.Dialog.TrackSheet -> EntryDetailsDialog.TrackSheet(EntryId.Manga(manga.id), manga.title)
+        is MangaViewModel.Dialog.DeleteChapters -> EntryDetailsDialog.DeleteChapters(d.chapters.map { it.id })
+        is MangaViewModel.Dialog.ClearDownloads -> EntryDetailsDialog.ClearDownloads(d.target)
+        is MangaViewModel.Dialog.RemoveFromLibrary -> EntryDetailsDialog.RemoveFromLibrary(
+            d.removal,
+            manga.withCustomInfo(customInfo).title,
+        )
+        is MangaViewModel.Dialog.ChapterNumber -> EntryDetailsDialog.ChapterNumber(d.edit)
+        else -> null
+    }

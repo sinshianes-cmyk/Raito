@@ -1,0 +1,86 @@
+package raito.domain.novel.track
+
+import eu.kanade.tachiyomi.data.database.models.TrackImpl
+import eu.kanade.tachiyomi.data.track.EnhancedTracker
+import eu.kanade.tachiyomi.data.track.Tracker
+import io.kotest.matchers.shouldBe
+import io.mockk.coEvery
+import io.mockk.every
+import io.mockk.mockk
+import kotlinx.coroutines.test.runTest
+import org.junit.jupiter.api.Test
+import raito.domain.novel.NovelTrackRepository
+import raito.domain.novel.interactor.UpsertNovelTrack
+import raito.domain.novel.model.NovelTrack
+import kotlin.time.Instant
+import eu.kanade.tachiyomi.data.database.models.Track as DbTrack
+
+/** Verifies the shared status/score transitions ([raito.domain.track.TrackFieldMutations]) land in `novel_tracks`. */
+class NovelTrackUpdaterTest {
+
+    private val reading = 2L
+    private val rereading = 5L
+    private val completed = 3L
+
+    private val tracker = mockk<Tracker>(relaxed = true) {
+        every { getReadingStatus() } returns reading
+        every { getRereadingStatus() } returns rereading
+        every { getCompletionStatus() } returns completed
+        coEvery { update(any(), any()) } answers { firstArg() }
+    }
+
+    private val inserted = mutableListOf<NovelTrack>()
+    private val repository = mockk<NovelTrackRepository> {
+        coEvery { upsert(any()) } answers { inserted.add(firstArg<NovelTrack>()) }
+    }
+
+    // Only reached to toast a remote failure, which none of these cases takes.
+    private val updater = NovelTrackUpdater(UpsertNovelTrack(repository), mockk(relaxed = true))
+
+    private fun dbTrack(lastRead: Double = 0.0, total: Long = 0, status: Long = 0): DbTrack =
+        TrackImpl().also {
+            it.id = 1L
+            it.manga_id = 42L
+            it.tracker_id = 2L
+            it.title = "t"
+            it.last_chapter_read = lastRead
+            it.total_chapters = total
+            it.status = status
+        }
+
+    @Test
+    fun `first progress flips an unread track to reading`() = runTest {
+        updater.setRemoteLastChapterRead(tracker, dbTrack(lastRead = 0.0, total = 10), 3)
+        inserted.single().let {
+            it.lastChapterRead shouldBe 3.0
+            it.status shouldBe reading
+        }
+    }
+
+    @Test
+    fun `reaching the total marks completed and stamps a finish date`() = runTest {
+        updater.setRemoteLastChapterRead(tracker, dbTrack(lastRead = 9.0, total = 10, status = reading), 10)
+        inserted.single().let {
+            it.status shouldBe completed
+            (it.finishDate != null) shouldBe true
+        }
+    }
+
+    @Test
+    fun `setting completed status snaps last chapter to the total`() = runTest {
+        updater.setRemoteStatus(tracker, dbTrack(lastRead = 4.0, total = 10), completed)
+        inserted.single().lastChapterRead shouldBe 10.0
+    }
+
+    @Test
+    fun `a server tracker is not sent an update for a status change on nothing read`() = runTest {
+        val sent = mutableListOf<DbTrack>()
+        val server = mockk<Tracker>(relaxed = true, moreInterfaces = arrayOf(EnhancedTracker::class)) {
+            coEvery { update(any(), any()) } answers { firstArg<DbTrack>().also(sent::add) }
+        }
+
+        updater.setRemoteStatus(server, dbTrack(lastRead = 0.0), reading)
+
+        sent shouldBe emptyList()
+    }
+}

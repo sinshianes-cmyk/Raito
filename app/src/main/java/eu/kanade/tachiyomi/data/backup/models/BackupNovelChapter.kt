@@ -1,0 +1,50 @@
+// Novel backup. Net-new Raito file: novel-chapter twin of BackupChapter, type only.
+package eu.kanade.tachiyomi.data.backup.models
+
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.protobuf.ProtoNumber
+import mihon.core.common.extensions.toInstantOrNull
+import raito.domain.novel.model.NovelChapter
+import kotlin.time.Instant
+
+@Serializable
+class BackupNovelChapter(
+    @ProtoNumber(1) var url: String,
+    @ProtoNumber(2) var name: String,
+    @ProtoNumber(3) var read: Boolean = false,
+    @ProtoNumber(4) var bookmark: Boolean = false,
+    // lastTextProgress: hundredths scroll percent (the novel reader's resume point).
+    @ProtoNumber(5) var lastTextProgress: Long = 0,
+    @ProtoNumber(6) var chapterNumber: Double = 0.0,
+    @ProtoNumber(7) var sourceOrder: Long = 0,
+    @ProtoNumber(8) var dateFetch: Long = 0,
+    @ProtoNumber(9) var dateUpload: Long = 0,
+    // page: volume/section label for paged sources; empty when the source doesn't expose it.
+    @ProtoNumber(10) var page: String = "",
+    @ProtoNumber(11) var scanlator: String? = null,
+    // The source's own number when the user corrected it, as BackupChapter carries it. Null when uncorrected.
+    @ProtoNumber(12) var sourceChapterNumber: Double? = null,
+    // No download flag is carried: the on-disk text file isn't in the backup, so downloaded state is
+    // rederived from disk by NovelDownloadCache after restore.
+) {
+    fun toChapterImpl(novelId: Long): NovelChapter {
+        return NovelChapter(
+            id = -1L,
+            novelId = novelId,
+            url = this@BackupNovelChapter.url,
+            name = this@BackupNovelChapter.name,
+            read = this@BackupNovelChapter.read,
+            bookmark = this@BackupNovelChapter.bookmark,
+            lastTextProgress = this@BackupNovelChapter.lastTextProgress,
+            chapterNumber = this@BackupNovelChapter.chapterNumber,
+            sourceOrder = this@BackupNovelChapter.sourceOrder,
+            dateFetch = Instant.fromEpochMilliseconds(this@BackupNovelChapter.dateFetch),
+            dateUpload = this@BackupNovelChapter.dateUpload.toInstantOrNull(),
+            page = this@BackupNovelChapter.page,
+            scanlator = this@BackupNovelChapter.scanlator,
+            // A page sync reads a stored raw number as the plugin's, so a corrected chapter starts from
+            // the source's number, never the user's; others from their stored number, as 63.sqm seeds.
+            rawChapterNumber = this@BackupNovelChapter.sourceChapterNumber ?: this@BackupNovelChapter.chapterNumber,
+        )
+    }
+}

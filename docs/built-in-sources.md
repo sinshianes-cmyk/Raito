@@ -1,0 +1,43 @@
+---
+title: Built-in sources
+titleTemplate: Reference
+description: Which sources ship with Raito, which are wrapped extensions, and which bugs belong here.
+---
+
+# Built-in sources
+
+_Dev records: [adult-sources.md](dev/subsystems/adult-sources.md). Doc map: [README.md](README.md)._
+
+Most sources in **Raito** come from extensions you install yourself.
+A few come from Raito, and those are the ones whose bugs belong in this repository.
+
+- **Built-in** means Raito ships it. There is no extension to install, and a bug in it is Raito's.
+- **Enhanced** means you install a third-party extension and Raito wraps it to add metadata, login or other features. How the wrapper behaves is Raito's; the extension itself belongs to whoever publishes it.
+
+The adult switch treats the two differently. A built-in adult source only appears once [adult sources](adult-sources.md) are switched on, while an enhanced one is wrapped whenever its extension is installed, switch or no switch.
+**Enable delegated sources**, just below it in <nav to="browse">, is the switch for the enhanced ones: on by default, and turning it off leaves each of those extensions as it ships.
+
+## Reporting a bug in one
+
+Keep the issue title general, for example "Error opening a built-in gallery source", and name the source by its shorthand in the body.
+That keeps the tracker readable without turning issue titles into a list of site names.
+
+| Shorthand | Source | Type | Content |
+| --------- | ------ | ---- | ------- |
+| EH  | E-Hentai | Built-in | Adult |
+| ExH | ExHentai | Built-in | Adult |
+| NH  | nHentai | Built-in + Enhanced | Adult |
+| Pu  | Pururin | Built-in | Adult |
+| HF  | HentaiFox | Enhanced | Adult |
+| Asm | AsmHentai | Enhanced | Adult |
+| SN  | SchaleNetwork (Koharu) | Enhanced | Adult |
+| 8M  | 8Muses | Enhanced | Adult |
+| HN  | HentaiNexus | Enhanced | Adult |
+| 9H  | NineHentai | Enhanced | Adult |
+| Hi  | Hitomi | Enhanced | Adult |
+| LRR | LANraragi | Enhanced | Adult |
+| MD  | MangaDex | Enhanced | Mainstream |
+
+::: info Anything not in this table is a third-party extension
+Its bugs belong to whoever publishes it, not here.
+:::

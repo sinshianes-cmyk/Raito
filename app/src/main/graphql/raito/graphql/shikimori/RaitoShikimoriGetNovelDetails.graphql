@@ -1,0 +1,11 @@
+query RaitoShikimoriGetNovelDetails(
+  $query: String!,
+) {
+  mangas(
+    ids: $query,
+    limit: 1,
+    kind: "light_novel,novel",
+  ) {
+    ...MangaFragment
+  }
+}

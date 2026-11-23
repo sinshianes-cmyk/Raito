@@ -1,0 +1,73 @@
+package tachiyomi.data.history
+
+import tachiyomi.domain.history.model.History
+import tachiyomi.domain.history.model.HistoryWithRelations
+import tachiyomi.domain.manga.model.MangaCover
+import kotlin.time.Instant
+
+object HistoryMapper {
+    fun mapHistory(
+        id: Long,
+        chapterId: Long,
+        readAt: Instant?,
+        readDuration: Long,
+    ): History = History(
+        id = id,
+        chapterId = chapterId,
+        readAt = readAt,
+        readDuration = readDuration,
+    )
+
+    fun mapHistoryWithRelations(
+        historyId: Long,
+        mangaId: Long,
+        chapterId: Long,
+        title: String,
+        thumbnailUrl: String?,
+        sourceId: Long,
+        isFavorite: Boolean,
+        coverLastModified: Instant?,
+        chapterNumber: Double,
+        // RK: the chapter's own state and download-lookup keys, see HistoryWithRelations.
+        chapterName: String,
+        scanlator: String?,
+        chapterUrl: String,
+        read: Boolean,
+        bookmark: Boolean,
+        lastPageRead: Int,
+        pageCount: Int,
+        readAt: Instant?,
+        readDuration: Long,
+        // RK: series counts for the History card's progress bar.
+        chapterCount: Long,
+        chaptersRead: Long,
+    ): HistoryWithRelations = HistoryWithRelations(
+        id = historyId,
+        chapterId = chapterId,
+        mangaId = mangaId,
+        title = title,
+        chapterNumber = chapterNumber,
+        readAt = readAt,
+        readDuration = readDuration,
+        // RK -->
+        chapterName = chapterName,
+        scanlator = scanlator,
+        chapterUrl = chapterUrl,
+        read = read,
+        bookmark = bookmark,
+        lastPageRead = lastPageRead,
+        pageCount = pageCount,
+        sourceId = sourceId,
+        storedTitle = title,
+        chapterCount = chapterCount.toInt(),
+        chaptersRead = chaptersRead.toInt(),
+        // RK <--
+        coverData = MangaCover(
+            mangaId = mangaId,
+            sourceId = sourceId,
+            isMangaFavorite = isFavorite,
+            url = thumbnailUrl,
+            lastModified = coverLastModified,
+        ),
+    )
+}

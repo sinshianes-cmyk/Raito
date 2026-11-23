@@ -1,0 +1,101 @@
+package eu.kanade.presentation.browse
+
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.material3.FilledTonalButton
+import androidx.compose.material3.FilledTonalIconButton
+import androidx.compose.material3.Icon
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.unit.dp
+import eu.kanade.presentation.browse.components.BaseSourceItem
+import eu.kanade.tachiyomi.ui.browse.source.browse.BrowseSourceViewModel.Listing
+import mihon.icons.materialsymbols.MaterialSymbols
+import mihon.icons.materialsymbols.rounded.Keep
+import mihon.icons.materialsymbols.roundedfilled.Keep
+import tachiyomi.domain.source.model.Pin
+import tachiyomi.domain.source.model.Source
+import tachiyomi.i18n.MR
+import tachiyomi.presentation.core.components.material.SECONDARY_ALPHA
+import tachiyomi.presentation.core.i18n.stringResource
+
+// RK --> the list itself moved to raito.presentation.browse.source, which draws one sectioned list
+//     of manga and light-novel sources together; the sectioning it used to do lives there too. What
+//     stays here is the manga row, which that list still draws.
+// RK <--
+
+@Composable
+fun SourceItem(
+    source: Source,
+    onClickItem: (Source, Listing) -> Unit,
+    onLongClickItem: (Source) -> Unit,
+    onClickPin: (Source) -> Unit,
+    modifier: Modifier = Modifier,
+    // RK --> the shared list's badges, its row title and language line, and its Latest switch
+    badge: @Composable () -> Unit = {},
+    title: String = source.name,
+    languageLabel: String? = null,
+    showLatest: Boolean = true,
+    // RK <--
+) {
+    BaseSourceItem(
+        modifier = modifier,
+        source = source,
+        onClickItem = { onClickItem(source, Listing.Popular) },
+        onLongClickItem = { onLongClickItem(source) },
+        badge = badge,
+        // RK -->
+        title = title,
+        languageLabel = languageLabel,
+        // RK <--
+        action = {
+            if (source.supportsLatest /* RK */ && showLatest) {
+                SourceLatestButton(onClick = { onClickItem(source, Listing.Latest) }) // RK: shared with novel rows
+            }
+            SourcePinButton(
+                isPinned = Pin.Pinned in source.pin,
+                onClick = { onClickPin(source) },
+            )
+        },
+    )
+}
+
+// RK --> SourceItem's Latest button, lifted out so the novel source row draws the same one
+@Composable
+fun SourceLatestButton(onClick: () -> Unit) {
+    FilledTonalButton(onClick = onClick, modifier = Modifier.height(40.dp)) { // RK: DropSauce tonal action
+        Text(
+            text = stringResource(MR.strings.latest),
+            style = MaterialTheme.typography.labelLarge,
+        )
+    }
+}
+// RK <--
+
+@Composable
+fun SourcePinButton( // RK: public, the novel source row draws it too
+    isPinned: Boolean,
+    onClick: () -> Unit,
+) {
+    val icon = if (isPinned) MaterialSymbols.RoundedFilled.Keep else MaterialSymbols.Rounded.Keep
+    val tint = if (isPinned) {
+        MaterialTheme.colorScheme.primary
+    } else {
+        MaterialTheme.colorScheme.onBackground.copy(
+            alpha = SECONDARY_ALPHA,
+        )
+    }
+    val description = if (isPinned) MR.strings.action_unpin else MR.strings.action_pin
+    FilledTonalIconButton(onClick = onClick, modifier = Modifier.padding(start = 4.dp).size(40.dp)) { // RK
+        Icon(
+            imageVector = icon,
+            tint = tint,
+            contentDescription = stringResource(description),
+        )
+    }
+}
+
+// RK: SourceOptionsDialog moved to EntrySourceOptionsDialog, SourceUiModel to SourcesListItem

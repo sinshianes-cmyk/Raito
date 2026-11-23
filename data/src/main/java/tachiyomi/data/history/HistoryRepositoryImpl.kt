@@ -1,0 +1,144 @@
+package tachiyomi.data.history
+
+import app.cash.sqldelight.async.coroutines.awaitAsList
+import app.cash.sqldelight.async.coroutines.awaitAsOne
+import app.cash.sqldelight.async.coroutines.awaitAsOneOrNull
+import dev.zacsweers.metro.AppScope
+import dev.zacsweers.metro.ContributesBinding
+import dev.zacsweers.metro.Inject
+import dev.zacsweers.metro.SingleIn
+import kotlinx.coroutines.flow.Flow
+import logcat.LogPriority
+import tachiyomi.core.common.util.system.logcat
+import tachiyomi.data.Database
+import tachiyomi.data.subscribeToList
+import tachiyomi.domain.history.model.History
+import tachiyomi.domain.history.model.HistoryUpdate
+import tachiyomi.domain.history.model.HistoryWithRelations
+import tachiyomi.domain.history.repository.HistoryRepository
+
+@Inject
+@SingleIn(AppScope::class)
+@ContributesBinding(AppScope::class)
+class HistoryRepositoryImpl(
+    private val database: Database,
+) : HistoryRepository {
+
+    // RK: the two category id lists are Raito's, from the recents filter; empty means no constraint.
+    override fun getHistory(
+        query: String,
+        includedCategories: List<Long>,
+        excludedCategories: List<Long>,
+    ): Flow<List<HistoryWithRelations>> {
+        return database.historyViewQueries
+            .history(
+                query = query,
+                includedEmpty = includedCategories.isEmpty(),
+                includedCategories = includedCategories,
+                excludedEmpty = excludedCategories.isEmpty(),
+                excludedCategories = excludedCategories,
+                mapper = HistoryMapper::mapHistoryWithRelations,
+            )
+            .subscribeToList()
+    }
+
+    override suspend fun getLastHistory(): HistoryWithRelations? {
+        return database.historyViewQueries
+            .getLatestHistory(HistoryMapper::mapHistoryWithRelations)
+            .awaitAsOneOrNull()
+    }
+
+    override suspend fun getTotalReadDuration(): Long {
+        return database.historyQueries
+            .getReadDuration()
+            .awaitAsOne()
+    }
+
+    override suspend fun getHistoryByMangaId(mangaId: Long): List<History> {
+        return database.historyQueries
+            .getHistoryByMangaId(mangaId, HistoryMapper::mapHistory)
+            .awaitAsList()
+    }
+
+    override suspend fun getHistoryByMangaIds(mangaIds: List<Long>): Map<Long, List<History>> {
+        return database.historyQueries
+            .getHistoryByMangaIds(mangaIds) { mangaId, id, chapterId, readAt, readDuration ->
+                mangaId to HistoryMapper.mapHistory(id, chapterId, readAt, readDuration)
+            }
+            .awaitAsList()
+            .groupBy({ it.first }, { it.second })
+    }
+
+    override suspend fun resetHistory(historyId: Long) {
+        try {
+            database.historyQueries.resetHistoryById(historyId)
+        } catch (e: Exception) {
+            logcat(LogPriority.ERROR, throwable = e)
+        }
+    }
+
+    // RK: batch reset for EHentai gallery-version reconciliation
+    override suspend fun resetHistory(historyIds: List<Long>) {
+        try {
+            database.historyQueries.resetHistoryByIds(historyIds)
+        } catch (e: Exception) {
+            logcat(LogPriority.ERROR, throwable = e)
+        }
+    }
+
+    override suspend fun resetHistoryByMangaId(mangaId: Long) {
+        try {
+            database.historyQueries.resetHistoryByMangaId(mangaId)
+        } catch (e: Exception) {
+            logcat(LogPriority.ERROR, throwable = e)
+        }
+    }
+
+    override suspend fun deleteAllHistory(): Boolean {
+        return try {
+            database.historyQueries.removeAllHistory()
+            database.reading_sessionQueries.removeAllManga() // RK: the reading log goes with the time it adds up to
+            true
+        } catch (e: Exception) {
+            logcat(LogPriority.ERROR, throwable = e)
+            false
+        }
+    }
+
+    // RK -->
+    override suspend fun deleteHistorySince(since: kotlin.time.Instant): Boolean = try {
+        database.reading_sessionQueries.removeMangaSince(since.toEpochMilliseconds())
+        database.historyQueries.removeHistorySince(since)
+        true
+    } catch (e: Exception) {
+        logcat(LogPriority.ERROR, throwable = e)
+        false
+    }
+
+    override suspend fun deleteHistoryOutsideLibrary(): Boolean = try {
+        database.reading_sessionQueries.removeMangaOutsideLibrary()
+        database.historyQueries.removeHistoryOutsideLibrary()
+        true
+    } catch (e: Exception) {
+        logcat(LogPriority.ERROR, throwable = e)
+        false
+    }
+    // RK <--
+
+    override suspend fun deleteResetHistory() {
+        database.reading_sessionQueries.removeMangaOfResetHistory() // RK: first, while the rows still say which
+        database.historyQueries.removeResettedHistory()
+    }
+
+    override suspend fun upsertHistory(historyUpdate: HistoryUpdate) {
+        try {
+            database.historyQueries.upsert(
+                chapterId = historyUpdate.chapterId,
+                readAt = historyUpdate.readAt,
+                readDuration = historyUpdate.sessionReadDuration,
+            )
+        } catch (e: Exception) {
+            logcat(LogPriority.ERROR, throwable = e)
+        }
+    }
+}

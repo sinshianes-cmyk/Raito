@@ -1,0 +1,79 @@
+package raito.domain.recommendation
+
+import eu.kanade.tachiyomi.data.track.Tracker
+import eu.kanade.tachiyomi.data.track.mangaupdates.MangaUpdatesApi
+import eu.kanade.tachiyomi.network.GET
+import eu.kanade.tachiyomi.network.POST
+import eu.kanade.tachiyomi.network.awaitSuccess
+import eu.kanade.tachiyomi.network.jsonMime
+import eu.kanade.tachiyomi.network.parseAs
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
+import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.OkHttpClient
+import okhttp3.RequestBody.Companion.toRequestBody
+import raito.data.track.isMangaUpdatesManga
+import raito.domain.recommendation.dto.MUSearchResponse
+import raito.domain.recommendation.dto.MUSeriesResponse
+
+/**
+ * MangaUpdates recommendations via the public v1 API (`series/{id}`): both the community
+ * `recommendations` and the `category_recommendations` (similar-titles) buckets. Public, no auth.
+ * No alternative titles parsed here, so candidates dedup on primary title only.
+ */
+class MangaUpdatesRecommendations(
+    private val client: OkHttpClient,
+    tracker: Tracker,
+    override val json: Json,
+) : TrackerRecommendations(tracker) {
+
+    override suspend fun getRecsById(remoteId: Long): List<RelatedMangaCandidate> =
+        fetchSeries(remoteId).toCandidates()
+
+    // The series endpoint returns both recommendations and genres, so one call serves both.
+    override suspend fun getMediaContext(remoteId: Long): MediaContext {
+        val data = fetchSeries(remoteId)
+        return MediaContext(genres = data.genres.map { it.genre }, recommendations = data.toCandidates())
+    }
+
+    private suspend fun fetchSeries(remoteId: Long): MUSeriesResponse {
+        val url = ENDPOINT.toHttpUrl().newBuilder()
+            .addPathSegment("series")
+            .addPathSegment(remoteId.toString())
+            .build()
+        return with(json) { client.newCall(GET(url)).awaitSuccess().parseAs<MUSeriesResponse>() }
+    }
+
+    private fun MUSeriesResponse.toCandidates(): List<RelatedMangaCandidate> =
+        (recommendations + categoryRecommendations).map { rec ->
+            candidate(
+                url = rec.seriesUrl,
+                title = rec.seriesName,
+                thumbnailUrl = rec.seriesImage?.url?.original,
+            )
+        }
+
+    override suspend fun getRecsBySearch(title: String): List<RelatedMangaCandidate> {
+        val url = ENDPOINT.toHttpUrl().newBuilder()
+            .addPathSegments("series/search")
+            .build()
+
+        val payload = buildJsonObject {
+            put("search", title)
+            put("stype", "title")
+        }
+        val body = payload.toString().toRequestBody(jsonMime)
+
+        val data = with(json) {
+            client.newCall(POST(url.toString(), body = body)).awaitSuccess().parseAs<MUSearchResponse>()
+        }
+        val firstSeriesId = data.results.firstOrNull { isMangaUpdatesManga(it.record.type) }?.record?.seriesId
+            ?: return emptyList()
+        return getRecsById(firstSeriesId)
+    }
+
+    companion object {
+        private const val ENDPOINT = "${MangaUpdatesApi.BASE_URL}/v1/"
+    }
+}

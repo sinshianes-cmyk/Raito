@@ -1,0 +1,42 @@
+package raito.domain.category
+
+/*
+ * Shared include/exclude category-filter math for the library (manga + novel), plus the picker's
+ * merge of a confirmed selection. Kept pure (no Android, no coroutines, ids as Long) so it
+ * unit-tests directly. The Recents feeds filter in SQL instead (their `includedEmpty` clauses),
+ * pinned to [matchesCategoryFilter] by RecentsCategoryFilterConformanceTest.
+ *
+ * Callers convert their stored Set<String> prefs to Set<Long> first (category ids are Long).
+ */
+
+/** True when an include/exclude category filter is actually constraining the list. */
+fun categoryFilterActive(enabled: Boolean, include: Set<Long>, exclude: Set<Long>): Boolean =
+    enabled && (include.isNotEmpty() || exclude.isNotEmpty())
+
+/**
+ * A series passes when it sits on at least one included category (or none are required) and on none
+ * of the excluded categories. [categories] is the set of category ids the series belongs to (empty
+ * means uncategorized).
+ */
+fun matchesCategoryFilter(categories: Collection<Long>, include: Set<Long>, exclude: Set<Long>): Boolean {
+    val isIncluded = include.isEmpty() || categories.any { it in include }
+    val isExcluded = exclude.isNotEmpty() && categories.any { it in exclude }
+    return isIncluded && !isExcluded
+}
+
+/**
+ * Whether a library update covers a series on [categories]. A manual update of one category
+ * ([categoryId], -1 for none, as both update workers store it) covers that category alone, whatever
+ * the update filter ([include], [exclude]) says; otherwise the filter decides.
+ */
+fun isUpdateScope(categories: Collection<Long>, categoryId: Long, include: Set<Long>, exclude: Set<Long>): Boolean =
+    if (categoryId != -1L) categoryId in categories else matchesCategoryFilter(categories, include, exclude)
+
+/**
+ * The selection to store after a picker confirm: [confirmed] replaces the part of [stored] that the
+ * picker displayed ([shown]) and leaves the rest alone. Storing [confirmed] wholesale instead would
+ * drop every id whose category the picker did not show, which is silent data loss wherever one stored
+ * selection is edited through a picker scoped to less than the whole category list.
+ */
+fun mergeCategorySelection(stored: Set<Long>, shown: Set<Long>, confirmed: Set<Long>): Set<Long> =
+    stored.filterNotTo(mutableSetOf()) { it in shown } + confirmed

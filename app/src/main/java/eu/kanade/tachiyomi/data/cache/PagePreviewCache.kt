@@ -1,0 +1,236 @@
+package eu.kanade.tachiyomi.data.cache
+
+import android.content.Context
+import android.text.format.Formatter
+import com.jakewharton.disklrucache.DiskLruCache
+import dev.zacsweers.metro.AppScope
+import dev.zacsweers.metro.Inject
+import dev.zacsweers.metro.SingleIn
+import eu.kanade.tachiyomi.source.PagePreviewPage
+import eu.kanade.tachiyomi.util.storage.DiskUtil
+import eu.kanade.tachiyomi.util.storage.saveTo
+import kotlinx.coroutines.channels.BufferOverflow
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.Json
+import logcat.LogPriority
+import okio.Source
+import okio.buffer
+import okio.sink
+import tachiyomi.core.common.util.system.logcat
+import tachiyomi.domain.manga.model.Manga
+import java.io.File
+import java.io.IOException
+
+/**
+ * Class used to create page preview cache.
+ * For each page in a page preview list a file is created.
+ * For each page preview page a Json list is created and converted to a file.
+ * The files are in format *md5key*.0
+ *
+ * @param context the application context.
+ */
+@Inject
+@SingleIn(AppScope::class)
+class PagePreviewCache(
+    private val context: Context,
+    private val json: Json,
+) {
+
+    companion object {
+        /** Name of cache directory. */
+        const val PARAMETER_CACHE_DIRECTORY = "page_preview_disk_cache"
+
+        /**
+         * Application cache version. Bumping it makes DiskLruCache reject the journal header and
+         * delete the directory, which is the only way to clear page lists cached before they
+         * carried an invalidation path (version 1 kept expired gallery URLs forever).
+         */
+        const val PARAMETER_APP_VERSION = 2
+
+        /** The number of values per cache entry. Must be positive. */
+        const val PARAMETER_VALUE_COUNT = 1
+    }
+
+    /** Cache class used for cache management. */
+    private var diskCache = setupDiskCache(75)
+
+    private val cacheDir: File
+        get() = diskCache.directory
+
+    private val realSize: Long
+        get() = DiskUtil.getDirectorySize(cacheDir)
+
+    /** Real size of directory in human readable format. */
+    val readableSize: String
+        get() = Formatter.formatFileSize(context, realSize)
+
+    // Cache size is in MB
+    private fun setupDiskCache(cacheSize: Long): DiskLruCache {
+        return DiskLruCache.open(
+            File(context.cacheDir, PARAMETER_CACHE_DIRECTORY),
+            PARAMETER_APP_VERSION,
+            PARAMETER_VALUE_COUNT,
+            cacheSize * 1024 * 1024,
+        )
+    }
+
+    /**
+     * Get page list from cache.
+     *
+     * @param manga the manga.
+     * @return the list of pages.
+     */
+    fun getPageListFromCache(manga: Manga, chapterIds: List<Long>, page: Int): PagePreviewPage {
+        // Get the key for the manga.
+        val key = DiskUtil.hashKeyForDisk(pageListKey(manga, chapterIds, page))
+
+        // Convert JSON string to list of objects. Throws an exception if snapshot is null
+        return diskCache.get(key).use {
+            json.decodeFromString(it.getString(0))
+        }
+    }
+
+    /**
+     * Add page list to disk cache.
+     *
+     * @param manga the manga.
+     * @param pages list of pages.
+     */
+    fun putPageListToCache(manga: Manga, chapterIds: List<Long>, pages: PagePreviewPage) {
+        // Convert list of pages to json string.
+        val cachedValue = json.encodeToString(pages)
+
+        // Initialize the editor (edits the values for an entry).
+        var editor: DiskLruCache.Editor? = null
+
+        try {
+            // Get editor from md5 key.
+            val key = DiskUtil.hashKeyForDisk(pageListKey(manga, chapterIds, pages.page))
+            editor = diskCache.edit(key) ?: return
+
+            // Write page preview urls to cache.
+            editor.newOutputStream(0).sink().buffer().use {
+                it.write(cachedValue.toByteArray())
+                it.flush()
+            }
+
+            diskCache.flush()
+            editor.commit()
+            editor.abortUnlessCommitted()
+        } catch (e: Exception) {
+            // Ignore.
+        } finally {
+            editor?.abortUnlessCommitted()
+        }
+    }
+
+    /**
+     * Returns true if page is in cache.
+     *
+     * @param imageUrl url of page.
+     * @return true if in cache otherwise false.
+     */
+    fun isImageInCache(imageUrl: String): Boolean {
+        return try {
+            diskCache.get(DiskUtil.hashKeyForDisk(imageUrl)) != null
+        } catch (e: IOException) {
+            false
+        }
+    }
+
+    /**
+     * Get page file from url.
+     *
+     * @param imageUrl url of page.
+     * @return path of page.
+     */
+    fun getImageFile(imageUrl: String): File {
+        // Get file from md5 key.
+        val imageName = DiskUtil.hashKeyForDisk(imageUrl) + ".0"
+        return File(diskCache.directory, imageName)
+    }
+
+    /**
+     * Add page to cache.
+     *
+     * @param imageUrl url of page.
+     * @param source okio source of the image.
+     * @throws IOException page error.
+     */
+    @Throws(IOException::class)
+    fun putImageToCache(imageUrl: String, source: Source) {
+        // Initialize editor (edits the values for an entry).
+        var editor: DiskLruCache.Editor? = null
+
+        try {
+            // Get editor from md5 key.
+            val key = DiskUtil.hashKeyForDisk(imageUrl)
+            editor = diskCache.edit(key) ?: throw IOException("Unable to edit key")
+
+            // Get OutputStream and write page with Okio.
+            source.buffer().saveTo(editor.newOutputStream(0))
+
+            diskCache.flush()
+            editor.commit()
+        } finally {
+            source.close()
+            editor?.abortUnlessCommitted()
+        }
+    }
+
+    fun clear(): Int {
+        var deletedFiles = 0
+        cacheDir.listFiles()?.forEach {
+            if (removeFileFromCache(it.name)) {
+                deletedFiles++
+            }
+        }
+        return deletedFiles
+    }
+
+    /**
+     * Remove file from cache.
+     *
+     * @param file name of file "md5.0".
+     * @return status of deletion for the file.
+     */
+    private fun removeFileFromCache(file: String): Boolean {
+        // Make sure we don't delete the journal file (keeps track of cache).
+        if (file == "journal" || file.startsWith("journal.")) {
+            return false
+        }
+
+        return try {
+            // Remove the extension from the file to get the key of the cache
+            val key = file.substringBeforeLast(".")
+            // Remove file from cache.
+            diskCache.remove(key)
+        } catch (e: Exception) {
+            logcat(LogPriority.WARN, e) { "Failed to remove file from cache" }
+            false
+        }
+    }
+
+    /** Identifies one cached page list. Carried on every page preview so a dead image can drop it. */
+    fun pageListKey(manga: Manga, chapterIds: List<Long>, page: Int): String {
+        return "${manga.id}_${chapterIds.joinToString(separator = "-")}_$page"
+    }
+
+    /** Keys of the page lists [removePageList] dropped, so a screen still showing one can fetch it again. */
+    val removedPageLists: SharedFlow<String>
+        field = MutableSharedFlow<String>(extraBufferCapacity = 64, onBufferOverflow = BufferOverflow.DROP_OLDEST)
+
+    /** Drops a cached page list so the next read refetches it. Returns whether anything was removed. */
+    fun removePageList(pageListKey: String): Boolean {
+        val removed = try {
+            diskCache.remove(DiskUtil.hashKeyForDisk(pageListKey))
+        } catch (e: Exception) {
+            logcat(LogPriority.WARN, e) { "Failed to remove page list from cache" }
+            false
+        }
+        if (removed) removedPageLists.tryEmit(pageListKey)
+        return removed
+    }
+}

@@ -1,0 +1,27 @@
+package raito.domain.novel
+
+import kotlinx.coroutines.flow.Flow
+import raito.domain.novel.model.NovelTrack
+
+interface NovelTrackRepository {
+
+    suspend fun getTrackById(id: Long): NovelTrack?
+
+    suspend fun getTracksByNovelId(novelId: Long): List<NovelTrack>
+
+    suspend fun getTracksByNovelIds(novelIds: List<Long>): Map<Long, List<NovelTrack>>
+
+    fun getTracksByNovelIdAsFlow(novelId: Long): Flow<List<NovelTrack>>
+
+    suspend fun getTracks(): List<NovelTrack>
+
+    fun getTracksAsFlow(): Flow<List<NovelTrack>>
+
+    suspend fun delete(novelId: Long, trackerId: Long)
+
+    /** False when the write failed, which is logged rather than thrown. */
+    suspend fun upsert(track: NovelTrack): Boolean
+
+    /** Upsert every track in one transaction, so a multi-tracker carry cannot half apply. False when it failed. */
+    suspend fun upsertAll(tracks: List<NovelTrack>): Boolean
+}

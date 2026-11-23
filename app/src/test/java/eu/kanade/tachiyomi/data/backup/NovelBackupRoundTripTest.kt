@@ -1,0 +1,196 @@
+package eu.kanade.tachiyomi.data.backup
+
+import eu.kanade.tachiyomi.data.backup.create.BackupOptions
+import eu.kanade.tachiyomi.data.backup.create.creators.NovelBackupCreator
+import eu.kanade.tachiyomi.data.backup.models.BackupNovel
+import eu.kanade.tachiyomi.data.backup.models.BackupNovelChapter
+import eu.kanade.tachiyomi.data.backup.models.BackupNovelMergeGroup
+import eu.kanade.tachiyomi.data.backup.models.BackupNovelSourceRef
+import eu.kanade.tachiyomi.data.backup.restore.restorers.NovelRestorer
+import io.kotest.matchers.collections.shouldContainExactly
+import io.kotest.matchers.shouldBe
+import io.mockk.coEvery
+import io.mockk.coVerify
+import io.mockk.mockk
+import io.mockk.slot
+import kotlinx.coroutines.test.runTest
+import kotlinx.serialization.ExperimentalSerializationApi
+import kotlinx.serialization.protobuf.ProtoBuf
+import org.junit.jupiter.api.Test
+import raito.domain.chapter.NoChapterNumberOverrides
+import raito.domain.db.PassThroughTransactions
+import raito.domain.library.ContentType
+import raito.domain.merge.MergeGroupRepository
+import raito.domain.merge.RestoreMergeGroups
+import raito.domain.novel.NovelRepository
+import raito.domain.novel.model.Novel
+import raito.domain.novel.model.NovelChapter
+import raito.domain.readinglog.NoReadingLog
+import kotlin.time.Instant
+
+class NovelBackupRoundTripTest {
+
+    private fun novel(id: Long, url: String, source: String, title: String = "T") =
+        Novel.create().copy(
+            id = id,
+            url = url,
+            source = source,
+            title = title,
+            favoriteAt = Instant.fromEpochMilliseconds(0L),
+        )
+
+    private fun restorer(repo: NovelRepository, repository: MergeGroupRepository) = NovelRestorer(
+        novelRepository = repo,
+        novelChapterRepository = mockk(relaxed = true),
+        categoryRepository = mockk(relaxed = true),
+        novelTrackRepository = mockk(relaxed = true),
+        restoreMergeGroups = RestoreMergeGroups(repository, PassThroughTransactions),
+        setCustomNovelInfo = mockk(relaxed = true),
+        novelHistoryRepository = mockk(relaxed = true),
+        chapterNumberOverrides = NoChapterNumberOverrides,
+        readingLog = NoReadingLog,
+    )
+
+    @Test
+    fun `merge groups survive an id remap across backup then restore`() = runTest {
+        // Backup side: a persisted group of two favorited novels on different sources.
+        val favorites = listOf(novel(1, "a", "s1"), novel(5, "b", "s2"))
+        val backupRepo = mockk<NovelRepository> {
+            coEvery { getFavorites() } returns favorites
+            coEvery { getById(1L) } returns favorites[0]
+            coEvery { getById(5L) } returns favorites[1]
+        }
+        val backupMergeRepo = mockk<MergeGroupRepository> {
+            coEvery { getAllMemberships(ContentType.NOVELS) } returns mapOf(1L to 100L, 5L to 100L)
+        }
+        val creator = NovelBackupCreator(
+            novelRepository = backupRepo,
+            novelChapterRepository = mockk(relaxed = true),
+            categoryRepository = mockk(relaxed = true),
+            novelTrackRepository = mockk(relaxed = true),
+            mergeGroupRepository = backupMergeRepo,
+            customNovelInfoRepository = mockk(relaxed = true),
+            novelHistoryRepository = mockk(relaxed = true),
+            novelSourceManager = mockk(),
+            chapterNumberOverrides = NoChapterNumberOverrides,
+            readingLog = NoReadingLog,
+        )
+        // Library + merges only; skip chapters/categories/tracking/history so no DB is touched.
+        val options = BackupOptions(
+            libraryEntries = true,
+            chapters = false,
+            categories = false,
+            tracking = false,
+            history = false,
+        )
+
+        val merges = creator.novelMerges(options)
+
+        // The group is serialized as stable {url, source} refs, not the raw ids.
+        merges.map { group -> group.refs.map { it.url to it.source } } shouldContainExactly
+            listOf(listOf("a" to "s1", "b" to "s2"))
+
+        // Restore side: the same two novels come back with fresh ids 10 and 20.
+        val restoreMergeRepo = mockk<MergeGroupRepository>(relaxed = true)
+        val restoreRepo = mockk<NovelRepository> {
+            coEvery { getByUrlAndSource("a", "s1") } returns novel(10, "a", "s1")
+            coEvery { getByUrlAndSource("b", "s2") } returns novel(20, "b", "s2")
+        }
+
+        restorer(restoreRepo, restoreMergeRepo).restoreMerges(merges, prefEra = null)
+
+        // The group is materialized against the restored ids via the repository.
+        coVerify { restoreMergeRepo.materializeGroup(ContentType.NOVELS, listOf(10L, 20L), false) }
+    }
+
+    @Test
+    fun `a merge group is dropped when fewer than two members resolve on restore`() = runTest {
+        val restoreMergeRepo = mockk<MergeGroupRepository>(relaxed = true)
+        val restoreRepo = mockk<NovelRepository> {
+            coEvery { getByUrlAndSource("a", "s1") } returns novel(10, "a", "s1")
+            // The second member's novel wasn't restored (e.g. its source wasn't backed up).
+            coEvery { getByUrlAndSource("b", "s2") } returns null
+        }
+        val group = BackupNovelMergeGroup(
+            refs = listOf(BackupNovelSourceRef("a", "s1"), BackupNovelSourceRef("b", "s2")),
+        )
+
+        restorer(restoreRepo, restoreMergeRepo).restoreMerges(listOf(group), prefEra = null)
+
+        // Only one member resolved, so no group is created.
+        coVerify(exactly = 0) { restoreMergeRepo.materializeGroup(any(), any(), any()) }
+    }
+
+    @Test
+    fun `BackupNovel maps back to the domain novel`() {
+        val backup = BackupNovel(
+            source = "s1",
+            url = "u",
+            title = "Title",
+            status = 2,
+            thumbnailUrl = "cover",
+            favorite = true,
+            totalPages = 3,
+            notes = "my note",
+        )
+
+        val novel = backup.toNovelImpl()
+
+        novel.source shouldBe "s1"
+        novel.url shouldBe "u"
+        novel.title shouldBe "Title"
+        novel.status shouldBe 2L
+        novel.thumbnailUrl shouldBe "cover"
+        novel.favorite shouldBe true
+        novel.totalPages shouldBe 3L
+        novel.notes shouldBe "my note"
+    }
+
+    @Test
+    fun `BackupNovelChapter restores under the new novel id`() {
+        // Downloaded state isn't in the backup or the model anymore; it's rederived from disk by
+        // NovelDownloadCache after restore.
+        val chapter = BackupNovelChapter(url = "c1", name = "Chapter 1", read = true, lastTextProgress = 4200)
+            .toChapterImpl(novelId = 42)
+
+        chapter.novelId shouldBe 42L
+        chapter.url shouldBe "c1"
+        chapter.read shouldBe true
+        chapter.lastTextProgress shouldBe 4200L
+    }
+
+    @OptIn(ExperimentalSerializationApi::class)
+    @Test
+    fun `a chapter's group survives a backup and its restore`() = runTest {
+        val stored = NovelChapter(
+            id = 7L, novelId = 1L, url = "c1", name = "Chapter 1", read = false, bookmark = false,
+            lastTextProgress = 0L, chapterNumber = 1.0, sourceOrder = 0L,
+            dateFetch = Instant.fromEpochMilliseconds(
+                0L,
+            ),
+            dateUpload = null,
+            page = "", scanlator = "Group",
+        )
+        val creator = NovelBackupCreator(
+            novelRepository = mockk(),
+            novelChapterRepository = mockk {
+                coEvery { getByNovelIds(listOf(1L)) } returns mapOf(1L to listOf(stored))
+            },
+            categoryRepository = mockk(),
+            novelTrackRepository = mockk(),
+            mergeGroupRepository = mockk(),
+            customNovelInfoRepository = mockk(),
+            novelHistoryRepository = mockk(),
+            novelSourceManager = mockk(),
+            chapterNumberOverrides = NoChapterNumberOverrides,
+            readingLog = NoReadingLog,
+        )
+        val backup = BackupNovel(source = "s1", url = "u")
+        creator.chapters(listOf(novel(1, "u", "s1") to backup))
+
+        val wire = ProtoBuf.encodeToByteArray(BackupNovelChapter.serializer(), backup.chapters.single())
+
+        ProtoBuf.decodeFromByteArray(BackupNovelChapter.serializer(), wire).toChapterImpl(novelId = 42)
+            .scanlator shouldBe "Group"
+    }
+}

@@ -1,0 +1,328 @@
+package eu.kanade.tachiyomi.source
+
+import android.content.Context
+import dev.zacsweers.metro.AppScope
+import dev.zacsweers.metro.ContributesBinding
+import dev.zacsweers.metro.Inject
+import dev.zacsweers.metro.SingleIn
+import eu.kanade.tachiyomi.data.download.DownloadManager
+import eu.kanade.tachiyomi.extension.ExtensionManager
+import eu.kanade.tachiyomi.source.online.HttpSource
+import eu.kanade.tachiyomi.source.online.all.AsmHentai
+import eu.kanade.tachiyomi.source.online.all.EHentai
+import eu.kanade.tachiyomi.source.online.all.HentaiFox
+import eu.kanade.tachiyomi.source.online.all.Hitomi
+import eu.kanade.tachiyomi.source.online.all.Koharu
+import eu.kanade.tachiyomi.source.online.all.Lanraragi
+import eu.kanade.tachiyomi.source.online.all.MangaDex
+import eu.kanade.tachiyomi.source.online.all.NHentai
+import eu.kanade.tachiyomi.source.online.all.NHentaiNet
+import eu.kanade.tachiyomi.source.online.english.EightMuses
+import eu.kanade.tachiyomi.source.online.english.HentaiNexus
+import eu.kanade.tachiyomi.source.online.english.NineHentai
+import eu.kanade.tachiyomi.source.online.english.Pururin
+import exh.source.BlacklistedSources
+import exh.source.DelegatedHttpSource
+import exh.source.EHENTAI_EXT_SOURCES
+import exh.source.EIGHTMUSES_SOURCE_ID
+import exh.source.EXHENTAI_EXT_SOURCES
+import exh.source.EnhancedHttpSource
+import exh.source.ExhPreferences
+import exh.source.HENTAINEXUS_SOURCE_ID
+import exh.source.NHENTAI_NET_SOURCE_ID
+import exh.source.NINEHENTAI_SOURCE_ID
+import exh.source.PURURIN_SOURCE_ID
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.filterNotNull
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.launch
+import mihon.core.metro.AppCoroutineScope
+import tachiyomi.domain.source.model.StubSource
+import tachiyomi.domain.source.repository.StubSourceRepository
+import tachiyomi.domain.source.service.SourceManager
+import tachiyomi.source.local.LocalSource
+import java.util.concurrent.ConcurrentHashMap
+
+// RK -->
+// Source ids of installed nHentai instances, derived from currentDelegatedSources whenever the
+// source map is (re)built. nHentai is delegated, so its id varies by extension version; the library
+// updater reads this to skip nHentai galleries the same way LIBRARY_UPDATE_EXCLUDED_SOURCES skips
+// the built-in E-Hentai / ExHentai / Pururin sources.
+// Volatile: written on the source-map rebuild's IO collector, read by the library-update worker on
+// its own thread, with no other happens-before between them.
+@Volatile
+internal var nHentaiDelegatedSourceIds: List<Long> = emptyList()
+// RK <--
+
+@Inject
+@SingleIn(AppScope::class)
+@ContributesBinding(AppScope::class)
+class AndroidSourceManager(
+    @AppCoroutineScope private val scope: CoroutineScope,
+    private val context: Context, // RK: the built-in adult sources need it
+    private val extensionManager: ExtensionManager,
+    private val sourceRepository: StubSourceRepository,
+    private val localSource: LocalSource,
+    private val downloadManager: Lazy<DownloadManager>,
+    // RK: gates the built-in E-Hentai / ExHentai sources.
+    private val exhPreferences: ExhPreferences,
+) : SourceManager {
+
+    /**
+     * Null until the extensions have loaded, so that nothing observes the empty seed value.
+     */
+    private val sourcesMapFlow = MutableStateFlow<Map<Long, Source>?>(null)
+
+    private val stubSourcesMap = ConcurrentHashMap<Long, StubSource>()
+
+    // RK: original-source-id -> matched delegate for every currently-wrapped delegated source,
+    //     rebuilt with the source map. The reusable basis for the delegated-source id lists; for now
+    //     only nHentai is derived (the library-update exclusion), but metadata / lanraragi lists can
+    //     derive from this the same way once they gain a consumer. Mirrors Komikku's
+    //     currentDelegatedSources / handleSourceLibrary.
+    private val currentDelegatedSources = ConcurrentHashMap<Long, DelegatedSource>()
+
+    override val sources: Flow<List<Source>> = sourcesMapFlow
+        .filterNotNull()
+        .map { it.values.toList() }
+
+    init {
+        scope.launch {
+            extensionManager.loadedExtensionsFlow
+                // RK: re-collect whenever the EXH gates flip so the built-in EH/ExH sources
+                //     appear or disappear without an app restart.
+                .combine(exhPreferences.enableExhentai().changes()) { extensions, enableExhentai ->
+                    extensions to enableExhentai
+                }
+                .combine(exhPreferences.isHentaiEnabled().changes()) { (extensions, enableExhentai), isHentaiEnabled ->
+                    Triple(extensions, enableExhentai, isHentaiEnabled)
+                }
+                .collectLatest { (extensions, enableExhentai, isHentaiEnabled) ->
+                    val mutableMap = ConcurrentHashMap<Long, Source>(
+                        mapOf(
+                            LocalSource.ID to localSource,
+                        ),
+                    ).apply {
+                        // RK: register the built-in E-Hentai sources (one per language) when the
+                        //     hentai gate is on; ExHentai needs the additional login gate.
+                        if (isHentaiEnabled) {
+                            EHENTAI_EXT_SOURCES.forEach { (id, lang) ->
+                                put(id, EHentai(id, false, context, lang))
+                            }
+                            if (enableExhentai) {
+                                EXHENTAI_EXT_SOURCES.forEach { (id, lang) ->
+                                    put(id, EHentai(id, true, context, lang))
+                                }
+                            }
+                            // RK: built-in pururin.me (no extension needed, like E-Hentai).
+                            put(PURURIN_SOURCE_ID, Pururin(context))
+                            // RK: built-in nhentai.net (no extension needed; talks to nhentai's v2 API).
+                            put(NHENTAI_NET_SOURCE_ID, NHentaiNet(context))
+                        }
+                    }
+                    // RK: rebuilt fresh each pass so uninstalled sources drop out.
+                    currentDelegatedSources.clear()
+                    extensions.forEach { extension ->
+                        extension.sources.forEach {
+                            // RK: skip the stock E-Hentai extension's sources while built-in EH is on;
+                            //     they share ids with our built-in sources and would shadow them.
+                            if (isHentaiEnabled && it.id in BlacklistedSources.BLACKLISTED_EXT_SOURCES) {
+                                return@forEach
+                            }
+                            // RK: wrap delegated adult sources so installed galleries gain metadata
+                            mutableMap[it.id] = it.toEnhancedSource()
+                            registerStubSource(StubSource.from(it))
+                        }
+                    }
+                    // RK: derive nHentai's delegated source ids (id varies by extension version) so
+                    //     the library updater skips nHentai galleries too.
+                    nHentaiDelegatedSourceIds = currentDelegatedSources
+                        .filterValues { it.sourceName == "NHentai" }
+                        .keys.sorted()
+                    sourcesMapFlow.value = mutableMap
+                }
+        }
+
+        scope.launch {
+            sourceRepository.subscribeAll()
+                .collectLatest { sources ->
+                    sources.forEach {
+                        stubSourcesMap[it.id] = it
+                    }
+                }
+        }
+    }
+
+    /**
+     * Awaits the extensions to have loaded before returning the sources.
+     */
+    private suspend fun sourcesMap(): Map<Long, Source> = sourcesMapFlow.filterNotNull().first()
+
+    override suspend fun get(sourceKey: Long): Source? {
+        return sourcesMap()[sourceKey]
+    }
+
+    override suspend fun getOrStub(sourceKey: Long): Source {
+        return sourcesMap()[sourceKey] ?: stubSourcesMap.getOrPut(sourceKey) {
+            createStubSource(sourceKey)
+        }
+    }
+
+    override suspend fun getAll(): List<Source> {
+        return sourcesMap().values.toList()
+    }
+
+    override suspend fun getOnlineSources(): List<HttpSource> {
+        return sourcesMap().values.filterIsInstance<HttpSource>()
+    }
+
+    override suspend fun getStubSources(): List<StubSource> {
+        val onlineSourceIds = getOnlineSources().map { it.id }
+        return stubSourcesMap.values.filterNot { it.id in onlineSourceIds }
+    }
+
+    private fun registerStubSource(source: StubSource) {
+        scope.launch {
+            val dbSource = sourceRepository.getStubSource(source.id)
+            if (dbSource == source) return@launch
+            sourceRepository.upsertStubSource(source.id, source.lang, source.name)
+            if (dbSource != null) {
+                downloadManager.value.renameSource(dbSource, source)
+            }
+        }
+    }
+
+    private suspend fun createStubSource(id: Long): StubSource {
+        sourceRepository.getStubSource(id)?.let {
+            return it
+        }
+        extensionManager.getSourceData(id)?.let {
+            registerStubSource(it)
+            return it
+        }
+        return StubSource(id = id, lang = "", name = "")
+    }
+
+    // RK -->
+    // If an installed extension is in DELEGATED_SOURCES, wrap it in an EnhancedHttpSource so its
+    // galleries gain searchable tag/title metadata; otherwise return the source unchanged.
+    private fun Source.toEnhancedSource(): Source {
+        if (this !is HttpSource) return this
+        val source = this
+        // Match by source name first. R8 obfuscates the source class that a factory extension
+        // builds (e.g. HentaiFox's source becomes a top-level "a"), so its qualified class name
+        // is useless for matching; the source name is stable across versions and languages.
+        // Fall back to the class name for entry-point (non-factory) extensions like 8Muses.
+        val sourceQName = this::class.qualifiedName
+        val delegate = DELEGATED_SOURCES.values.find { it.sourceName == source.name }
+            ?: sourceQName?.let { qName ->
+                DELEGATED_SOURCES[qName]
+                    ?: DELEGATED_SOURCES.values.find {
+                        it.factory && qName.startsWith(it.originalSourceQualifiedClassName)
+                    }
+            }
+        return if (delegate != null) {
+            // RK: record id -> delegate so the delegated-source id lists (nHentai today) can be
+            //     derived after the source map is built.
+            currentDelegatedSources[source.id] = delegate
+            EnhancedHttpSource(source, delegate.newSourceFactory(source, context))
+        } else {
+            source
+        }
+    }
+
+    companion object {
+        private const val FILL_IN_SOURCE_ID = Long.MAX_VALUE
+
+        // Installed extensions that get wrapped in a metadata-enhancing EnhancedHttpSource.
+        // factory = true matches by package prefix (multi-language factory extensions).
+        private val DELEGATED_SOURCES = listOf(
+            // RK: Pururin is now a built-in source (see the isHentaiEnabled block above), not delegated.
+            DelegatedSource(
+                "8Muses",
+                EIGHTMUSES_SOURCE_ID,
+                "eu.kanade.tachiyomi.extension.en.eightmuses.EightMuses",
+                ::EightMuses,
+            ),
+            DelegatedSource(
+                "MangaDex",
+                FILL_IN_SOURCE_ID,
+                "eu.kanade.tachiyomi.extension.all.mangadex.MangaDex",
+                ::MangaDex,
+                factory = true,
+            ),
+            DelegatedSource(
+                "NHentai",
+                FILL_IN_SOURCE_ID,
+                "eu.kanade.tachiyomi.extension.all.nhentai.NHentai",
+                ::NHentai,
+                factory = true,
+            ),
+            DelegatedSource(
+                "LANraragi",
+                FILL_IN_SOURCE_ID,
+                "eu.kanade.tachiyomi.extension.all.lanraragi.LANraragi",
+                ::Lanraragi,
+                factory = true,
+            ),
+            DelegatedSource(
+                "HentaiFox",
+                FILL_IN_SOURCE_ID,
+                "eu.kanade.tachiyomi.extension.all.hentaifox.HentaiFox",
+                ::HentaiFox,
+                factory = true,
+            ),
+            DelegatedSource(
+                "AsmHentai",
+                FILL_IN_SOURCE_ID,
+                "eu.kanade.tachiyomi.extension.all.asmhentai.AsmHentai",
+                ::AsmHentai,
+                factory = true,
+            ),
+            DelegatedSource(
+                // The Koharu extension's source is named "SchaleNetwork"; match on that.
+                "SchaleNetwork",
+                FILL_IN_SOURCE_ID,
+                "eu.kanade.tachiyomi.extension.all.koharu.Koharu",
+                ::Koharu,
+                factory = true,
+            ),
+            DelegatedSource(
+                "HentaiNexus",
+                HENTAINEXUS_SOURCE_ID,
+                "eu.kanade.tachiyomi.extension.en.hentainexus.HentaiNexus",
+                ::HentaiNexus,
+            ),
+            DelegatedSource(
+                "NineHentai",
+                NINEHENTAI_SOURCE_ID,
+                "eu.kanade.tachiyomi.extension.en.ninehentai.NineHentai",
+                ::NineHentai,
+            ),
+            DelegatedSource(
+                "Hitomi",
+                FILL_IN_SOURCE_ID,
+                "eu.kanade.tachiyomi.extension.all.hitomi.Hitomi",
+                ::Hitomi,
+                factory = true,
+            ),
+        ).associateBy { it.originalSourceQualifiedClassName }
+
+        // The extensions the delegated-sources switch lists in its summary.
+        val DELEGATED_SOURCE_NAMES = DELEGATED_SOURCES.values.map { it.sourceName }
+
+        private data class DelegatedSource(
+            val sourceName: String,
+            val sourceId: Long,
+            val originalSourceQualifiedClassName: String,
+            val newSourceFactory: (HttpSource, Context) -> DelegatedHttpSource,
+            val factory: Boolean = false,
+        )
+    }
+    // RK <--
+}

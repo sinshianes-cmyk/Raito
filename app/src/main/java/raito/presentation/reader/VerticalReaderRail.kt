@@ -1,0 +1,114 @@
+package raito.presentation.reader
+
+import androidx.compose.foundation.background
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.FilledIconButton
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButtonDefaults
+import androidx.compose.material3.SliderState
+import androidx.compose.material3.Text
+import androidx.compose.material3.VerticalSlider
+import androidx.compose.runtime.Composable
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.rotate
+import androidx.compose.ui.unit.dp
+import eu.kanade.presentation.util.isTabletUi
+import mihon.icons.materialsymbols.MaterialSymbols
+import mihon.icons.materialsymbols.rounded.SkipNext
+import mihon.icons.materialsymbols.rounded.SkipPrevious
+import tachiyomi.i18n.MR
+import tachiyomi.presentation.core.i18n.stringResource
+
+/**
+ * The reader's vertical progress rail for both content types: a previous-chapter skip button, a
+ * labelled vertical slider pill, and a next-chapter skip button. The caller owns the [sliderState] and
+ * the [topLabel]/[bottomLabel], which carry each content type's unit. A null [sliderState] is a chapter
+ * with nowhere to scrub to, carried by the state rather than beside a flag a caller could set to
+ * disagree with it.
+ */
+@Composable
+fun VerticalReaderRail(
+    sliderState: SliderState?,
+    onSeek: (Float) -> Unit,
+    onSeekFinished: () -> Unit,
+    topLabel: String,
+    bottomLabel: String,
+    onPreviousChapter: () -> Unit,
+    enabledPrevious: Boolean,
+    onNextChapter: () -> Unit,
+    enabledNext: Boolean,
+    interactionSource: MutableInteractionSource,
+    modifier: Modifier = Modifier,
+) {
+    val mainAxisPadding = if (isTabletUi()) 24.dp else 8.dp
+    val backgroundColor = readerChromeColor()
+    val buttonColor = IconButtonDefaults.filledIconButtonColors(
+        containerColor = backgroundColor,
+        disabledContainerColor = backgroundColor,
+    )
+
+    Column(
+        modifier = modifier
+            .fillMaxHeight()
+            .padding(vertical = mainAxisPadding),
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        FilledIconButton(
+            enabled = enabledPrevious,
+            onClick = onPreviousChapter,
+            colors = buttonColor,
+        ) {
+            Icon(
+                imageVector = MaterialSymbols.Rounded.SkipPrevious,
+                contentDescription = stringResource(MR.strings.action_previous_chapter),
+                modifier = Modifier.rotate(90f),
+            )
+        }
+
+        if (sliderState != null) {
+            Column(
+                modifier = Modifier
+                    .weight(1f)
+                    // Round the background rather than clip, so the slider thumb is never cropped at
+                    // the ends (the novel reader's original fix; harmless for the manga page slider).
+                    .background(backgroundColor, RoundedCornerShape(24.dp))
+                    .padding(vertical = 16.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+            ) {
+                Text(text = topLabel)
+
+                VerticalSlider(
+                    state = sliderState,
+                    modifier = Modifier
+                        .weight(1f)
+                        .padding(vertical = 8.dp),
+                    onValueChange = onSeek,
+                    onValueChangeFinished = onSeekFinished,
+                    interactionSource = interactionSource,
+                )
+
+                Text(text = bottomLabel)
+            }
+        } else {
+            Spacer(Modifier.weight(1f))
+        }
+
+        FilledIconButton(
+            enabled = enabledNext,
+            onClick = onNextChapter,
+            colors = buttonColor,
+        ) {
+            Icon(
+                imageVector = MaterialSymbols.Rounded.SkipNext,
+                contentDescription = stringResource(MR.strings.action_next_chapter),
+                modifier = Modifier.rotate(90f),
+            )
+        }
+    }
+}

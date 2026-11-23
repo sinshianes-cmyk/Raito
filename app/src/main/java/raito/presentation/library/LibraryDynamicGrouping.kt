@@ -1,0 +1,266 @@
+package raito.presentation.library
+
+import android.content.Context
+import eu.kanade.tachiyomi.data.track.TrackerManager
+import eu.kanade.tachiyomi.ui.library.LibraryItem
+import raito.domain.entry.EntryId
+import raito.domain.library.CategorySortOrder
+import raito.presentation.components.entryStatusRes
+import tachiyomi.core.common.i18n.stringResource
+import tachiyomi.domain.track.model.Track
+
+/**
+ * Minimal per-item view the dynamic grouping needs, decoupled from the manga / novel domain types so
+ * one kernel serves both libraries. [id] is the neutral [EntryId] because a row id is only unique
+ * WITHIN a content type: a manga and a novel can share the id 12, and every metadata map below is
+ * keyed by this id.
+ */
+data class DynItem(
+    val id: EntryId,
+    val genre: List<String>?,
+    val author: String?,
+    val artist: String?,
+)
+
+/**
+ * One provider's pre-resolved inputs for [LibraryDynamicGrouping.build], keyed by the neutral
+ * [EntryId] like the kernel: raw row ids collide across content types, and every map below is
+ * id-keyed. Each provider builds one through [libraryDynamicGroupingFeed]; the engine concatenates
+ * the active feeds and runs the kernel once, so the under-All merge
+ * and the group ordering come from the kernel's existing logic rather than a hand-written list merge.
+ */
+class DynamicGroupingFeed(
+    val items: List<DynItem>,
+    val sourceMeta: Map<EntryId, List<Pair<String, String>>> = emptyMap(),
+    val languageCodes: Map<EntryId, List<String>> = emptyMap(),
+    val statusNames: Map<EntryId, String> = emptyMap(),
+    val trackStatuses: Map<EntryId, String> = emptyMap(),
+)
+
+/**
+ * Resolve one content type's rows into a [DynamicGroupingFeed]. Every group mode reads the shared row,
+ * so it means the same for manga and novels; the source label and a merged row's tracks are the two
+ * lookups a row cannot answer, which each adapter supplies. A merged series groups under every
+ * member's source and language, as library search and Statistics read it; [sourceKey] is the row's own
+ * key, and [sourceOf] labels a key from the source manager, since a member's stored name is lowercased.
+ */
+@Suppress("LongParameterList")
+suspend fun libraryDynamicGroupingFeed(
+    rows: List<LibraryItem>,
+    groupType: Int,
+    sourceKey: (LibraryItem) -> String,
+    sourceOf: suspend (key: String) -> Pair<String, String>?,
+    groupTracks: (LibraryItem) -> List<Track>,
+    loggedInTrackerIds: Set<Long>,
+    trackerManager: TrackerManager,
+    context: Context,
+): DynamicGroupingFeed = DynamicGroupingFeed(
+    items = rows.map { row ->
+        val manga = row.libraryManga.manga
+        // Every member's tags, as tag search and Statistics count a merged series; never Edit info's.
+        DynItem(row.entryId, seriesGenres(null, listOf(manga.genre, row.memberGenres)), manga.author, manga.artist)
+    },
+    sourceMeta = if (groupType == LibraryGroup.BY_SOURCE) {
+        rows.associate { row -> row.entryId to row.allSources(sourceKey(row)).mapNotNull { sourceOf(it.key) } }
+    } else {
+        emptyMap()
+    },
+    languageCodes = if (groupType == LibraryGroup.BY_LANGUAGE) {
+        rows.associate { row -> row.entryId to row.allSources(sourceKey(row)).mapNotNull { it.language } }
+    } else {
+        emptyMap()
+    },
+    statusNames = if (groupType == LibraryGroup.BY_STATUS) {
+        rows.associate { it.entryId to context.stringResource(entryStatusRes(it.libraryManga.manga.status)) }
+    } else {
+        emptyMap()
+    },
+    trackStatuses = if (groupType == LibraryGroup.BY_TRACK_STATUS) {
+        rows.mapNotNull { row ->
+            groupTrackStatus(groupTracks(row), loggedInTrackerIds, trackerManager)
+                ?.let { row.entryId to context.stringResource(it) }
+        }.toMap()
+    } else {
+        emptyMap()
+    },
+)
+
+private const val LANG_SPLITTER = "⨼⨦⨠"
+
+private val SEPARATOR_RUN = Regex("[-_\\s]+")
+
+/**
+ * Normalized form of a dynamic bucket's key, matching the spelling-merge rule below (case-folded,
+ * separator runs unified). This is what [LibraryBucket.Dynamic.key] holds and what is persisted in
+ * `collapsed_dynamic_categories`. Stored keys may predate normalization, so membership checks
+ * normalize both sides. A language key drops its label, which follows the device's language data,
+ * so a relabelled language keeps its stored collapse state.
+ */
+fun normalizeDynamicKey(name: String): String =
+    (if (LANG_SPLITTER in name) name.substringBefore(LANG_SPLITTER) + LANG_SPLITTER else name)
+        .lowercase().replace(SEPARATOR_RUN, " ").trim()
+
+/** Stored collapse keys in bucket-key form, so a key persisted before normalization still matches. */
+fun Set<String>.normalizedDynamicKeys(): Set<String> = mapTo(HashSet(), ::normalizeDynamicKey)
+
+/**
+ * Buckets library items into synthetic groups: by source, language, tag, author, status or tracking
+ * status. Generalized over [DynItem] so both libraries share one kernel. Pure: anything needing a
+ * SourceManager, tracker or status is pre-resolved by the caller. BY_DEFAULT returns empty.
+ * Source and language buckets encode a disambiguator into the key (two sources can share a name, a
+ * language code is not its label), which is why key and label are separate. That encoding is
+ * persisted and restored verbatim from backups, so changing a splitter needs a migration.
+ */
+object LibraryDynamicGrouping {
+
+    private const val SOURCE_SPLITTER = "◘•◘"
+
+    private val DYNAMIC_GROUP_TYPES = setOf(
+        LibraryGroup.BY_TAG,
+        LibraryGroup.BY_SOURCE,
+        LibraryGroup.BY_LANGUAGE,
+        LibraryGroup.BY_AUTHOR,
+        LibraryGroup.BY_STATUS,
+        LibraryGroup.BY_TRACK_STATUS,
+    )
+
+    @Suppress("LongParameterList")
+    fun build(
+        items: List<DynItem>,
+        groupType: Int,
+        collapsedDynamicCategories: Set<String>,
+        collapsedDynamicAtBottom: Boolean,
+        unknownLabel: String,
+        notTrackedLabel: String,
+        ungroupedLabel: String = "",
+        categorySortOrder: CategorySortOrder = CategorySortOrder.MANUAL,
+        sourceMeta: Map<EntryId, List<Pair<String, String>>> = emptyMap(),
+        trackStatuses: Map<EntryId, String> = emptyMap(),
+        languageCodes: Map<EntryId, List<String>> = emptyMap(),
+        statusNames: Map<EntryId, String> = emptyMap(),
+        languageDisplay: (langCode: String) -> String = { it },
+        trackingStatusOrder: (statusName: String) -> String = { it },
+    ): Map<LibraryBucket.Dynamic, List<EntryId>> {
+        if (items.isEmpty()) return emptyMap()
+
+        // UNGROUPED: one flat synthetic bucket holding every item, no per-item metadata lookups.
+        if (groupType == LibraryGroup.UNGROUPED) {
+            val allIds = items.distinctBy { it.id }.map { it.id }
+            val bucket = LibraryBucket.Dynamic(normalizeDynamicKey(ungroupedLabel), ungroupedLabel)
+            return mapOf(bucket to allIds)
+        }
+
+        if (groupType !in DYNAMIC_GROUP_TYPES) return emptyMap()
+
+        val deduplicated = items.distinctBy { it.id }
+
+        // Step 1: per-item, the encoded bucket name(s) it belongs to. An item can land in several
+        // buckets (multiple tags / authors); distinct guards against the same bucket twice.
+        //
+        // Keyed by the normalized name, with the first spelling seen winning the label: sources spell
+        // one tag several ways ("Adult" against "ADULT"), and an exact-string key renders those as two
+        // adjacent groups. Normalizing the label would mangle acronyms (BL, NTR). Callers concatenate
+        // the manga feed first, which keeps the choice stable.
+        val idsByKey = LinkedHashMap<String, MutableList<EntryId>>()
+        val encodedByKey = LinkedHashMap<String, String>()
+        for (item in deduplicated) {
+            val names = categoryNamesFor(
+                item = item,
+                groupType = groupType,
+                unknownLabel = unknownLabel,
+                notTrackedLabel = notTrackedLabel,
+                sourceMeta = sourceMeta,
+                trackStatuses = trackStatuses,
+                languageCodes = languageCodes,
+                statusNames = statusNames,
+                languageDisplay = languageDisplay,
+            )
+            for (name in names.distinctBy(::normalizeDynamicKey)) {
+                val key = normalizeDynamicKey(name)
+                encodedByKey.getOrPut(key) { name }
+                idsByKey.getOrPut(key) { mutableListOf() }.add(item.id)
+            }
+        }
+
+        // Step 2: one bucket per distinct key, labelled with the first spelling seen.
+        val buckets = encodedByKey.map { (key, encoded) -> LibraryBucket.Dynamic(key, labelOf(encoded)) }
+
+        // Step 3: order the buckets. Tracking status has an inherent reading-progress order (Reading
+        // first, Not tracked last), so it always uses that and ignores the alphabetical category sort,
+        // which is meant for name-keyed groupings (source / tag / author / language). For those, Z->A
+        // reverses and off / A->Z is alphabetical by label.
+        val sorted = if (groupType == LibraryGroup.BY_TRACK_STATUS) {
+            buckets.sortedWith(compareBy(String.CASE_INSENSITIVE_ORDER) { trackingStatusOrder(it.label) })
+        } else if (categorySortOrder == CategorySortOrder.Z_TO_A) {
+            buckets.sortedByDescending { it.label.lowercase() }
+        } else {
+            buckets.sortedWith(compareBy(String.CASE_INSENSITIVE_ORDER) { it.label })
+        }
+
+        // Step 4: optionally push collapsed groups to the bottom.
+        val finalBuckets = if (collapsedDynamicAtBottom) {
+            val collapsedKeys = collapsedDynamicCategories.normalizedDynamicKeys()
+            sorted.filterNot { it.key in collapsedKeys } + sorted.filter { it.key in collapsedKeys }
+        } else {
+            sorted
+        }
+
+        return finalBuckets.associateWith { idsByKey[it.key].orEmpty().toList() }
+    }
+
+    /** The label behind an encoded name: the part that is not the source-id / language-code disambiguator. */
+    private fun labelOf(encodedName: String): String = when {
+        SOURCE_SPLITTER in encodedName -> encodedName.substringBefore(SOURCE_SPLITTER)
+        LANG_SPLITTER in encodedName -> encodedName.substringAfter(LANG_SPLITTER)
+        else -> encodedName
+    }
+
+    private fun categoryNamesFor(
+        item: DynItem,
+        groupType: Int,
+        unknownLabel: String,
+        notTrackedLabel: String,
+        sourceMeta: Map<EntryId, List<Pair<String, String>>>,
+        trackStatuses: Map<EntryId, String>,
+        languageCodes: Map<EntryId, List<String>>,
+        statusNames: Map<EntryId, String>,
+        languageDisplay: (langCode: String) -> String,
+    ): List<String> {
+        val itemId = item.id
+        return when (groupType) {
+            LibraryGroup.BY_TAG -> {
+                val tags = item.genre.orEmpty().mapNotNull { it.trim().capitalizeWords().ifBlank { null } }
+                tags.ifEmpty { listOf(unknownLabel) }
+            }
+            LibraryGroup.BY_SOURCE -> sourceMeta[itemId].orEmpty()
+                .map { (name, key) -> "$name$SOURCE_SPLITTER$key" }
+                .ifEmpty { listOf("$unknownLabel${SOURCE_SPLITTER}0") }
+            // A member with no language says nothing about the series, so Unknown only when none has one.
+            LibraryGroup.BY_LANGUAGE -> languageCodes[itemId].orEmpty()
+                .filterNot { it.isBlank() }
+                .map { code -> "$code$LANG_SPLITTER${languageDisplay(code).ifBlank { code }}" }
+                .ifEmpty { listOf(unknownLabel) }
+            LibraryGroup.BY_AUTHOR -> {
+                val author = item.author?.takeUnless { it.isBlank() }
+                val artist = item.artist?.takeUnless { it.isBlank() }
+                if (author == null && artist == null) {
+                    listOf(unknownLabel)
+                } else {
+                    listOfNotNull(author, artist)
+                        .flatMap { combined ->
+                            combined.split(",", "/", " x ", " - ", ignoreCase = true)
+                                .mapNotNull { it.trim().ifBlank { null } }
+                        }
+                        .distinct()
+                        .ifEmpty { listOf(unknownLabel) }
+                }
+            }
+            LibraryGroup.BY_TRACK_STATUS -> listOf(trackStatuses[itemId] ?: notTrackedLabel)
+            LibraryGroup.BY_STATUS -> listOf(statusNames[itemId] ?: unknownLabel)
+            else -> emptyList()
+        }
+    }
+
+    private fun String.capitalizeWords(): String =
+        split(" ").joinToString(" ") { word -> word.replaceFirstChar { it.uppercaseChar() } }
+}

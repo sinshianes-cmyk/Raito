@@ -1,0 +1,176 @@
+package raito.domain.recommendation
+
+import dev.icerock.moko.resources.StringResource
+import dev.zacsweers.metro.AppScope
+import dev.zacsweers.metro.Inject
+import dev.zacsweers.metro.SingleIn
+import eu.kanade.tachiyomi.data.track.Tracker
+import eu.kanade.tachiyomi.data.track.TrackerManager
+import tachiyomi.core.common.preference.Preference
+import tachiyomi.core.common.preference.PreferenceStore
+import tachiyomi.core.common.preference.getEnum
+import tachiyomi.i18n.MR
+
+/** Where the details screen surfaces the related-manga carousel when it is enabled. */
+enum class RelatedPlacement(val titleRes: StringResource) {
+    INLINE(MR.strings.pref_related_placement_inline),
+
+    /** A three-dot overflow-menu action that opens the recommendations screen; no inline carousel and
+     *  no inline search, so the details page opens without the suggestion request. */
+    MENU(MR.strings.pref_related_placement_menu),
+}
+
+/**
+ * Preferences for the recommendation carousel and taste profile. Key strings are stored on every
+ * install and restored verbatim from backups, so renaming one needs a migration that moves the value.
+ *
+ * MangaUpdates is recommendations-only (its user-library API is undocumented), so it has a recs
+ * toggle but no library-pull toggle. Kitsu and Bangumi have no recommendations endpoint, so they
+ * have a library-pull toggle but no recs toggle.
+ */
+@Inject
+@SingleIn(AppScope::class)
+class RaitoRecommendationPreferences(
+    private val preferenceStore: PreferenceStore,
+) {
+
+    // region Recommendation sources (per-manga "Related")
+
+    /**
+     * Master switch for the whole carousel. Off means no work at all, not just a hidden row: the
+     * details screen skips the load entirely, so a rate-limited source keeps its whole request
+     * budget for the chapter list.
+     */
+    val enableRelatedMangas: Preference<Boolean> =
+        preferenceStore.getBoolean("pref_enable_related_mangas", true)
+
+    /** Inline body carousel vs a three-dot menu action; only meaningful while [enableRelatedMangas] is on. */
+    val relatedPlacement: Preference<RelatedPlacement> =
+        preferenceStore.getEnum("pref_related_placement", RelatedPlacement.INLINE)
+
+    val includeTrackerRecommendations: Preference<Boolean> =
+        preferenceStore.getBoolean("pref_include_tracker_recommendations", true)
+
+    val anilistRecommendations: Preference<Boolean> =
+        preferenceStore.getBoolean("pref_anilist_recommendations", true)
+
+    val myAnimeListRecommendations: Preference<Boolean> =
+        preferenceStore.getBoolean("pref_myanimelist_recommendations", true)
+
+    val mangaUpdatesRecommendations: Preference<Boolean> =
+        preferenceStore.getBoolean("pref_mangaupdates_recommendations", true)
+
+    val shikimoriRecommendations: Preference<Boolean> =
+        preferenceStore.getBoolean("pref_shikimori_recommendations", true)
+
+    // endregion
+
+    // region Taste profile (pull the user's tracker library to learn tag affinity)
+
+    val pullLibraryFromAnilist: Preference<Boolean> =
+        preferenceStore.getBoolean("pullLibraryFromAnilist", false)
+
+    val pullLibraryFromMyAnimeList: Preference<Boolean> =
+        preferenceStore.getBoolean("pullLibraryFromMyAnimeList", false)
+
+    val pullLibraryFromKitsu: Preference<Boolean> =
+        preferenceStore.getBoolean("pullLibraryFromKitsu", false)
+
+    val pullLibraryFromShikimori: Preference<Boolean> =
+        preferenceStore.getBoolean("pullLibraryFromShikimori", false)
+
+    val pullLibraryFromBangumi: Preference<Boolean> =
+        preferenceStore.getBoolean("pullLibraryFromBangumi", false)
+
+    /** Auto-refresh interval for the tracker-library pull, in hours. 0 = never (manual only). */
+    val trackerLibraryAutoRefreshHours: Preference<Int> =
+        preferenceStore.getInt("pref_tracker_library_auto_refresh_hours", 0)
+
+    // endregion
+
+    // region Candidate injection (taste-driven extra candidates)
+
+    val injectTagSearchCandidates: Preference<Boolean> =
+        preferenceStore.getBoolean("pref_inject_tag_search_candidates", true)
+
+    val injectCrossRecommendationCandidates: Preference<Boolean> =
+        preferenceStore.getBoolean("pref_inject_cross_recommendation_candidates", true)
+
+    // endregion
+
+    // region Reranking
+
+    val enableRecommendationRerank: Preference<Boolean> =
+        preferenceStore.getBoolean("pref_enable_recommendation_rerank", true)
+
+    /** 0..100: 0 = popularity-first, 100 = fully personalized. Maps to the ranker's wPersonal. */
+    val recommendationStyle: Preference<Int> =
+        preferenceStore.getInt("pref_recommendation_style", 25)
+
+    /** 0..100: 0 = familiar, 100 = adventurous. Maps to the ranker's wSerendipity. */
+    val serendipity: Preference<Int> =
+        preferenceStore.getInt("pref_serendipity", 20)
+
+    // endregion
+
+    // region Filters (hide already-tracked / in-library candidates from suggestions)
+
+    /** Matches by normalized title regardless of tracking, and independently of the status filters
+     *  below. */
+    val hideInLibraryRecommendations: Preference<Boolean> =
+        preferenceStore.getBoolean("pref_hide_in_library_recommendations", false)
+
+    val hideTrackedReadingCompleted: Preference<Boolean> =
+        preferenceStore.getBoolean("pref_hide_tracked_reading_completed", false)
+
+    val hideTrackedDropped: Preference<Boolean> =
+        preferenceStore.getBoolean("pref_hide_tracked_dropped", false)
+
+    val hideTrackedOnHold: Preference<Boolean> =
+        preferenceStore.getBoolean("pref_hide_tracked_on_hold", false)
+
+    val hideTrackedPlanToRead: Preference<Boolean> =
+        preferenceStore.getBoolean("pref_hide_tracked_plan_to_read", false)
+
+    // endregion
+
+    fun buildRanker(): RecommendationRanker = RecommendationRanker(
+        wPersonal = recommendationStyle.get().coerceIn(0, 100) / 100.0,
+        wSerendipity = serendipity.get().coerceIn(0, 100) / 100.0,
+    )
+
+    /**
+     * One switch per tracker with a recommendations endpoint, the same set [RecommendationProviders.forTracker]
+     * answers for. The settings screen draws these and [enabledRecommendationTrackerIds] reads them.
+     */
+    fun recommendationToggles(trackerManager: TrackerManager): List<TrackerToggle> = listOf(
+        TrackerToggle(trackerManager.aniList, anilistRecommendations),
+        TrackerToggle(trackerManager.myAnimeList, myAnimeListRecommendations),
+        TrackerToggle(trackerManager.mangaUpdates, mangaUpdatesRecommendations),
+        TrackerToggle(trackerManager.shikimori, shikimoriRecommendations),
+    )
+
+    /**
+     * Tracker ids whose recommendation stream is enabled: the master toggle on AND that tracker's own
+     * sub-toggle on. Shared by both carousel paths (the title-search [RecommendationsFetcher] and the
+     * media-context [RelatedMangasLoader]) so they can't disagree on what the toggles gate; a
+     * media-context recommendation for a tracker outside this set is dropped from the pool.
+     */
+    fun enabledRecommendationTrackerIds(trackerManager: TrackerManager): Set<Long> {
+        if (!includeTrackerRecommendations.get()) return emptySet()
+        return recommendationToggles(trackerManager).filter { it.preference.get() }.map { it.tracker.id }.toSet()
+    }
+
+    /** The master toggle gates the taste injections too, which ride on the trackers' recommendation graph. */
+    fun enabledStreams(trackerManager: TrackerManager): EnabledRecommendationStreams {
+        val trackerDerived = includeTrackerRecommendations.get()
+        return EnabledRecommendationStreams(
+            trackerIds = enabledRecommendationTrackerIds(trackerManager),
+            crossRecs = trackerDerived && injectCrossRecommendationCandidates.get(),
+            tagSearch = trackerDerived && injectTagSearchCandidates.get(),
+        )
+    }
+}
+
+/** A tracker and the switch that gates its recommendations. */
+data class TrackerToggle(val tracker: Tracker, val preference: Preference<Boolean>)

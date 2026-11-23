@@ -1,0 +1,22 @@
+-- Precomputed cross-source chapter identity, backing the deduplicated unread count on a merged entry.
+-- Mirrors data/chapter_match_key.sq exactly (fresh installs build from the .sq, existing ones here);
+-- see that file for the rationale.
+-- No backfill (migrations do not seed): reconciliation fills the keys. Until it runs every chapter is
+-- its own unit and a merged count reads as the sum across sources, so the count must not be surfaced
+-- before the first reconciliation.
+CREATE TABLE chapter_match_key (
+    chapter_id INTEGER NOT NULL PRIMARY KEY,
+    match_key TEXT,
+    derived_number REAL NOT NULL,
+    FOREIGN KEY(chapter_id) REFERENCES chapters (_id)
+    ON DELETE CASCADE
+);
+
+CREATE TABLE novel_chapter_match_key (
+    chapter_id INTEGER NOT NULL PRIMARY KEY,
+    match_key TEXT,
+    derived_name TEXT NOT NULL,
+    derived_number REAL NOT NULL,
+    FOREIGN KEY(chapter_id) REFERENCES novel_chapters (_id)
+    ON DELETE CASCADE
+);

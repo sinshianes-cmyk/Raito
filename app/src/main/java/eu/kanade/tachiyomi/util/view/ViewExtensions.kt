@@ -1,0 +1,73 @@
+@file:Suppress("NOTHING_TO_INLINE")
+
+package eu.kanade.tachiyomi.util.view
+
+import android.content.res.Resources
+import android.graphics.Rect
+import android.view.View
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.compose.material3.LocalContentColor
+import androidx.compose.material3.LocalTextStyle
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionContext
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.ui.platform.ComposeView
+import androidx.compose.ui.platform.ViewCompositionStrategy
+import dev.zacsweers.metrox.viewmodel.LocalMetroViewModelFactory
+import eu.kanade.presentation.theme.TachiyomiTheme
+import exh.debug.LocalCoverImagesHidden
+import exh.debug.rememberCoverImagesHidden
+import mihon.app.di.appGraph
+
+inline fun ComponentActivity.setComposeContent(
+    parent: CompositionContext? = null,
+    crossinline content: @Composable () -> Unit,
+) {
+    setContent(parent) {
+        TachiyomiTheme {
+            CompositionLocalProvider(
+                LocalTextStyle provides MaterialTheme.typography.bodySmall,
+                LocalContentColor provides MaterialTheme.colorScheme.onBackground,
+                LocalMetroViewModelFactory provides appGraph.viewModelFactory,
+                LocalCoverImagesHidden provides rememberCoverImagesHidden(), // RK: the debug menu's hidden covers
+            ) {
+                content()
+            }
+        }
+    }
+}
+
+fun ComposeView.setComposeContent(
+    content: @Composable () -> Unit,
+) {
+    setViewCompositionStrategy(ViewCompositionStrategy.DisposeOnViewTreeLifecycleDestroyed)
+    setContent {
+        TachiyomiTheme {
+            CompositionLocalProvider(
+                LocalTextStyle provides MaterialTheme.typography.bodySmall,
+                LocalContentColor provides MaterialTheme.colorScheme.onBackground,
+                // RK: the view-model factory, so metroViewModel resolves inside a ComposeView too
+                LocalMetroViewModelFactory provides context.appGraph.viewModelFactory,
+                LocalCoverImagesHidden provides rememberCoverImagesHidden(), // RK: the debug menu's hidden covers
+            ) {
+                content()
+            }
+        }
+    }
+}
+
+fun View?.isVisibleOnScreen(): Boolean {
+    if (this == null) {
+        return false
+    }
+    if (!this.isShown) {
+        return false
+    }
+    val actualPosition = Rect()
+    this.getGlobalVisibleRect(actualPosition)
+    val screen =
+        Rect(0, 0, Resources.getSystem().displayMetrics.widthPixels, Resources.getSystem().displayMetrics.heightPixels)
+    return actualPosition.intersect(screen)
+}

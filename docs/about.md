@@ -1,0 +1,99 @@
+---
+title: Raito
+titleTemplate: Frequently Asked Questions
+description: What Raito is, where to get it, and how it differs from Mihon.
+---
+
+# Raito
+
+The questions that come up most about the app itself.
+For how the reading experience works, the rest of this section and the [guides](/docs/guides/getting-started) cover it.
+
+::: tip Not answered here?
+Ask in [Q&A](https://github.com/unseensnick/Raito/discussions/categories/q-a).
+:::
+
+## What is Raito?
+
+Raito is a personal fork for reading manga and light novels in one app.
+
+It is built on Mihon, with its own features on top: light novels beside manga in one library,
+[merged series](/docs/multi-source) that bring one series' sources together, and more.
+Mihon's fixes and improvements reach Raito as they land.
+
+## Does the UI follow Mihon or Yōkai?
+
+Mostly Mihon, so nothing looks out of place, with the Yōkai touches I liked carried
+over: the single-list library view with the floating category hopper, dynamic grouping
+(by source, language, tag, and so on), and the cover-color accent on the details
+screen. [Library layout](library-layout.md) covers how to turn on the first two; the cover color is
+**Theme based on cover** in <nav to="appearance">, on by default. Suggestions are welcome,
+but additions will still follow Mihon's design.
+
+## How do I get updates? Is it on an app store?
+
+No app store. Raito has a built-in updater. It checks GitHub Releases each time you open the app from
+cold and every 6 hours while it stays open, and you can check yourself in <nav to="about"> under
+**Check for updates**. When there is a newer version, it opens an update screen with its changelog,
+where you can also skip that version.
+Tap **Download** and the button shows the progress; when it finishes, tap **Install**.
+
+## Where should I download Raito from? Are "patched" builds safe?
+
+Only from the [download page](/download/), which offers both Stable and Nightly, or the GitHub
+releases it links to (the in-app updater pulls from the same place). Nowhere else. People
+sometimes post links to a "patched" or "fixed" APK in issue comments or elsewhere;
+those are not from me and have turned out to be malware. If a build did not come from
+there, do not install it.
+
+## Will updating keep my library and data? Should I back up?
+
+Yes. An update installs over the version you have, and your library and settings stay as they are.
+Coming from Raito 0.3.1 or older, or from another app, takes a few extra steps: see
+[Before you upgrade](/docs/before-you-upgrade).
+
+Making a backup before any update is a good habit either way (<nav to="data-and-storage"> then
+**Create backup**).
+
+## Are extensions and sources supported?
+
+Raito doesn't maintain or fix third-party extensions; problems with a specific
+extension are out of scope and belong upstream. A few sources are built into Raito,
+and bugs in those are fair to report. When you do, keep the issue title generalized
+(for example "Error opening a built-in gallery source") and name the source by its
+shorthand in the body. Shorthand list: [built-in sources](built-in-sources.md#reporting-a-bug-in-one).
+
+## Can I use novel sources from Tsundoku (NovelSourcery) or IReader?
+
+Yes. Add the repo address each project publishes with **Add repo** under **Repos**, in
+<nav to="browse">, the same way as any other. Their extensions are
+[extension apps](/docs/faq/browse/extensions#extension-apps-and-plugins), so they install and update
+from **Extensions** like manga extensions, and their novels browse, read, download, update, migrate and
+track like any other novel.
+
+Both kinds sit beside [LNReader](https://github.com/LNReader/lnreader)-style
+[plugins](/docs/faq/browse/extensions#extension-apps-and-plugins). When a list mixes
+kinds of novel source, each one is labelled JS, APK or IReader so you can tell them apart.
+Extensions from a repo that publishes its signing key load without a trust prompt, and so do those from
+IReader's own repo; any other asks before an extension first loads, as it does for manga.
+
+## Where do I report a bug, request a feature, or ask a question?
+
+- **Bug:** the [bug report form](https://github.com/unseensnick/Raito/issues/new?template=2_report_issue.yml)
+  under Issues. Include your Raito version, from <nav to="about">, plus your Android version and
+  device.
+- **Feature idea:** the [Ideas discussion](https://github.com/unseensnick/Raito/discussions/categories/ideas),
+  so it can be talked through first.
+- **Question:** the [Q&A discussion](https://github.com/unseensnick/Raito/discussions/categories/q-a).
+
+## Will my feature request be built?
+
+Maybe as asked, maybe as a variation that fits the app better, maybe not at all. Raito
+is shaped around one person's use, so talking an idea through in Ideas first is the most
+useful path.
+
+## Will my pull request be merged?
+
+It's a personal-time project, so a PR may sit for a while, may not be merged, or may
+inspire a different take on the same idea. For anything beyond a small fix, raise it
+first.

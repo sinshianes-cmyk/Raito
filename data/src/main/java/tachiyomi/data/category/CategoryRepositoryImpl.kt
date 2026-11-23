@@ -1,0 +1,169 @@
+package tachiyomi.data.category
+
+import app.cash.sqldelight.async.coroutines.awaitAsList
+import app.cash.sqldelight.async.coroutines.awaitAsOne
+import app.cash.sqldelight.async.coroutines.awaitAsOneOrNull
+import dev.zacsweers.metro.AppScope
+import dev.zacsweers.metro.ContributesBinding
+import dev.zacsweers.metro.Inject
+import dev.zacsweers.metro.SingleIn
+import kotlinx.coroutines.flow.Flow
+import raito.domain.category.CategoryContentType
+import tachiyomi.data.Database
+import tachiyomi.data.subscribeToList
+import tachiyomi.domain.category.model.Category
+import tachiyomi.domain.category.model.NewCategory
+import tachiyomi.domain.category.repository.CategoryRepository
+
+@Inject
+@SingleIn(AppScope::class)
+@ContributesBinding(AppScope::class)
+class CategoryRepositoryImpl(
+    private val database: Database,
+) : CategoryRepository {
+
+    override suspend fun get(id: Long): Category? {
+        return database.categoryQueries
+            .getCategory(id, ::mapCategory)
+            .awaitAsOneOrNull()
+    }
+
+    // RK: branch on contentType so one repository serves both libraries (novel rows live in the shared
+    // table at content_type 2). Manga callers pass the default and hit the unchanged manga query.
+    override suspend fun getAll(contentType: Long): List<Category> {
+        val query = if (contentType == CategoryContentType.NOVEL) {
+            database.categoryQueries.getNovelCategories(::mapCategory)
+        } else {
+            database.categoryQueries.getCategories(::mapCategory)
+        }
+        return query.awaitAsList()
+    }
+
+    override fun getAllAsFlow(contentType: Long): Flow<List<Category>> {
+        val query = if (contentType == CategoryContentType.NOVEL) {
+            database.categoryQueries.getNovelCategories(::mapCategory)
+        } else {
+            database.categoryQueries.getCategories(::mapCategory)
+        }
+        return query.subscribeToList()
+    }
+
+    override suspend fun getUnfiltered(): List<Category> {
+        return database.categoryQueries
+            .getAllCategories(::mapCategory)
+            .awaitAsList()
+    }
+
+    // RK: every content type's rows, now that getAllAsFlow filters by one
+    override fun getUnfilteredAsFlow(): Flow<List<Category>> {
+        return database.categoryQueries
+            .getAllCategories(::mapCategory)
+            .subscribeToList()
+    }
+
+    override suspend fun getCategoriesByMangaId(mangaId: Long): List<Category> {
+        return database.categoryQueries
+            .getCategoriesByMangaId(mangaId, ::mapCategory)
+            .awaitAsList()
+    }
+
+    override fun getCategoriesByMangaIdAsFlow(mangaId: Long): Flow<List<Category>> {
+        return database.categoryQueries
+            .getCategoriesByMangaId(mangaId, ::mapCategory)
+            .subscribeToList()
+    }
+
+    override suspend fun getCategoriesByMangaIds(mangaIds: List<Long>): Map<Long, List<Category>> {
+        return database.categoryQueries
+            // RK: the row carries its content type
+            .getCategoriesByMangaIds(mangaIds) { mangaId, id, name, order, flags, contentType ->
+                mangaId to mapCategory(id, name, order, flags, contentType) // RK
+            }
+            .awaitAsList()
+            .groupBy({ it.first }, { it.second })
+    }
+
+    // RK: novel-side per-entry read over the shared table.
+    override suspend fun getCategoriesByNovelId(novelId: Long): List<Category> {
+        return database.categoryQueries
+            .getNovelCategoriesByNovelId(novelId, ::mapCategory)
+            .awaitAsList()
+    }
+
+    // RK: getCategoriesByNovelId for many novels at once
+    override suspend fun getCategoriesByNovelIds(novelIds: List<Long>): Map<Long, List<Category>> {
+        return database.categoryQueries
+            .getNovelCategoriesByNovelIds(novelIds) { novelId, id, name, order, flags, contentType ->
+                novelId to mapCategory(id, name, order, flags, contentType)
+            }
+            .awaitAsList()
+            .groupBy({ it.first }, { it.second })
+    }
+
+    // RK --> contentType is written straight through, so a universal category (0) is expressible and not
+    // silently demoted to manga. Returns the new row id for the create/restore paths that key off it.
+    override suspend fun insert(category: NewCategory): Long {
+        return database.transactionWithResult {
+            database.categoryQueries.insert(
+                name = category.name,
+                flags = category.flags,
+                contentType = category.contentType,
+            )
+            database.categoryQueries.selectLastInsertedRowId().awaitAsOne()
+        }
+    }
+    // RK <--
+
+    override suspend fun insertAll(categories: List<NewCategory>) {
+        database.transaction {
+            categories.forEach { insert(it) }
+        }
+    }
+
+    override suspend fun updateName(categoryId: Long, name: String) {
+        database.categoryQueries.updateName(name = name, id = categoryId)
+    }
+
+    override suspend fun updateFlags(categoryId: Long, flags: Long) {
+        database.categoryQueries.updateFlags(flags = flags, id = categoryId)
+    }
+
+    // RK: upstream's updateAllFlags is clearSortOverrides, below
+    override suspend fun updateAllOrders(orderedIds: List<Long>) {
+        database.transaction {
+            val current = database.categoryQueries.getUserCategoryIds().awaitAsList()
+            val ids = orderedIds.filter { it in current } + current.filterNot { it in orderedIds }
+            ids.forEachIndexed { index, categoryId ->
+                database.categoryQueries.updateOrder(order = -index - 2L, id = categoryId)
+            }
+            ids.forEachIndexed { index, categoryId ->
+                database.categoryQueries.updateOrder(order = index.toLong(), id = categoryId)
+            }
+        }
+    }
+
+    // RK: clear the per-category sort-override marker on every category (they follow the global sort again).
+    override suspend fun clearSortOverrides() {
+        database.categoryQueries.clearSortOverrides()
+    }
+
+    override suspend fun delete(categoryId: Long) {
+        database.categoryQueries.delete(id = categoryId)
+    }
+
+    private fun mapCategory(
+        id: Long,
+        name: String,
+        order: Long,
+        flags: Long,
+        contentType: Long, // RK: the category's content type column
+    ): Category {
+        return Category(
+            id = id,
+            name = name,
+            order = order,
+            flags = flags,
+            contentType = contentType, // RK: the category's content type column
+        )
+    }
+}

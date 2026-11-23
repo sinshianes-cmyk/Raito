@@ -1,0 +1,318 @@
+package raito.presentation.novel.details
+
+import androidx.compose.foundation.layout.padding
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import cafe.adriel.voyager.navigator.LocalNavigator
+import cafe.adriel.voyager.navigator.currentOrThrow
+import dev.zacsweers.metrox.viewmodel.assistedMetroViewModel
+import eu.kanade.presentation.category.components.ChangeCategoryDialog
+import eu.kanade.presentation.components.AppBar
+import raito.presentation.theme.CoverTheme
+import raito.presentation.theme.rememberCoverSeed
+import eu.kanade.presentation.util.AssistContentScreen
+import eu.kanade.presentation.util.Screen
+import eu.kanade.presentation.util.isTabletUi
+import eu.kanade.tachiyomi.ui.browse.extension.details.SourcePreferencesScreen
+import eu.kanade.tachiyomi.ui.category.CategoryScreen
+import eu.kanade.tachiyomi.ui.reader.ReaderActivity
+import eu.kanade.tachiyomi.ui.setting.SettingsScreen
+import kotlinx.coroutines.launch
+import mihon.app.di.appGraph
+import raito.data.novel.expectedNextUpdate
+import raito.domain.entry.EntryId
+import raito.domain.library.ContentType
+import raito.domain.novel.NovelRepository
+import raito.domain.novel.model.Novel
+import raito.domain.novel.model.NovelChapter
+import raito.domain.novel.model.NovelWithChapterCount
+import raito.domain.novel.model.asNovelCover
+import raito.domain.novel.model.withCustomInfo
+import raito.domain.source.SourceKey
+import raito.novel.source.NovelSettings
+import raito.presentation.browse.catalogue.EntryCatalogueScreen
+import raito.presentation.browse.components.EntryDuplicateDialog
+import raito.presentation.browse.components.toDuplicateCard
+import raito.presentation.browse.globalsearch.EntryGlobalSearchScreen
+import raito.presentation.details.EntryDetailsContent
+import raito.presentation.details.EntryDetailsDialog
+import raito.presentation.details.EntryDetailsDialogHost
+import raito.presentation.details.EntryDetailsNavigation
+import raito.presentation.details.EntryDetailsScreenState
+import raito.presentation.details.EntryDetailsSkeleton
+import raito.presentation.details.EntryEditInfoUi
+import raito.presentation.details.NovelEntryAdapter
+import raito.presentation.details.chapterToOpen
+import raito.presentation.details.openDownloadFolder
+import raito.presentation.details.searchGenreFromDetails
+import raito.presentation.details.searchLibraryFromDetails
+import raito.presentation.migrate.flow.EntryMigrateFor
+import raito.presentation.migrate.flow.EntryMigrationSourcePickScreen
+import raito.presentation.novel.browse.NovelSourceSettingsSheet
+import raito.presentation.novel.notes.NovelNotesScreen
+import raito.presentation.novel.search.NovelChapterSearchScreen
+import tachiyomi.presentation.core.components.material.Scaffold
+import tachiyomi.presentation.core.screens.EmptyScreen
+
+/**
+ * Light-novel details screen, the novel twin of `MangaScreen`, pinned by [EntryDetailsContent]. Builds a
+ * [NovelEntryAdapter] over the novel model and delegates the whole body to the shared content, so a
+ * details change is written once and reaches both content types. Only novel-specific navigation (the
+ * reader, notes, the page selector) and the per-type dialogs live here; the shared dialogs go through
+ * [EntryDetailsDialogHost].
+ */
+class NovelScreen(
+    // Public so the migrate flow can identity-check the screen below it before replacing.
+    val sourceId: String,
+    val novelUrl: String,
+    // The cover a listing showed, which stands in for a placeholder the details page gives.
+    private val listingCover: String? = null,
+    // Opened from a source listing: starts the synopsis expanded, and closes when incognito ends.
+    val fromSource: Boolean = false,
+) : Screen(), AssistContentScreen {
+
+    private var assistUrl: String? = null
+
+    override fun onProvideAssistUrl() = assistUrl
+
+    @Composable
+    override fun Content() {
+        val navigator = LocalNavigator.currentOrThrow
+        val context = LocalContext.current
+        val scope = rememberCoroutineScope()
+        val viewModel = assistedMetroViewModel<NovelDetailsViewModel, NovelDetailsViewModel.Factory> {
+            create(sourceId = sourceId, novelUrl = novelUrl, listingCover = listingCover, isFromSource = fromSource)
+        }
+        // Lifecycle-aware so collection pauses when the screen is not resumed (parity with MangaScreen).
+        val state by viewModel.state.collectAsStateWithLifecycle()
+        val coverViewModelFactory = remember { context.appGraph.novelCoverViewModelFactory }
+        val adapter = remember(viewModel) { NovelEntryAdapter(viewModel, coverViewModelFactory) }
+        val neutralState by adapter.state.collectAsStateWithLifecycle()
+
+        when (val s = state) {
+            NovelDetailsState.Loading -> EntryDetailsSkeleton()
+            is NovelDetailsState.Failed -> Scaffold(
+                topBar = { AppBar(title = null, navigateUp = navigator::pop, scrollBehavior = it) },
+            ) { padding -> EmptyScreen(message = s.message, modifier = Modifier.padding(padding)) }
+            is NovelDetailsState.Loaded -> CoverTheme(
+                rememberCoverSeed(
+                    id = EntryId.Novel(s.displayNovel.id),
+                    extracted = s.seedColor,
+                    enabled = viewModel.themeCoverBased,
+                ),
+            ) {
+                // The page WebView and Share open, so a merged novel offers the selected chip's.
+                LaunchedEffect(s.webPage) { assistUrl = s.webPage?.url }
+
+                (neutralState as? EntryDetailsScreenState.Loaded)?.let { loaded ->
+                    EntryDetailsContent(
+                        behavior = adapter,
+                        state = loaded,
+                        snackbarHostState = viewModel.snackbarHostState,
+                        isTabletUi = isTabletUi(),
+                        chapterSwipeStartAction = s.chapterSwipeActions.start,
+                        chapterSwipeEndAction = s.chapterSwipeActions.end,
+                        nav = EntryDetailsNavigation(
+                            navigateUp = navigator::pop,
+                            onOpenChapter = { chapterId ->
+                                // Route to the chapter's own source (a unified-list row keeps its owning
+                                // novelId). The All chip opens group scope; a source chip opens source scope.
+                                // The model's state at the tap, so the lambda outlives an emission (as manga's).
+                                val live = viewModel.state.value as? NovelDetailsState.Loaded
+                                live?.let {
+                                    chapterToOpen(chapterId, it.chapters, it.resumeChapter, NovelChapter::id)
+                                }?.let { ch ->
+                                    context.startActivity(
+                                        ReaderActivity.newNovelIntent(
+                                            context = context,
+                                            novelId = ch.novelId,
+                                            chapterId = ch.id,
+                                            sourceScoped = live.selectedSourceNovelId != null,
+                                        ),
+                                    )
+                                }
+                            },
+                            onGlobalSearch = {
+                                navigator.push(EntryGlobalSearchScreen(it, scopedContentType = ContentType.NOVELS))
+                            },
+                            onLibrarySearch = { query ->
+                                scope.launch { navigator.searchLibraryFromDetails(query, ContentType.NOVELS) }
+                            },
+                            // Null for an uninstalled plugin, whose catalogue would open on nothing.
+                            onBrowseSource = s.browsableSourceId?.let { id ->
+                                { navigator.push(EntryCatalogueScreen(SourceKey.Novel(id))) }
+                            },
+                            onTagSearch = { genre ->
+                                scope.launch {
+                                    navigator.searchGenreFromDetails(
+                                        genre,
+                                        SourceKey.Novel(s.browsableSourceId ?: sourceId),
+                                        ContentType.NOVELS,
+                                    )
+                                }
+                            },
+                            onOpenTrackingSettings = {
+                                navigator.push(SettingsScreen(SettingsScreen.Destination.Tracking))
+                            },
+                            onEditNotes = {
+                                navigator.push(NovelNotesScreen(s.novel.id, s.novel.title, s.novel.notes))
+                            },
+                            onOpenFilterSettings = viewModel::showChapterSettingsDialog,
+                            onEditInterval = viewModel::showSetFetchIntervalDialog,
+                            // Anchor-scoped like manga: migrating must re-home the series, not
+                            // whichever source chip happens to be selected.
+                            onMigrate = {
+                                navigator.push(EntryMigrationSourcePickScreen(ContentType.NOVELS, listOf(s.novel.id)))
+                            },
+                            onOpenPageSelector = viewModel::showPageSelectorDialog,
+                            // The scope a chapter tapped here opens in: the chip's source, else the group.
+                            onSearchText = {
+                                navigator.push(
+                                    NovelChapterSearchScreen(
+                                        novelId = s.selectedSourceNovelId ?: s.novel.id,
+                                        sourceScoped = s.selectedSourceNovelId != null,
+                                    ),
+                                )
+                            },
+                            onWordCount = viewModel::showWordCountDialog,
+                            onOpenFolder = {
+                                scope.launch { openDownloadFolder(context, viewModel.viewedDownloadDir()) }
+                            },
+                            onOpenSourceSettings = viewModel::showSourceSettings
+                                .takeIf { s.sourceHasSettings },
+                        ),
+                    )
+                }
+
+                EntryDetailsDialogHost(
+                    s.toSharedDetailsDialog(viewModel.isUpdateIntervalEnabled),
+                    adapter,
+                    viewModel::dismissDialog,
+                )
+                NovelDetailsDialogs(s, viewModel)
+            }
+        }
+    }
+
+    companion object {
+        // The page is keyed by source and url, so an id from the download queue or recents needs its stored row.
+        suspend fun forStored(novelId: Long, novelRepository: NovelRepository): NovelScreen? =
+            novelRepository.getById(novelId)?.let { NovelScreen(it.source, it.url) }
+    }
+}
+
+/** The novel dialogs that stay per-type (their data genuinely diverges); the shared ones go through
+ *  [EntryDetailsDialogHost]. A `Screen` extension because the Migrate case calls [EntryMigrateFor]. */
+@Composable
+private fun Screen.NovelDetailsDialogs(state: NovelDetailsState.Loaded, viewModel: NovelDetailsViewModel) {
+    val navigator = LocalNavigator.currentOrThrow
+    when (val dialog = state.dialog) {
+        is NovelDetailsDialog.ChangeCategory -> ChangeCategoryDialog(
+            initialSelection = dialog.initialSelection,
+            onDismissRequest = viewModel::dismissDialog,
+            onEditCategories = { navigator.push(CategoryScreen()) },
+            onConfirm = { include, _ -> viewModel.applyCategories(include) },
+        )
+        is NovelDetailsDialog.DuplicateNovel -> EntryDuplicateDialog(
+            prompt = dialog.prompt,
+            card = NovelWithChapterCount::toDuplicateCard,
+            onDismissRequest = viewModel::dismissDialog,
+            onConfirm = viewModel::addFavoriteAnyway,
+            onOpen = { navigator.push(NovelScreen(it.novel.source, it.novel.url)) },
+            onMigrate = { viewModel.startMigrate(it.novel.id) },
+            onAddToGroup = viewModel::addToExistingGroup,
+        )
+        NovelDetailsDialog.ChapterSettings -> NovelChapterSettingsDialog(
+            sorting = state.sorting,
+            sortDescending = state.sortDescending,
+            filters = state.chapterFilters,
+            readFilter = state.readFilter,
+            bookmarkedFilter = state.bookmarkedFilter,
+            downloadedFilter = state.downloadedFilter,
+            downloadedFilterLocked = state.downloadedFilterLocked,
+            hideChapterTitles = state.hideChapterTitles,
+            onDismiss = viewModel::dismissDialog,
+            onSortModeChange = viewModel::setSortMode,
+            onFilterChange = viewModel::setFilters,
+            onDisplayChange = viewModel::setHideChapterTitles,
+            onSetAsDefault = viewModel::setChapterSettingsAsDefault,
+            onReset = viewModel::resetChapterSettings,
+        )
+        is NovelDetailsDialog.SourceSettings -> when (val settings = dialog.source.settings) {
+            is NovelSettings.LnSchema -> NovelSourceSettingsSheet(settings, onDismiss = viewModel::dismissDialog)
+            // A screen of its own rather than a sheet, so the dialog only hands over to it.
+            is NovelSettings.PreferenceScreen -> LaunchedEffect(dialog) {
+                viewModel.dismissDialog()
+                navigator.push(SourcePreferencesScreen.forNovel(dialog.source.id))
+            }
+            null -> {}
+        }
+        is NovelDetailsDialog.WordCount -> NovelWordCountDialog(dialog, onDismissRequest = viewModel::dismissDialog)
+        NovelDetailsDialog.PageSelector -> NovelPageSelectorSheet(
+            pages = state.pages,
+            selectedIndex = state.pageIndex,
+            onSelect = viewModel::selectPage,
+            onDismiss = viewModel::dismissDialog,
+        )
+        is NovelDetailsDialog.Migrate -> EntryMigrateFor(
+            contentType = ContentType.NOVELS,
+            currentId = dialog.currentId,
+            targetId = dialog.targetId,
+            onDismissRequest = viewModel::dismissDialog,
+        )
+        else -> {}
+    }
+}
+
+// Map a novel dialog to the shared union for the dialogs both content types render (EntryDetailsDialogHost);
+// the per-type ones (change-category, duplicate, chapter-settings, source-settings, page-selector, word
+// count, migrate)
+// stay in NovelDetailsDialogs.
+private fun NovelDetailsState.Loaded.toSharedDetailsDialog(isUpdateIntervalEnabled: Boolean): EntryDetailsDialog? =
+    when (val d = dialog) {
+        NovelDetailsDialog.SetFetchInterval -> EntryDetailsDialog.SetFetchInterval(
+            interval = intervalNovel.fetchInterval,
+            nextUpdate = intervalNovel.expectedNextUpdate(),
+            editable = isUpdateIntervalEnabled,
+        )
+        NovelDetailsDialog.EditInfo -> EntryDetailsDialog.EditInfo(
+            // Seed from the ANCHOR, not displayNovel: save diffs each field against the anchor row, so
+            // seeding from a selected merge sibling would persist its every differing field as an
+            // override on an untouched Save. Matches the manga side (seed and diff share one entry).
+            initial = novel.withCustomInfo(customInfo).toEntryEditInfoUi(),
+            source = novel.toEntryEditInfoUi(),
+            seedColor = seedColor,
+            coverModel = { url -> novel.asNovelCover(url.ifBlank { null }) },
+        )
+        NovelDetailsDialog.FullCover -> EntryDetailsDialog.Cover
+        is NovelDetailsDialog.ManageSources -> EntryDetailsDialog.ManageSources(
+            sources = d.sources,
+            isOverridden = d.isOverridden,
+        )
+        NovelDetailsDialog.TrackSheet -> EntryDetailsDialog.TrackSheet(EntryId.Novel(novel.id), novel.title)
+        is NovelDetailsDialog.DeleteChapters -> EntryDetailsDialog.DeleteChapters(d.chapters.map { it.id })
+        is NovelDetailsDialog.ClearDownloads -> EntryDetailsDialog.ClearDownloads(d.target)
+        is NovelDetailsDialog.RemoveFromLibrary -> EntryDetailsDialog.RemoveFromLibrary(
+            d.removal,
+            novel.withCustomInfo(customInfo).title,
+        )
+        is NovelDetailsDialog.ChapterNumber -> EntryDetailsDialog.ChapterNumber(d.edit)
+        else -> null
+    }
+
+/** Seed the shared edit-info dialog from a novel's effective (edited) values. */
+internal fun Novel.toEntryEditInfoUi() = EntryEditInfoUi(
+    title = title,
+    author = author.orEmpty(),
+    artist = artist.orEmpty(),
+    description = description.orEmpty(),
+    genre = genre.orEmpty(),
+    status = status,
+    thumbnailUrl = thumbnailUrl.orEmpty(),
+)

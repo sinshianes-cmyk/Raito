@@ -1,0 +1,23 @@
+---
+title: Shizuku
+titleTemplate: Sources
+description: Using Shizuku with Raito.
+---
+
+# Shizuku
+**Shizuku** is an alternative method for installing and updating extensions in **Raito**.
+
+It taps into system APIs to directly install packages without requiring user interaction.
+
+To get a detailed understanding of **Shizuku**, its purpose, and how it operates, refer to the information provided [here on Shizuku](https://shizuku.rikka.app/introduction/).
+
+## Setting up Shizuku
+To set up **Shizuku**, follow the instructions [here on Shizuku](https://shizuku.rikka.app/guide/setup/).
+
+On a rooted device, Sui works in place of the Shizuku app.
+
+After configuring it, enable **Shizuku** within **Raito** by navigating to <nav to="advanced"> then setting **Installer** to **Shizuku**.
+
+::: info Extension apps only
+The installer setting covers every extension app, manga and novel alike. Plugins install inside the app, so no installer setting touches them. See [extension apps and plugins](/docs/faq/browse/extensions#extension-apps-and-plugins).
+:::

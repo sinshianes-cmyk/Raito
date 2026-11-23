@@ -1,0 +1,310 @@
+package raito.presentation.novel.browse
+
+import dev.zacsweers.metro.Inject
+import raito.data.novel.toNovel
+import raito.domain.category.GetNovelCategories
+import raito.domain.category.groupCategoryIds
+import raito.domain.category.resolveDefaultCategoryIds
+import raito.domain.category.withoutSystemCategory
+import raito.domain.db.Transactions
+import raito.domain.library.RaitoLibraryPreferences
+import raito.domain.novel.NovelChapterSettings
+import raito.domain.novel.NovelGroupCategories
+import raito.domain.novel.NovelMergeManager
+import raito.domain.novel.NovelPreferences
+import raito.domain.novel.NovelRepository
+import raito.domain.novel.interactor.RemoveNovelsFromLibrary
+import raito.domain.novel.interactor.SetNovelCategories
+import raito.domain.novel.interactor.UpdateNovel
+import raito.domain.novel.model.Novel
+import raito.domain.novel.model.NovelWithChapterCount
+import raito.domain.track.autobind.AutoBindOnAdd
+import raito.novel.host.NovelItem
+import raito.novel.source.NovelSourceManager
+import raito.presentation.browse.AddDecision
+import raito.presentation.browse.AddFavoriteResult
+import raito.presentation.browse.AddOutcome
+import raito.presentation.browse.AddStep
+import raito.presentation.browse.BatchCategories
+import raito.presentation.browse.DuplicatePrompt
+import raito.presentation.browse.addEntry
+import raito.presentation.browse.addEntryOrPrompt
+import raito.presentation.browse.batchCategories
+import raito.presentation.browse.components.EntrySourceLabel
+import raito.presentation.browse.decideAdd
+import raito.presentation.browse.duplicatePrompt
+import raito.presentation.browse.finishAdd
+import raito.presentation.browse.step
+import raito.presentation.library.raitoSortCategories
+import tachiyomi.core.common.preference.CheckboxState
+import tachiyomi.core.common.preference.mapAsCheckboxState
+import tachiyomi.domain.category.model.Category
+
+/**
+ * The novel add-to-library orchestration every surface shares. Stateless: each browse step returns the
+ * next [AddStep], a [NovelBrowseDialog] to show or the add's end, and [NovelAddFlow] holds it. The source id is
+ * passed per call, since a global search or a feed has one per result.
+ */
+@Inject
+class NovelLibraryAdder(
+    private val novelRepository: NovelRepository,
+    private val manager: NovelSourceManager,
+    private val getNovelCategories: GetNovelCategories,
+    private val setNovelCategories: SetNovelCategories,
+    private val updateNovel: UpdateNovel,
+    private val novelPreferences: NovelPreferences,
+    private val mergeManager: NovelMergeManager,
+    private val transactions: Transactions,
+    private val raitoLibraryPreferences: RaitoLibraryPreferences,
+    private val autoBindOnAdd: AutoBindOnAdd,
+    private val removeNovelsFromLibrary: RemoveNovelsFromLibrary,
+    private val chapterSettings: NovelChapterSettings,
+) {
+
+    private val groupCategories = NovelGroupCategories(getNovelCategories, setNovelCategories)
+
+    /**
+     * Decide a long press: remove, confirm a possible duplicate, or add. Decided on the stored row, as
+     * `MangaLibraryAdder.onLongClick` is, pinned by `EntryAddFlowConformanceTest`.
+     */
+    suspend fun onLongClick(item: NovelItem, sourceId: String): AddStep<NovelBrowseDialog> {
+        val decision = decideAdd(
+            inLibrary = isInLibrary(item, sourceId),
+            // -1: the item isn't favorited yet, so there's no library row to exclude (a non-favorite
+            // shadow row is excluded by the query's favorite=1 filter anyway).
+            findDuplicates = { findDuplicates(-1L, item.name) },
+        )
+        return when (decision) {
+            AddDecision.Remove -> AddStep.Ask(NovelBrowseDialog.RemoveNovel(item, sourceId))
+            is AddDecision.ConfirmDuplicate ->
+                AddStep.Ask(NovelBrowseDialog.AddDuplicate(item, sourceId, decision.duplicates))
+            AddDecision.Add -> addToLibrary(item, sourceId)
+        }
+    }
+
+    /**
+     * The duplicate prompt every novel add path raises, or null when nothing similar is in the library.
+     * [id] is the row to exclude from its own match (-1 when the item has no library row yet). A source
+     * the manager cannot answer for is not installed, so it is named as it was last seen and the card
+     * warns about it. Twin of `MangaLibraryAdder.findDuplicates`, pinned by `AddDecisionConformanceTest`.
+     */
+    suspend fun findDuplicates(id: Long, title: String): DuplicatePrompt<NovelWithChapterCount, String>? =
+        if (!raitoLibraryPreferences.checkDuplicates.get()) null else findDuplicatesUnchecked(id, title) // RK
+
+    private suspend fun findDuplicatesUnchecked(id: Long, title: String): DuplicatePrompt<NovelWithChapterCount, String>? =
+        duplicatePrompt(
+            duplicates = novelRepository.getDuplicateLibraryNovel(id, title),
+            entryId = { it.novel.id },
+            mergeManager = mergeManager,
+        ) { duplicates ->
+            duplicates.map { it.novel.source }.distinct().associateWith { key ->
+                manager.get(key)?.let { EntrySourceLabel.Installed(it.name) }
+                    ?: EntrySourceLabel.Missing(manager.nameOf(key))
+            }
+        }
+
+    /**
+     * Add the browsed item through the shared sequence ([addEntry]): decide, favorite, then file. The
+     * row is only created by the favorite step, so a picker returned here is still pending: nothing is
+     * written until its confirm reaches [confirmCategories].
+     */
+    suspend fun addToLibrary(item: NovelItem, sourceId: String): AddStep<NovelBrowseDialog> {
+        val outcome = addEntry(
+            resolveCategories = { landingCategories(novelRepository.getByUrlAndSource(item.path, sourceId)?.id) },
+            favorite = { favoriteReturningId(item, sourceId) },
+            fileCategories = { id, categoryIds -> applyCategories(id, categoryIds) },
+        )
+        if (outcome != AddOutcome.NeedsCategoryChoice) return outcome.step
+        return AddStep.Ask(NovelBrowseDialog.ChangeCategory(item, sourceId, categoryPickerPrompt(item, sourceId)))
+    }
+
+    /**
+     * The writes a browse picker's confirm owes. The add has written nothing yet, so this creates the
+     * row, favorites it and files it.
+     */
+    suspend fun confirmCategories(item: NovelItem, sourceId: String, categoryIds: List<Long>): AddOutcome =
+        finishAdd(
+            categoryIds = categoryIds,
+            favorite = { favoriteReturningId(item, sourceId) },
+            fileCategories = { id, ids -> applyCategories(id, ids) },
+        )
+
+    /**
+     * The writes a picker's confirm owes for a stored row, in the shared order, so backing out adds
+     * nothing and the row is favorited only when the user confirms. Twin of
+     * `MangaLibraryAdder.confirmAddCategories`, pinned by `AddToGroupConformanceTest`.
+     */
+    suspend fun confirmAddCategories(novelId: Long, categoryIds: List<Long>): AddOutcome = finishAdd(
+        categoryIds = categoryIds,
+        favorite = { favoriteForAdd(novelId) },
+        fileCategories = { id, ids -> applyCategories(id, ids) },
+    )
+
+    /**
+     * Favorite [novelId] for an add, answering its id, or null when the row is gone or the write
+     * failed. An already-favorited row is not re-written: that would reset dateAdded, moving the entry
+     * in a date-added sort for something the user did not do. Twin of `MangaLibraryAdder.favoriteForAdd`,
+     * pinned by `AddToGroupConformanceTest`'s confirm cases.
+     */
+    suspend fun favoriteForAdd(novelId: Long): Long? = novelRepository.getById(novelId)?.let { favoriteStored(it) }
+
+    /** Where an entry joining [selectedIds]'s group lands: their categories, never a prompt. Reads only. */
+    suspend fun groupCategoryIdsOf(selectedIds: List<Long>): List<Long> =
+        groupCategoryIds(selectedIds.flatMap { getNovelCategories.awaitByNovelId(it) })
+
+    /**
+     * Add the browsed item in the group of the user's picked duplicates, through the shared sequence,
+     * filed in the group's categories, so it never asks. The row is inserted first, unfavorited, since
+     * the merge needs its id; an insert on its own leaves nothing a user can see.
+     */
+    suspend fun addToExistingGroup(item: NovelItem, sourceId: String, selectedIds: List<Long>): AddOutcome {
+        val storedId = materialize(item, sourceId)?.id ?: return AddOutcome.Failed
+        return addEntry(
+            resolveCategories = { groupCategoryIdsOf(selectedIds) },
+            favorite = { joinGroup(storedId, selectedIds) },
+            fileCategories = { id, categoryIds -> applyCategories(id, categoryIds) },
+        )
+    }
+
+    /**
+     * Add a novel that already has a library row, through the shared sequence. Twin of
+     * `MangaLibraryAdder.resolveAddFavorite`, pinned by the `addEntryOrPrompt` kernel both call, for the
+     * stored-row case its browse twin above cannot serve: nothing is inserted here, only favorited and filed.
+     */
+    suspend fun addStoredToLibrary(novelId: Long): AddFavoriteResult = addEntryOrPrompt(
+        resolveCategories = { landingCategories(novelId) },
+        favorite = { favoriteForAdd(novelId) },
+        fileCategories = { id, categoryIds -> applyCategories(id, categoryIds) },
+        categoryPicker = { categoryPickerPrompt(novelId) },
+    )
+
+    /**
+     * The stored-row form of the browse [addToExistingGroup] above, answering the shared result type
+     * instead of a browse dialog. Twin of `MangaLibraryAdder.addToExistingGroup`, pinned by the
+     * `addEntryOrPrompt` kernel both call.
+     */
+    suspend fun addToExistingGroup(novelId: Long, selectedIds: List<Long>): AddFavoriteResult = addEntryOrPrompt(
+        resolveCategories = { groupCategoryIdsOf(selectedIds) },
+        favorite = { joinGroup(novelId, selectedIds) },
+        fileCategories = { id, categoryIds -> applyCategories(id, categoryIds) },
+        categoryPicker = { categoryPickerPrompt(novelId) },
+    )
+
+    /**
+     * Favorite the novel and merge it into [selectedIds]'s group as ONE unit, answering its id, or null
+     * when the row is gone or the write failed. Twin of `MangaLibraryAdder.joinGroup`, which carries the
+     * why, including why the picks go first; pinned by `AddToGroupConformanceTest`. An already-favorited row is not re-written: that would
+     * reset dateAdded, moving the entry in a date-added sort for what the user did as a grouping change.
+     */
+    suspend fun joinGroup(novelId: Long, selectedIds: List<Long>): Long? {
+        val novel = novelRepository.getById(novelId) ?: return null
+        val favorited = chapterSettings.rejoin(novelId, mergeManager) {
+            transactions.run {
+                val ok = novel.favorite || updateNovel.awaitUpdateFavorite(novelId, favorite = true)
+                if (ok) mergeManager.merge(selectedIds + novelId)
+                ok
+            }
+        }
+        if (!favorited) return null
+        autoBindOnAdd.novel(novel)
+        return novelId
+    }
+
+    /** Insert + favorite the item, returning its stored novel id and skipping the category prompt, or
+     *  null when the favorite write failed. The bulk add path favorites many items this way, then applies
+     *  one category set to all. insertOrGet may return a non-favorite shadow row from a prior details
+     *  open, so favorite is applied as a follow-up. */
+    suspend fun favoriteReturningId(item: NovelItem, sourceId: String): Long? =
+        materialize(item, sourceId)?.let { favoriteStored(it) }
+
+    /**
+     * One browsed entry of a bulk add filed under the batch's [categoryIds], or under its group's when it
+     * comes back to one. Twin of `MangaLibraryAdder.addToBatch`, which carries the why, pinned by
+     * `GroupCategoriesConformanceTest`'s bulk rows.
+     */
+    suspend fun addToBatch(item: NovelItem, sourceId: String, categoryIds: List<Long>): AddOutcome = finishAdd(
+        categoryIds = categoryIds,
+        favorite = { favoriteReturningId(item, sourceId) },
+        fileCategories = { id, ids -> fileAdded(id, ids) },
+    )
+
+    /** Where a bulk add files its batch, decided once by the shared [batchCategories] rule. Reads only. */
+    suspend fun resolveBatchCategories(): BatchCategories =
+        batchCategories(userCategories(), novelPreferences.defaultNovelCategory().get())
+
+    /** [favoriteForAdd]'s rule over a row just read, which every favorite of a stored row here shares. A
+     *  row rejoining its group takes the group's chapter settings. */
+    private suspend fun favoriteStored(novel: Novel): Long? {
+        if (novel.favorite) return novel.id
+        val added = chapterSettings.rejoin(novel.id, mergeManager) {
+            updateNovel.awaitUpdateFavorite(novel.id, favorite = true)
+        }
+        if (!added) return null
+        autoBindOnAdd.novel(novel)
+        return novel.id
+    }
+
+    /** Whether the browsed [item] is in the library now, rather than when a list drew it. */
+    suspend fun isInLibrary(item: NovelItem, sourceId: String): Boolean =
+        novelRepository.getByUrlAndSource(item.path, sourceId)?.favorite == true
+
+    /** Insert-or-get the browsed [item] as a row and return it, without favoriting: the add above, and
+     *  the migrate-from-duplicate flow, whose migrate use case favorites and chapter-syncs the target. */
+    suspend fun materialize(item: NovelItem, sourceId: String): Novel? =
+        novelRepository.insertOrGet(item.toNovel(sourceId))
+
+    /**
+     * Where an add of [novelId] lands, or null to ask: a member coming back to its group takes the
+     * group's categories, as it takes its chapter setting; anything else, or a row not stored yet, the
+     * default. Reads only. Twin of `MangaLibraryAdder.landingCategories`, pinned by GroupCategoriesConformanceTest.
+     */
+    suspend fun landingCategories(novelId: Long?): List<Long>? =
+        novelId?.let { groupCategories.groupCategoriesFor(it, mergeManager) } ?: resolveDefaultCategories()
+
+    /**
+     * Where a new favorite should land, or null when the user has to be asked. Reads only, so a caller
+     * can favorite between this and [applyCategories]. Twin of `MangaLibraryAdder.resolveDefaultCategories`;
+     * both call the `resolveDefaultCategoryIds` kernel, pinned by `AddDecisionConformanceTest`.
+     */
+    suspend fun resolveDefaultCategories(): List<Long>? =
+        resolveDefaultCategoryIds(userCategories(), novelPreferences.defaultNovelCategory().get())
+
+    /**
+     * The picker's data for a browse item with no library row yet. A row can still exist unfavorited
+     * from an earlier add, so its categories are preselected rather than assumed empty. Reads only.
+     */
+    suspend fun categoryPickerPrompt(item: NovelItem, sourceId: String): List<CheckboxState.State<Category>> {
+        val existingId = novelRepository.getByUrlAndSource(item.path, sourceId)?.id
+        return existingId?.let { categoryPickerPrompt(it) } ?: userCategories().mapAsCheckboxState { false }
+    }
+
+    /** The picker's initial state for [novelId], its current categories checked. Reads only. */
+    suspend fun categoryPickerPrompt(novelId: Long): List<CheckboxState.State<Category>> {
+        val current = getNovelCategories.awaitByNovelId(novelId).map { it.id }.toSet()
+        return userCategories().mapAsCheckboxState { it.id in current }
+    }
+
+    /**
+     * The pickable categories: the system default (id 0) is not one a user can file into. Ordered by
+     * the category sort-order preference, so every picker lists them the way the library and the
+     * details picker do rather than in table order.
+     */
+    suspend fun userCategories(): List<Category> = raitoSortCategories(
+        categories = getNovelCategories.await().filterNot { it.isSystemCategory },
+        sortOrder = raitoLibraryPreferences.categorySortOrder.get(),
+    )
+
+    /** Files a just-added [novelId]: a member back in its group takes the group's categories, else [categoryIds]. */
+    suspend fun fileAdded(novelId: Long, categoryIds: List<Long>) =
+        applyCategories(novelId, groupCategories.groupCategoriesFor(novelId, mergeManager) ?: categoryIds)
+
+    /** Files [novelId] under [categoryIds], and the rest of its merge group with it. */
+    suspend fun applyCategories(novelId: Long, categoryIds: List<Long>) {
+        groupCategories.set(novelId, categoryIds.withoutSystemCategory(), mergeManager)
+    }
+
+    /** Remove a favorited result from the library (keeps the row + read state, like the manga side). */
+    suspend fun confirmRemove(item: NovelItem, sourceId: String) {
+        novelRepository.getByUrlAndSource(item.path, sourceId)?.let { removeNovelsFromLibrary.await(listOf(it.id)) }
+    }
+}

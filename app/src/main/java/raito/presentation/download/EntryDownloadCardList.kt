@@ -1,0 +1,280 @@
+package raito.presentation.download
+
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.runtime.toMutableStateList
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import mihon.icons.materialsymbols.MaterialSymbols
+import mihon.icons.materialsymbols.rounded.Close
+import mihon.icons.materialsymbols.rounded.DragHandle
+import mihon.icons.materialsymbols.rounded.KeyboardArrowDown
+import mihon.icons.materialsymbols.rounded.KeyboardArrowUp
+import raito.domain.library.ContentType
+import raito.presentation.components.CardKicker
+import raito.presentation.components.ContentTypeBadge
+import raito.presentation.components.RaitoListCard
+import raito.presentation.components.rememberSettledReorder
+import sh.calvin.reorderable.ReorderableCollectionItemScope
+import sh.calvin.reorderable.ReorderableItem
+import tachiyomi.i18n.MR
+import tachiyomi.presentation.core.i18n.stringResource
+import tachiyomi.presentation.core.util.plus
+
+/** Status of a whole series' queued downloads, driving the card's chip + progress treatment. */
+enum class EntryDownloadCardStatus { QUEUED, DOWNLOADING, ERROR }
+
+/**
+ * Neutral model for one download-queue card. Manga and novels each aggregate their queue by series
+ * into this, so a single composable renders either (the unified-content-UI seam), including the All
+ * view where both types share one list. A card is a whole series (novel / manga), not a single
+ * chapter: [downloadedChapters] / [totalChapters] is the aggregate progress, and reorder / cancel act
+ * on the series ([seriesId]). [contentType] routes those actions to the right queue and disambiguates
+ * the key, since a manga and a novel can share a numeric id.
+ */
+data class EntryDownloadCardUi(
+    val contentType: ContentType,
+    val seriesId: Long,
+    val sourceName: String,
+    val title: String,
+    val downloadedChapters: Int,
+    val totalChapters: Int,
+    val status: EntryDownloadCardStatus,
+    /** The chapter an active series is on; null while the series waits. */
+    val currentChapterId: Long? = null,
+    val currentChapterName: String? = null,
+) {
+    val cardKey: String get() = "${keyPrefix(contentType)}$seriesId"
+
+    companion object {
+        /** What every card key of [type] starts with, which a saved order is told apart by. */
+        fun keyPrefix(type: ContentType): String = "${type.name}-"
+    }
+}
+
+/**
+ * The shared download-queue list for both content types: a flat, drag-reorderable list of per-series
+ * cards, where a drag and the top / bottom chevrons all commit the same way, a new card-key order via
+ * [onReorder]. A committed order is held until the queue echoes it back, so a stale progress-driven
+ * emission arriving before the echo can't clobber it. Card content (counts, status) always
+ * refreshes; only the ordering is guarded.
+ */
+@Composable
+fun EntryDownloadCardList(
+    items: List<EntryDownloadCardUi>,
+    showTypeBadge: Boolean,
+    onReorder: (cardKeysInOrder: List<String>) -> Unit,
+    onCancel: (EntryDownloadCardUi) -> Unit,
+    onOpen: (EntryDownloadCardUi) -> Unit,
+    contentPadding: PaddingValues,
+    modifier: Modifier = Modifier,
+) {
+    val localItems = remember { items.toMutableStateList() }
+    val listState = rememberLazyListState()
+    // The card-key order last committed here, held until the queue echoes it back (see class KDoc).
+    var committedOrder by remember { mutableStateOf<List<String>?>(null) }
+
+    val reorderableState = rememberSettledReorder(localItems, listState, { it.cardKey }, contentPadding) { settled ->
+        val keys = settled.map { it.cardKey }
+        committedOrder = keys
+        onReorder(keys)
+    }
+
+    fun commit(keysInOrder: List<String>) {
+        val byKey = localItems.associateBy { it.cardKey }
+        val rebuilt = keysInOrder.mapNotNull { byKey[it] }
+        localItems.clear()
+        localItems.addAll(rebuilt)
+        committedOrder = keysInOrder
+        onReorder(keysInOrder)
+    }
+
+    LaunchedEffect(items) {
+        if (reorderableState.isAnyItemDragging) return@LaunchedEffect
+        val order = reconcileCardOrder(items.map { it.cardKey }, localItems.map { it.cardKey }, committedOrder)
+        committedOrder = order.pending
+        // Card content (counts, status) always refreshes; only the order is guarded.
+        val rebuilt = items.inOrderOf(order.keys) { it.cardKey }
+        if (rebuilt != localItems.toList()) {
+            localItems.clear()
+            localItems.addAll(rebuilt)
+        }
+    }
+
+    LazyColumn(
+        modifier = modifier.fillMaxWidth(),
+        state = listState,
+        // Inset the cards from the screen edges (matching Tsundoku's 16.dp gutter + 8.dp top).
+        contentPadding = contentPadding + PaddingValues(start = 16.dp, end = 16.dp, top = 8.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        items(localItems, key = { it.cardKey }) { item ->
+            ReorderableItem(reorderableState, key = item.cardKey) {
+                val others = { localItems.map { it.cardKey } - item.cardKey }
+                EntryDownloadCard(
+                    item = item,
+                    showTypeBadge = showTypeBadge,
+                    onMoveToTop = { commit(listOf(item.cardKey) + others()) },
+                    onMoveToBottom = { commit(others() + item.cardKey) },
+                    onCancel = { onCancel(item) },
+                    onOpen = { onOpen(item) },
+                    modifier = Modifier.animateItem(),
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun ReorderableCollectionItemScope.EntryDownloadCard(
+    item: EntryDownloadCardUi,
+    showTypeBadge: Boolean,
+    onMoveToTop: () -> Unit,
+    onMoveToBottom: () -> Unit,
+    onCancel: () -> Unit,
+    onOpen: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    RaitoListCard(onClick = onOpen, modifier = modifier) {
+        Column(modifier = Modifier.padding(start = 4.dp, end = 8.dp, top = 12.dp, bottom = 4.dp)) {
+            Row(verticalAlignment = Alignment.Top) {
+                Icon(
+                    imageVector = MaterialSymbols.Rounded.DragHandle,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier
+                        .padding(horizontal = 8.dp, vertical = 2.dp)
+                        .draggableHandle(),
+                )
+                Column(modifier = Modifier.weight(1f)) {
+                    CardKicker(item.sourceName) {
+                        if (showTypeBadge) ContentTypeBadge(item.contentType)
+                    }
+                    Text(
+                        text = item.title,
+                        style = MaterialTheme.typography.titleSmall,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    Text(
+                        text = stringResource(
+                            MR.strings.download_card_chapters,
+                            item.downloadedChapters,
+                            item.totalChapters,
+                        ),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = if (item.status == EntryDownloadCardStatus.ERROR) {
+                            MaterialTheme.colorScheme.error
+                        } else {
+                            MaterialTheme.colorScheme.onSurfaceVariant
+                        },
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    item.currentChapterName?.let {
+                        Text(
+                            text = it,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                }
+                EntryDownloadStatusChip(item.status)
+            }
+            if (item.status != EntryDownloadCardStatus.ERROR) {
+                val fraction = if (item.totalChapters > 0) {
+                    item.downloadedChapters.toFloat() / item.totalChapters
+                } else {
+                    0f
+                }
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.padding(start = 36.dp, top = 10.dp, end = 2.dp),
+                ) {
+                    LinearProgressIndicator(
+                        progress = { fraction },
+                        modifier = Modifier.weight(1f),
+                    )
+                    Text(
+                        text = "${(fraction * 100).toInt()}%",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(start = 8.dp),
+                    )
+                }
+            }
+            Row(
+                horizontalArrangement = Arrangement.End,
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 4.dp),
+            ) {
+                IconButton(onClick = onMoveToTop) {
+                    Icon(
+                        imageVector = MaterialSymbols.Rounded.KeyboardArrowUp,
+                        contentDescription = stringResource(MR.strings.action_move_to_top),
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                IconButton(onClick = onMoveToBottom) {
+                    Icon(
+                        imageVector = MaterialSymbols.Rounded.KeyboardArrowDown,
+                        contentDescription = stringResource(MR.strings.action_move_to_bottom),
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                IconButton(onClick = onCancel) {
+                    Icon(
+                        imageVector = MaterialSymbols.Rounded.Close,
+                        contentDescription = stringResource(MR.strings.action_cancel),
+                        tint = MaterialTheme.colorScheme.error,
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun EntryDownloadStatusChip(status: EntryDownloadCardStatus) {
+    val (label, color) = when (status) {
+        EntryDownloadCardStatus.DOWNLOADING ->
+            stringResource(MR.strings.download_card_status_downloading) to MaterialTheme.colorScheme.primary
+        EntryDownloadCardStatus.ERROR ->
+            stringResource(MR.strings.download_card_status_error) to MaterialTheme.colorScheme.error
+        EntryDownloadCardStatus.QUEUED ->
+            stringResource(MR.strings.download_card_status_queued) to MaterialTheme.colorScheme.onSurfaceVariant
+    }
+    Text(
+        text = label,
+        style = MaterialTheme.typography.labelSmall,
+        color = color,
+        maxLines = 1,
+        modifier = Modifier.padding(start = 8.dp, top = 2.dp),
+    )
+}

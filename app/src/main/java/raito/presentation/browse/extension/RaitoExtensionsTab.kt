@@ -1,0 +1,733 @@
+package raito.presentation.browse.extension
+
+import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.RowScope
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.lazy.items
+import androidx.compose.material3.FilledTonalButton
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.unit.dp
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import cafe.adriel.voyager.core.screen.Screen
+import cafe.adriel.voyager.navigator.LocalNavigator
+import cafe.adriel.voyager.navigator.currentOrThrow
+import dev.zacsweers.metrox.viewmodel.assistedMetroViewModel
+import dev.zacsweers.metrox.viewmodel.metroViewModel
+import eu.kanade.presentation.browse.ExtensionInstallErrorDialog
+import eu.kanade.presentation.browse.ExtensionItem
+import eu.kanade.presentation.browse.ExtensionNotLoadedDialog
+import eu.kanade.presentation.browse.ExtensionTrustDialog
+import eu.kanade.presentation.browse.ExtensionUninstallConfirmation
+import eu.kanade.presentation.browse.NotLoadedDialog
+import eu.kanade.presentation.browse.components.BaseBrowseItem
+import eu.kanade.presentation.components.AppBar
+import eu.kanade.presentation.components.TabContent
+import eu.kanade.presentation.components.WarningBanner
+import eu.kanade.presentation.util.rememberRequestPackageInstallsPermissionState
+import eu.kanade.tachiyomi.extension.model.Extension
+import eu.kanade.tachiyomi.extension.model.InstallStep
+import eu.kanade.tachiyomi.ui.browse.extension.ExtensionFilterScreen
+import eu.kanade.tachiyomi.ui.browse.extension.ExtensionUiModel
+import eu.kanade.tachiyomi.ui.browse.extension.ExtensionsViewModel
+import eu.kanade.tachiyomi.ui.browse.extension.details.ExtensionDetailsScreen
+import eu.kanade.tachiyomi.ui.webview.WebViewScreen
+import eu.kanade.tachiyomi.util.system.isPackageInstalled
+import eu.kanade.tachiyomi.util.system.launchRequestPackageInstallsPermission
+import mihon.icons.materialsymbols.MaterialSymbols
+import mihon.icons.materialsymbols.rounded.Download
+import mihon.icons.materialsymbols.rounded.Info
+import mihon.icons.materialsymbols.rounded.Public
+import mihon.icons.materialsymbols.rounded.Refresh
+import mihon.icons.materialsymbols.rounded.Settings
+import raito.domain.library.ContentType
+import raito.domain.library.includes
+import raito.domain.library.labelRes
+import raito.novel.install.LnPluginLoadFailure
+import raito.novel.install.canonicalizePluginUrl
+import raito.novel.install.description
+import raito.novel.registry.LnRegistryEntry
+import raito.novel.source.NovelSource
+import raito.presentation.browse.RaitoBrowseViewModel
+import raito.presentation.browse.browseLanguageLabel
+import raito.presentation.browse.components.BrowseSectionHeader
+import raito.presentation.browse.components.ExtensionAction
+import raito.presentation.browse.components.ExtensionActionButtons
+import raito.presentation.browse.components.ExtensionRowDetail
+import raito.presentation.browse.components.NovelSourceIcon
+import raito.presentation.browse.components.SourceNameRow
+import raito.presentation.browse.components.failedInstall
+import raito.presentation.browse.components.retryInstall
+import raito.presentation.browse.extension.details.NovelPluginDetailsScreen
+import raito.presentation.browse.repos.RepositoriesScreen
+import raito.presentation.browse.source.EntrySourcesFilterScreen
+import raito.presentation.browse.sourceLanguageName
+import raito.presentation.components.ContentTypeBadge
+import raito.presentation.components.ContentTypeFilterChips
+import raito.presentation.components.TypeBadge
+import raito.presentation.components.rememberChipListState
+import tachiyomi.i18n.MR
+import tachiyomi.presentation.core.components.FastScrollLazyColumn
+import tachiyomi.presentation.core.components.material.PullRefresh
+import tachiyomi.presentation.core.components.material.padding
+import tachiyomi.presentation.core.components.material.topSmallPaddingValues
+import tachiyomi.presentation.core.i18n.pluralStringResource
+import tachiyomi.presentation.core.i18n.stringResource
+import tachiyomi.presentation.core.screens.EmptyScreen
+import tachiyomi.presentation.core.screens.EmptyScreenAction
+import tachiyomi.presentation.core.screens.LoadingScreen
+import tachiyomi.presentation.core.util.plus
+
+/**
+ * The Browse "Extensions" tab: one list of every manga extension and light-novel plugin, with the
+ * content-type chip as a filter over it rather than a switch between two lists.
+ *
+ * Assembly, sectioning, search and every value describing the list live in [ExtensionsEngine]; this
+ * draws what it is given and routes a tap. Replaces Mihon's `extensionsTab()` via a `// RK` island at
+ * its call site; the replaced builder is deleted (see the off-path manifest).
+ */
+@Composable
+fun Screen.raitoExtensionsTab(
+    extensionsViewModel: ExtensionsViewModel,
+    browseViewModel: RaitoBrowseViewModel,
+): TabContent {
+    val navigator = LocalNavigator.currentOrThrow
+    val lnModel = metroViewModel<LnPluginManagerViewModel>()
+    val providers = remember(extensionsViewModel, lnModel) {
+        listOf(ApkExtensionsProvider(extensionsViewModel), NovelExtensionsProvider(lnModel))
+    }
+    val engine = assistedMetroViewModel<ExtensionsEngine, ExtensionsEngine.Factory> {
+        create(providers, browseViewModel.searchQuery)
+    }
+    // Only the chip and the badge counts are read out here, never the engine state: collecting it out
+    // here would hold the extension subscription open for the tab strip, which is what upstream's
+    // WhileSubscribed conversion exists to stop (mihonapp/mihon#3729).
+    val updatesCount by extensionsViewModel.updatesCount.collectAsStateWithLifecycle()
+    val novelCount by browseViewModel.novelUpdatesCount.collectAsStateWithLifecycle()
+    val totalCount by browseViewModel.totalUpdatesCount.collectAsStateWithLifecycle()
+    val contentType by browseViewModel.contentType.collectAsStateWithLifecycle()
+    val openRepos = { navigator.push(RepositoriesScreen()) }
+
+    return TabContent(
+        titleRes = MR.strings.label_extensions,
+        badgeNumber = totalCount.takeIf { it > 0 },
+        searchEnabled = true,
+        actions = listOf(
+            // Each type's own language filter: Mihon's extension-language screen for manga, and for
+            // novels the novel sources' filter, whose languages narrow the plugins and apps offered.
+            AppBar.OverflowAction(
+                title = stringResource(MR.strings.action_filter),
+                onClick = {
+                    navigator.push(
+                        if (contentType == ContentType.NOVELS) {
+                            EntrySourcesFilterScreen(ContentType.NOVELS)
+                        } else {
+                            ExtensionFilterScreen()
+                        },
+                    )
+                },
+            ),
+            AppBar.OverflowAction(
+                title = stringResource(MR.strings.repos),
+                onClick = openRepos,
+            ),
+            // Re-check both verticals: re-scan installed manga extensions and re-evaluate trust
+            // against the current repos (for a scan that failed transiently or a package change the
+            // receiver missed), and force-reload the installed novel plugins.
+            AppBar.OverflowAction(
+                title = stringResource(MR.strings.action_recheck_extensions),
+                onClick = {
+                    extensionsViewModel.reloadInstalledExtensions()
+                    lnModel.reloadInstalled()
+                },
+            ),
+        ),
+        content = { contentPadding, _ ->
+            val state by engine.state.collectAsStateWithLifecycle()
+
+            BackHandler(enabled = state.query != null) {
+                browseViewModel.search(null)
+            }
+
+            Column {
+                ContentTypeFilterChips(
+                    selected = state.contentType,
+                    onSelect = browseViewModel::setContentType,
+                    // Show where the pending updates are: a count on the Manga / Novels chip. The All
+                    // chip stays clean; the tab badge already carries the combined total.
+                    badges = mapOf(
+                        ContentType.MANGA to updatesCount,
+                        ContentType.NOVELS to novelCount,
+                    ),
+                )
+                PullRefresh(
+                    refreshing = state.isRefreshing,
+                    onRefresh = engine::refresh,
+                    enabled = !state.isLoading,
+                ) {
+                    when {
+                        state.isLoading -> LoadingScreen(Modifier.padding(contentPadding))
+                        state.isEmpty -> ExtensionsEmptyScreen(
+                            state = state,
+                            contentPadding = contentPadding,
+                            onRetry = engine::refresh,
+                            onOpenRepos = openRepos,
+                        )
+                        else -> ExtensionsList(
+                            state = state,
+                            showContentType = state.contentType == ContentType.ALL,
+                            contentPadding = contentPadding,
+                            extensionsViewModel = extensionsViewModel,
+                            lnModel = lnModel,
+                            onUpdateAll = engine::updateAll,
+                        )
+                    }
+                }
+            }
+        },
+    )
+}
+
+@Composable
+private fun ExtensionsEmptyScreen(
+    state: ExtensionsEngine.State,
+    contentPadding: PaddingValues,
+    onRetry: () -> Unit,
+    onOpenRepos: () -> Unit,
+) {
+    EmptyScreen(
+        stringRes = when {
+            state.isSearching -> MR.strings.no_results_found
+            // A repo is added but nothing loaded (empty or unreachable) reads differently from
+            // having no repos at all.
+            state.hasRepos -> MR.strings.ext_repos_empty
+            else -> MR.strings.ext_no_repos
+        },
+        modifier = Modifier.padding(contentPadding),
+        actions = buildList {
+            if (state.hasRepos && !state.isSearching) {
+                add(
+                    EmptyScreenAction(
+                        stringRes = MR.strings.action_retry,
+                        icon = MaterialSymbols.Rounded.Refresh,
+                        onClick = onRetry,
+                    ),
+                )
+            }
+            add(
+                EmptyScreenAction(
+                    stringRes = MR.strings.repos,
+                    icon = MaterialSymbols.Rounded.Settings,
+                    onClick = onOpenRepos,
+                ),
+            )
+        },
+    )
+}
+
+@Composable
+private fun ExtensionsList(
+    state: ExtensionsEngine.State,
+    showContentType: Boolean,
+    contentPadding: PaddingValues,
+    extensionsViewModel: ExtensionsViewModel,
+    lnModel: LnPluginManagerViewModel,
+    onUpdateAll: () -> Unit,
+) {
+    val context = LocalContext.current
+    val installGranted = rememberRequestPackageInstallsPermissionState(initialValue = true)
+    val lnState by lnModel.state.collectAsStateWithLifecycle()
+    // Hosted here rather than in the row: a dialog owned by a lazy item is disposed the moment that
+    // row scrolls out of the list.
+    var notLoadedState by remember { mutableStateOf<Extension.NotLoaded?>(null) }
+    var privateExtensionToUninstall by remember { mutableStateOf<Extension.Installed?>(null) }
+    var pluginToUninstall by remember { mutableStateOf<NovelSource?>(null) }
+    var failedPlugin by remember { mutableStateOf<LnPluginLoadFailure?>(null) }
+    var installError by remember { mutableStateOf<InstallStep.Error?>(null) }
+
+    FastScrollLazyColumn(
+        state = rememberChipListState(state.contentType),
+        contentPadding = contentPadding + topSmallPaddingValues,
+    ) {
+        if (!installGranted && state.needsInstallPermission) {
+            item(key = "extension-permissions-warning") {
+                WarningBanner(
+                    textRes = MR.strings.ext_permission_install_apps_warning,
+                    modifier = Modifier.clickable { context.launchRequestPackageInstallsPermission() },
+                )
+            }
+        }
+
+        items(
+            items = state.items,
+            contentType = {
+                when (it) {
+                    is ExtensionsListItem.Header -> "header"
+                    is ExtensionsListItem.Row -> "item"
+                }
+            },
+            key = {
+                when (it) {
+                    is ExtensionsListItem.Header -> "header-${it.section}"
+                    // Section-qualified: a provider that let one source into two sections would
+                    // otherwise take the list down rather than merely look wrong.
+                    is ExtensionsListItem.Row -> "extension-${it.row.section}-${it.row.key}"
+                }
+            },
+        ) { item ->
+            when (item) {
+                is ExtensionsListItem.Header ->
+                    ExtensionsSectionHeader(item.section, state.updatesByType, onUpdateAll, Modifier.animateItem())
+                is ExtensionsListItem.Row -> {
+                    val badge: @Composable () -> Unit = {
+                        // One pill at most: a phone row has no room for a type and a format side by side.
+                        val format = item.row.key.format?.takeIf { state.showsFormat }?.let { stringResource(it.label) }
+                        when {
+                            format == null -> if (showContentType) ContentTypeBadge(item.row.key.contentType)
+                            showContentType -> TypeBadge(
+                                stringResource(
+                                    MR.strings.content_type_with_format,
+                                    stringResource(item.row.key.contentType.labelRes),
+                                    format,
+                                ),
+                            )
+                            else -> TypeBadge(format)
+                        }
+                    }
+                    when (item.row.key) {
+                        is ExtensionKey.Manga, is ExtensionKey.NovelApk -> ApkExtensionRow(
+                            modifier = Modifier.animateItem(),
+                            row = item.row,
+                            model = extensionsViewModel,
+                            badge = badge,
+                            onNotLoaded = { notLoadedState = it },
+                            onConfirmPrivateUninstall = { privateExtensionToUninstall = it },
+                            onInstallError = { installError = it },
+                        )
+                        is ExtensionKey.Novel -> NovelExtensionRow(
+                            row = item.row,
+                            state = lnState,
+                            model = lnModel,
+                            badge = badge,
+                            onConfirmUninstall = { pluginToUninstall = it },
+                            onNotLoaded = { failedPlugin = it },
+                            onInstallError = { installError = it },
+                            modifier = Modifier.animateItem(),
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    notLoadedState?.let { extension ->
+        val dismiss = { notLoadedState = null }
+        if (extension.reason is Extension.NotLoaded.Reason.Untrusted) {
+            ExtensionTrustDialog(
+                onClickConfirm = {
+                    extensionsViewModel.trustExtension(extension)
+                    dismiss()
+                },
+                onClickDismiss = {
+                    extensionsViewModel.uninstallExtension(extension)
+                    dismiss()
+                },
+                onDismissRequest = dismiss,
+            )
+        } else {
+            ExtensionNotLoadedDialog(
+                reason = extension.reason,
+                onClickUninstall = {
+                    extensionsViewModel.uninstallExtension(extension)
+                    dismiss()
+                },
+                onDismissRequest = dismiss,
+            )
+        }
+    }
+
+    // The same dialog a manga extension that did not load raises, with what a plugin can say about it.
+    failedPlugin?.let { failure ->
+        val reason = failure.reason
+        val dismiss = { failedPlugin = null }
+        NotLoadedDialog(
+            description = reason.description,
+            failureMessage = reason.message,
+            stackTrace = (reason as? LnPluginLoadFailure.Reason.Failed)?.stackTrace,
+            onClickUninstall = {
+                lnModel.uninstall(failure)
+                dismiss()
+            },
+            onDismissRequest = dismiss,
+            confirmLabel = if (reason is LnPluginLoadFailure.Reason.Missing) {
+                MR.strings.ext_reinstall
+            } else {
+                MR.strings.action_ok
+            },
+            onClickConfirm = {
+                if (reason is LnPluginLoadFailure.Reason.Missing) lnModel.reinstall(failure)
+                dismiss()
+            },
+        )
+    }
+
+    installError?.let { error ->
+        ExtensionInstallErrorDialog(
+            error = error,
+            onDismissRequest = { installError = null },
+        )
+    }
+
+    privateExtensionToUninstall?.let { extension ->
+        ExtensionUninstallConfirmation(
+            extensionName = extension.name,
+            onClickConfirm = { extensionsViewModel.uninstallExtension(extension) },
+            onDismissRequest = { privateExtensionToUninstall = null },
+        )
+    }
+
+    // A plugin is not a package the system can remove, so its long press is confirmed here, the
+    // way a privately installed manga extension is.
+    pluginToUninstall?.let { plugin ->
+        ExtensionUninstallConfirmation(
+            extensionName = plugin.name,
+            onClickConfirm = { lnModel.uninstall(plugin) },
+            onDismissRequest = { pluginToUninstall = null },
+        )
+    }
+}
+
+@Composable
+private fun ExtensionsSectionHeader(
+    section: ExtensionSection,
+    updatesByType: Map<ContentType, Int>,
+    onUpdateAll: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    BrowseSectionHeader(
+        modifier = modifier,
+        title = when (section) {
+            ExtensionSection.Updates -> updatesPendingTitle(updatesByType)
+            ExtensionSection.NotLoaded -> stringResource(MR.strings.ext_not_loaded)
+            ExtensionSection.Installed -> stringResource(MR.strings.ext_installed)
+            is ExtensionSection.Available -> browseLanguageLabel(section.lang, LocalContext.current)
+        },
+        action = {
+            // One Update all, spanning both content types, because there is one Updates section.
+            if (section == ExtensionSection.Updates) {
+                FilledTonalButton(onClick = onUpdateAll) {
+                    Text(text = stringResource(MR.strings.ext_update_all))
+                }
+            }
+        },
+    )
+}
+
+/** Under the All chip, the counts per content type, so it is clear Update all covers each of them. */
+@Composable
+private fun updatesPendingTitle(updatesByType: Map<ContentType, Int>): String {
+    val manga = updatesByType[ContentType.MANGA]?.let { pluralStringResource(MR.plurals.bulk_selected_manga, it, it) }
+    val novels = updatesByType[ContentType.NOVELS]?.let {
+        pluralStringResource(MR.plurals.bulk_selected_novels, it, it)
+    }
+    val counts = if (manga != null && novels != null) {
+        stringResource(MR.strings.bulk_selected_types, manga, novels)
+    } else {
+        manga ?: novels
+    }
+    return counts?.let { stringResource(MR.strings.ext_updates_pending_by_type, it) }
+        ?: stringResource(MR.strings.ext_updates_pending)
+}
+
+@Composable
+private fun ApkExtensionRow(
+    row: BrowseExtensionRow,
+    model: ExtensionsViewModel,
+    badge: @Composable () -> Unit,
+    onNotLoaded: (Extension.NotLoaded) -> Unit,
+    onConfirmPrivateUninstall: (Extension.Installed) -> Unit,
+    onInstallError: (InstallStep.Error) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val navigator = LocalNavigator.currentOrThrow
+    val context = LocalContext.current
+
+    ExtensionItem(
+        modifier = modifier,
+        item = row.payload as ExtensionUiModel.Item,
+        badge = badge,
+        showsLanguage = row.section.namesLanguage,
+        updateVersion = row.updateVersion,
+        onClickItem = {
+            when (it) {
+                is Extension.Available -> model.installExtension(it)
+                is Extension.Loaded -> navigator.push(ExtensionDetailsScreen(it.pkgName))
+                is Extension.NotLoaded -> onNotLoaded(it)
+            }
+        },
+        onLongClickItem = {
+            when (it) {
+                is Extension.Available -> model.installExtension(it)
+                // A privately installed extension is not a package the system can remove, so it is
+                // confirmed here rather than uninstalled on the long press.
+                is Extension.Installed -> if (context.isPackageInstalled(it.pkgName)) {
+                    model.uninstallExtension(it)
+                } else {
+                    onConfirmPrivateUninstall(it)
+                }
+            }
+        },
+        onClickItemCancel = model::cancelInstallUpdateExtension,
+        onClickItemError = onInstallError,
+        onClickItemAction = {
+            when (it) {
+                is Extension.Available -> model.installExtension(it)
+                is Extension.Loaded -> if (it.hasUpdate) {
+                    model.updateExtension(it)
+                } else {
+                    navigator.push(ExtensionDetailsScreen(it.pkgName))
+                }
+                // An update is often what gets a not-loaded extension loading again
+                is Extension.NotLoaded -> if (it.hasUpdate) model.updateExtension(it) else onNotLoaded(it)
+            }
+        },
+        onClickItemSecondaryAction = {
+            when (it) {
+                is Extension.Available -> it.sources.getOrNull(0)?.let { source ->
+                    // The id picks a manga source's client, which a novel apk's number can name wrongly.
+                    val sourceId = if (it.kind == Extension.Kind.MANGA) source.id else null
+                    navigator.push(WebViewScreen(url = source.baseUrl, initialTitle = source.name, sourceId = sourceId))
+                }
+                is Extension.Loaded -> navigator.push(ExtensionDetailsScreen(it.pkgName))
+                // Trust, or why it did not load, which the row's menu and its button both name.
+                is Extension.NotLoaded -> onNotLoaded(it)
+            }
+        },
+    )
+}
+
+@Composable
+private fun NovelExtensionRow(
+    row: BrowseExtensionRow,
+    state: LnPluginManagerViewModel.State,
+    model: LnPluginManagerViewModel,
+    badge: @Composable () -> Unit,
+    onConfirmUninstall: (NovelSource) -> Unit,
+    onNotLoaded: (LnPluginLoadFailure) -> Unit,
+    onInstallError: (InstallStep.Error) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val navigator = LocalNavigator.currentOrThrow
+    val lang = if (row.section.namesLanguage) row.lang else ""
+    when (val payload = row.payload) {
+        is LnPluginLoadFailure -> {
+            // Keyed as the install writes it, so a reinstall from the dialog shows its progress and error here.
+            val key = canonicalizePluginUrl(payload.url)
+            val installing = key in state.inProgress
+            val details = ExtensionAction(MaterialSymbols.Rounded.Info, MR.strings.ext_not_loaded_details) {
+                onNotLoaded(payload)
+            }
+            PluginRow(
+                modifier = modifier,
+                name = payload.name,
+                lang = lang,
+                iconUrl = payload.iconUrl,
+                version = payload.version,
+                repoName = state.repoNames[key],
+                onClickItem = { if (!installing) onNotLoaded(payload) },
+                onLongClickItem = { if (!installing) onNotLoaded(payload) },
+                badge = badge,
+                action = {
+                    NovelRowAction(inProgress = installing) {
+                        val error = state.errors[key]
+                        ExtensionActionButtons(
+                            secondary = error?.let { failedInstall(it, onInstallError) } ?: details,
+                            primary = error?.let { retryInstall { model.reinstall(payload) } },
+                        )
+                    }
+                },
+            )
+        }
+        is NovelPluginUpdateRow -> {
+            val update = payload.update
+            val key = canonicalizePluginUrl(update.entry.url)
+            // As a manga row: a loaded plugin opens its page and asks to be removed, while one that
+            // failed opens why, which also offers reinstall and uninstall.
+            val failure = payload.failure
+            // The dialog reinstalls from the recorded URL, which a repo may have moved the update from.
+            val installing = listOfNotNull(key, failure?.url?.let(::canonicalizePluginUrl)).any {
+                it in state.inProgress
+            }
+            val open = if (failure != null) {
+                ExtensionAction(MaterialSymbols.Rounded.Info, MR.strings.ext_not_loaded_details) {
+                    onNotLoaded(failure)
+                }
+            } else {
+                ExtensionAction(MaterialSymbols.Rounded.Settings, MR.strings.action_settings) {
+                    navigator.push(NovelPluginDetailsScreen(update.entry.id))
+                }
+            }
+            PluginRow(
+                modifier = modifier,
+                name = update.entry.name,
+                lang = lang,
+                iconUrl = update.entry.iconUrl,
+                version = versionLabel(update.installedVersion, row.updateVersion),
+                repoName = state.repoNames[key],
+                onClickItem = { if (!installing) open.onClick() },
+                onLongClickItem = {
+                    when {
+                        installing -> Unit
+                        failure != null -> onNotLoaded(failure)
+                        else -> state.installed.firstOrNull { it.id == update.entry.id }?.let(onConfirmUninstall)
+                    }
+                },
+                badge = badge,
+                action = {
+                    NovelRowAction(inProgress = installing) {
+                        val error = state.errors[key]
+                        ExtensionActionButtons(
+                            secondary = error?.let { failedInstall(it, onInstallError) } ?: open,
+                            primary = if (error != null) {
+                                retryInstall { model.update(update) }
+                            } else {
+                                ExtensionAction(MaterialSymbols.Rounded.Download, MR.strings.ext_update) {
+                                    model.update(update)
+                                }
+                            },
+                        )
+                    }
+                },
+            )
+        }
+        is NovelSource -> PluginRow(
+            modifier = modifier,
+            name = payload.name,
+            lang = lang,
+            iconUrl = payload.iconUrl,
+            version = state.installedVersions[payload.id],
+            repoName = state.installedRepoNames[payload.id],
+            // As an installed manga extension's row: a tap or its settings button opens its page.
+            onClickItem = { navigator.push(NovelPluginDetailsScreen(payload.id)) },
+            onLongClickItem = { onConfirmUninstall(payload) },
+            badge = badge,
+            action = {
+                ExtensionActionButtons(
+                    secondary = ExtensionAction(MaterialSymbols.Rounded.Settings, MR.strings.action_settings) {
+                        navigator.push(NovelPluginDetailsScreen(payload.id))
+                    },
+                    primary = null,
+                )
+            },
+        )
+        is LnRegistryEntry -> {
+            val key = canonicalizePluginUrl(payload.url)
+            val webView = payload.site.takeIf { it.isNotEmpty() }?.let {
+                ExtensionAction(MaterialSymbols.Rounded.Public, MR.strings.action_open_in_web_view) {
+                    navigator.push(webViewFor(payload))
+                }
+            }
+            PluginRow(
+                modifier = modifier,
+                name = payload.name,
+                lang = lang,
+                iconUrl = payload.iconUrl,
+                version = payload.version,
+                repoName = state.repoNames[key],
+                // As an available manga extension's row: a tap or a long press installs it.
+                onClickItem = { model.install(payload) },
+                onLongClickItem = { model.install(payload) },
+                badge = badge,
+                action = {
+                    // The apk rows' own buttons, so one list reads as one list. They go while an
+                    // install runs, as they do on the apk side.
+                    NovelRowAction(inProgress = key in state.inProgress) {
+                        val error = state.errors[key]
+                        ExtensionActionButtons(
+                            secondary = error?.let { failedInstall(it, onInstallError) } ?: webView,
+                            primary = if (error != null) {
+                                retryInstall { model.install(payload) }
+                            } else {
+                                ExtensionAction(MaterialSymbols.Rounded.Download, MR.strings.ext_install) {
+                                    model.install(payload)
+                                }
+                            },
+                        )
+                    }
+                },
+            )
+        }
+    }
+}
+
+/**
+ * A plugin's site in the WebView. No source id goes with it: that only carries an HTTP source's own
+ * request headers, which a JavaScript plugin does not have. The plugin id keeps the site's storage for it.
+ */
+private fun webViewFor(entry: LnRegistryEntry) =
+    WebViewScreen(url = entry.site, initialTitle = entry.name, pluginId = entry.id)
+
+/** A plugin's row, drawn as an apk extension row is: its repo, then its language and version. */
+@Composable
+private fun PluginRow(
+    name: String,
+    lang: String,
+    iconUrl: String?,
+    version: String?,
+    repoName: String?,
+    onClickItem: () -> Unit,
+    onLongClickItem: () -> Unit,
+    badge: @Composable () -> Unit,
+    action: @Composable RowScope.() -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    BaseBrowseItem(
+        modifier = modifier,
+        onClickItem = onClickItem,
+        onLongClickItem = onLongClickItem,
+        icon = { NovelSourceIcon(iconUrl, size = 48.dp) },
+        action = action,
+    ) {
+        Column(modifier = Modifier.weight(1f).padding(start = MaterialTheme.padding.medium)) {
+            SourceNameRow(name, badge)
+            repoName?.let { ExtensionRowDetail(it) }
+            val facts = listOfNotNull(sourceLanguageName(lang, LocalContext.current), version)
+            if (facts.isNotEmpty()) ExtensionRowDetail(facts.joinToString(" • "))
+        }
+    }
+}
+
+/**
+ * A novel row's trailing buttons, or a spinner while its install runs.
+ *
+ * The Row and its spacing are the apk rows' own, so the two kinds line their buttons up in the
+ * same columns; emitting the buttons bare leaves the group narrower and shifts all but the last.
+ */
+@Composable
+private fun NovelRowAction(inProgress: Boolean, buttons: @Composable RowScope.() -> Unit) {
+    Row(
+        horizontalArrangement = Arrangement.spacedBy(MaterialTheme.padding.small),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        if (inProgress) {
+            CircularProgressIndicator(modifier = Modifier.size(24.dp), strokeWidth = 2.dp)
+        } else {
+            buttons()
+        }
+    }
+}

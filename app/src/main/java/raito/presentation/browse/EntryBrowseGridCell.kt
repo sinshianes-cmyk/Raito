@@ -1,0 +1,87 @@
+package raito.presentation.browse
+
+import androidx.compose.runtime.Composable
+import eu.kanade.presentation.browse.components.InLibraryBadge
+import eu.kanade.presentation.library.components.CommonMangaItemDefaults
+import eu.kanade.presentation.library.components.MangaComfortableGridItem
+import eu.kanade.presentation.library.components.MangaCompactGridItem
+import eu.kanade.presentation.library.components.MangaListItem
+import raito.domain.novel.model.Novel
+import raito.domain.novel.model.NovelCover
+import raito.domain.novel.model.novelResultCover
+import raito.novel.host.NovelItem
+import tachiyomi.domain.library.model.LibraryDisplayMode
+import tachiyomi.domain.manga.model.Manga
+import tachiyomi.domain.manga.model.MangaCover
+import tachiyomi.domain.manga.model.asMangaCover
+
+/**
+ * Content-neutral data for one browse-catalogue result. The cover is typed [Any] so a [MangaCover] or
+ * a [NovelCover] flows through the shared cells unchanged (both have a registered Coil fetcher);
+ * [favorite] drives the in-library dim + badge.
+ */
+data class EntryBrowseItemUi(
+    val title: String,
+    val cover: Any,
+    val favorite: Boolean,
+)
+
+fun Manga.toEntryBrowseUi() = EntryBrowseItemUi(
+    title = title,
+    cover = asMangaCover(),
+    favorite = favorite,
+)
+
+/** [NovelItem] carries no library state or source, so the caller supplies its [stored] library row and [sourceId]. */
+fun NovelItem.toEntryBrowseUi(stored: Novel?, sourceId: String) = EntryBrowseItemUi(
+    title = name,
+    cover = novelResultCover(stored, cover, sourceId),
+    favorite = stored?.favorite == true,
+)
+
+/**
+ * The single browse-result cell for both manga and novels: switches on [displayMode] and renders the
+ * matching shared leaf (`MangaComfortableGridItem` / `MangaCompactGridItem` / `MangaListItem`), so the
+ * two catalogues can't drift. Cover-only draws as compact, as browse has always drawn it. The container
+ * is the catalogue's `StandardRows` or global search's card row.
+ */
+@Composable
+fun EntryBrowseGridCell(
+    ui: EntryBrowseItemUi,
+    displayMode: LibraryDisplayMode,
+    onClick: () -> Unit,
+    onLongClick: () -> Unit,
+    isSelected: Boolean = false,
+) {
+    val coverAlpha = if (ui.favorite) CommonMangaItemDefaults.BrowseFavoriteCoverAlpha else 1f
+    when (displayMode) {
+        LibraryDisplayMode.List -> MangaListItem(
+            coverData = ui.cover,
+            title = ui.title,
+            coverAlpha = coverAlpha,
+            badgeStart = { InLibraryBadge(enabled = ui.favorite) },
+            onClick = onClick,
+            onLongClick = onLongClick,
+            isSelected = isSelected,
+        )
+        LibraryDisplayMode.CompactGrid, LibraryDisplayMode.CoverOnlyGrid -> MangaCompactGridItem(
+            coverData = ui.cover,
+            title = ui.title,
+            coverAlpha = coverAlpha,
+            coverBadgeStart = { InLibraryBadge(enabled = ui.favorite) },
+            onClick = onClick,
+            onLongClick = onLongClick,
+            isSelected = isSelected,
+        )
+        LibraryDisplayMode.ComfortableGrid, LibraryDisplayMode.ComfortableGridPanorama -> MangaComfortableGridItem(
+            coverData = ui.cover,
+            title = ui.title,
+            coverAlpha = coverAlpha,
+            coverBadgeStart = { InLibraryBadge(enabled = ui.favorite) },
+            onClick = onClick,
+            onLongClick = onLongClick,
+            isSelected = isSelected,
+            usePanoramaCover = displayMode is LibraryDisplayMode.ComfortableGridPanorama,
+        )
+    }
+}

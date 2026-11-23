@@ -1,0 +1,32 @@
+package raito.domain.novel.interactor
+
+import dev.zacsweers.metro.Inject
+import raito.domain.download.NovelRemovableDownloads
+import raito.domain.novel.NovelPreferences
+import raito.domain.novel.model.NovelChapter
+import raito.novel.download.NovelDownloadManager
+
+/**
+ * Delete the downloads of chapters just marked read, when "delete after marked as read" is on:
+ * [SetNovelReadStatus] calls it for a mark made by hand, never for finishing a chapter in the reader.
+ * A queued chapter leaves the queue too, as manga's delete dequeues it.
+ */
+@Inject
+class DeleteNovelChaptersAfterRead(
+    private val novelPreferences: NovelPreferences,
+    private val removableDownloads: NovelRemovableDownloads,
+    // Deferred on purpose: building the manager restores the persisted queue and resumes the drain, so
+    // taking it directly would resume downloads from every screen that can mark a chapter read. This is
+    // the choke point, since the library, details, updates and the notification receiver all reach the
+    // manager only through here. See docs/dev/subsystems/architecture.md.
+    private val downloadManager: () -> NovelDownloadManager,
+) {
+
+    /** [chapters] as written, read. Filtered here: the manager's own delete is the manual one, which
+     *  does not ask the kept categories, and a mark that deletes nothing builds no manager. */
+    suspend fun await(chapters: List<NovelChapter>) {
+        if (chapters.isEmpty() || !novelPreferences.removeAfterMarkedAsRead().get()) return
+        val removable = removableDownloads(chapters)
+        if (removable.isNotEmpty()) downloadManager().deleteChapters(removable)
+    }
+}
