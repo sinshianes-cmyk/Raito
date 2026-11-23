@@ -10,9 +10,7 @@ A free and open source reader for Android. Manga and light novels live side by s
 
 *Requires Android 8.0 or higher.*
 
-[![Release](https://img.shields.io/github/v/release/sinshianes-cmyk/Raito?label=Release&labelColor=27303D&color=6d28d9)](https://github.com/sinshianes-cmyk/Raito/releases) [![Downloads](https://img.shields.io/github/downloads/sinshianes-cmyk/Raito/total?label=Downloads&labelColor=27303D&color=0D1117&logo=github&logoColor=FFFFFF)]([https://github.com/sinshianes-cmyk/Raito/releases](https://github.com/sinshianes-cmyk/Raito/releases/download/Release/app-universal-release.apk))
-[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-0877d2?labelColor=27303D)](./LICENSE)
-![Platform: Android](https://img.shields.io/badge/platform-Android%208.0%2B-3DDC84?labelColor=27303D)
+[![Release](https://img.shields.io/github/v/release/sinshianes-cmyk/Raito?label=Release&labelColor=27303D&color=6d28d9)](https://github.com/sinshianes-cmyk/Raito/releases) [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-0877d2?labelColor=27303D)](./LICENSE)![Platform: Android](https://img.shields.io/badge/platform-Android%208.0%2B-3DDC84?labelColor=27303D)
 
 <table>
   <tr>
